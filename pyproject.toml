@@ -66,5 +66,10 @@ extend-select = ["C4"] # Extends the root rules just for this project
 [tool.pytest]
 minversion = "9.0"
 testpaths = ["tests"]
-addopts = ["-ra", "-q", "--cov=jun_build", "--cov-report=html"]
+addopts = ["-ra", "-q", "--cov=src", "--cov-report=html"]
 pythonpath = ["src"]
+
+[tool.coverage.run]
+omit = [
+    "src/examples/*",
+]
