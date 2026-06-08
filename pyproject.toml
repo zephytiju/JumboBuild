@@ -9,7 +9,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "typer>=0.21.0",
-    "rich>=13.0.0"
+    "rich>=13.0.0",
 ]
 
 [project.urls]
@@ -34,6 +34,8 @@ lint = [
 dev = [
     { include-group = "test" },
     { include-group = "lint" },
+
+    "pytest-local-badge[cov]>=1.2.0",
 ]
 
 ###############################################################################################
@@ -66,7 +68,7 @@ extend-select = ["C4"] # Extends the root rules just for this project
 [tool.pytest]
 minversion = "9.0"
 testpaths = ["tests"]
-addopts = ["-ra", "-q", "--cov=src", "--cov-report=html"]
+addopts = ["-ra", "-q", "--cov=src", "--cov-report=html", "--local-badge-output-dir=badges/"]
 pythonpath = ["src"]
 
 [tool.coverage.run]

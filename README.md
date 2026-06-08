@@ -1,4 +1,5 @@
 # Jun Build
+![Coverage](./badges/coverage.svg) ![Duration](./badges/duration.svg) ![Skipped](./badges/skipped.svg) ![Tests](./badges/tests.svg) ![Warnings](./badges/warnings.svg) ![XFailed](./badges/xfailed.svg)
 
 ## 简介
 
