@@ -24,9 +24,16 @@ jun-build = "jun_build.main:app"
 ###############################################################################################
 
 [dependency-groups]
-dev = [
+test = [
     "pytest>=9.0.0",
+    "pytest-cov",
+]
+lint = [
     "ruff>=0.4.0",
+]
+dev = [
+    { include-group = "test" },
+    { include-group = "lint" },
 ]
 
 ###############################################################################################
@@ -59,5 +66,5 @@ extend-select = ["C4"] # Extends the root rules just for this project
 [tool.pytest]
 minversion = "9.0"
 testpaths = ["tests"]
-addopts = ["-ra", "-q"]
+addopts = ["-ra", "-q", "--cov=jun_build", "--cov-report=html"]
 pythonpath = ["src"]
