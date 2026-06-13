@@ -1,11 +1,30 @@
-# Jun Build 开发指南
+# 开发指南
 
-## 环境设置
+本文档概述了为本项目做贡献的工程师所需的工作流、环境搭建以及架构指南。
 
-### 前置要求
+---
 
-- Python >= 3.11
-- [uv](https://docs.astral.sh/uv/) — 用于依赖管理与构建
+## 🛠️ 快速开始与命令中心
+
+```bash
+# 使用 uv 安装项目依赖
+uv sync
+
+# 更新依赖并打包
+uv run jumbo
+
+# 单元测试
+uv run jumbo test
+
+# 构建生产版本代码包
+uv run jumbo release
+```
+
+_参考[Jumbo Build](https://github.com/zephytiju/JumboBuild)了解更多信息。_
+
+## 💻 本地环境搭建
+
+_如果你希望逐步配置环境或需要排查问题，请按以下步骤操作：_
 
 ### 依赖安装
 
@@ -20,136 +39,58 @@ uv sync
 安装完成后，可直接运行以验证环境是否正常：
 
 ```bash
-uv run jun-build --help
+uv run jumbo --help
 ```
 
----
-
-## 项目架构
-
-```
-src/jun_build/
-├── __init__.py
-└── main.py        # CLI 入口，所有命令均在此定义
-```
-
-### 技术栈
-
-| 依赖 | 用途 |
-|------|------|
-| [Typer](https://typer.tiangolo.com/) | CLI 框架，基于类型注解自动解析命令与参数 |
-| [Rich](https://rich.readthedocs.io/) | 终端美化输出（进度面板、彩色文本） |
-| [pytest](https://pytest.org/) | 单元测试框架 |
-| [Ruff](https://docs.astral.sh/ruff/) | 代码格式化与 Lint |
-
-### 命令流水线设计
-
-每个命令由一系列步骤（shell 命令）组成，通过 `run_step` 串联执行。任一步骤失败时，后续步骤将跳过，并最终通过 `finalize_build` 输出结果面板。
-
-当前命令及其步骤：
-
-| 命令 | 步骤 |
-|------|------|
-| `jun-build`（默认） | lock → sync → build |
-| `jun-build test` | lock → sync → build → pytest |
-| `jun-build format` | lock → sync → build → ruff format → ruff check --fix |
-| `jun-build release` | lock → sync → build → pytest → ruff check（严格模式） |
-
----
-
-## 添加新命令
-
-在 `main.py` 中使用 `@app.command()` 装饰器注册新命令：
-
-```python
-@app.command()
-def my_new_command():
-    """描述此命令的用途（会显示在 --help 中）。"""
-    success = (
-        run_step("uv lock --upgrade", "Updating lockfile")
-        and run_step("uv sync", "Syncing environment metadata")
-        and run_step("uv build", "Running python build")
-        and run_step("your-command-here", "描述此步骤")
-    )
-    finalize_build(success)
-```
-
-**约定：**
-- 每个命令的前三步（lock → sync → build）保持一致，确保环境最新
-- 使用短路求值（`and`）实现步骤失败时自动终止
-- 最后必须调用 `finalize_build(success)` 输出结果
-
----
-
-## 测试
-
-### 运行测试
+### 测试验证
 
 ```bash
-# 直接运行 pytest
-uv run pytest -v
-
-# 或通过 jun-build 命令（会先执行构建流水线）
-uv run jun-build test
+uv run jumbo test
+un run jumbo format
 ```
 
-### 编写测试
+## 📐 开发指南与模式
 
-测试文件放在 `tests/` 目录下，文件名以 `test_` 开头：
+_为了保持代码库的整洁与可维护性，我们遵循强调可预测性和解耦的模式，而非僵化的规则。_
 
-```python
-# tests/test_my_feature.py
-def test_example():
-    assert True
-```
+### 代码组织
 
-**约定：**
-- 测试函数命名：`test_<功能描述>`
-- 每个测试函数只验证一个行为
-- 需要时可在 `tests/conftest.py` 中定义共享 fixture
+* 关注点分离：基础设施应与业务逻辑解耦。根据需要引入新的代码模块，以维护架构的可扩展性与可维护性。
+* 异步边界设计：向代理发布事件或任务时，确保消息是自包含的，或使用可预测的资源标识符。避免在线路上传递大量载荷，应改为传递引用。
+* 幂等性：将 Worker 设计为幂等的，可确保对网络抖动和重复消息投递的弹性。
 
----
+### 错误处理理念
 
-## 代码规范
+* 快速且明确地失败。避免使用静默的 catch 块吞掉错误。
+* 区分操作型错误（例如：外部 API 超时、无效的用户输入）和程序型错误（例如：空指针异常、语法错误）。
+* 确保在异常处理期间干净地关闭资源或将资源归还池（连接、通道、文件描述符）。
 
-### 格式化与 Lint
+### Pull Request 与代码审查流程
 
-使用 Ruff 统一代码风格：
+* 提交格式：遵循[Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/)。
+* 分支命名：feat/功能名称、fix/错误名称 或 chore/任务名称。
+* 自动验证：每个 PR 都会通过 CI/CD 自动运行验证矩阵（lint、类型检查、测试）。在请求审查之前，请先修复所有流水线阻塞问题。
+* 审查重点：代码审查高度关注架构一致性、测试覆盖率质量、可扩展性考量以及边缘情况处理，而非繁琐的代码格式风格（格式问题由 linter 自动处理）。
 
-```bash
-# 格式化代码
-uv run ruff format .
+## 🧠 文档理念
 
-# 检查并自动修复
-uv run ruff check --fix .
-```
+我们的文档遵循一条严格规则：**为意图和架构而设计，而非复制代码。** 代码变化迅速；维护一份逐行详尽的代码文件文本日志会产生僵化的、高维护成本的文档负担，且不可避免地会过时。取而代之的是，我们为两类受众提供高层次的上下文文档：**人类工程师** 寻找系统原理，以及 **AI 协作者** 寻找结构上下文。
 
-或通过 jun-build 一键执行：
+### 面向 AI 的文档模式
 
-```bash
-uv run jun-build format
-```
+在与 AI 编码助手协作时，充斥着复制粘贴代码细节的长文件会污染上下文窗口并导致幻觉。AI 模型擅长直接读取源代码——它们所欠缺的是**架构意图**以及**事物的归属位置**的理解。
 
-### Ruff 配置
+为了帮助 AI 正确定位上下文并生成精确的代码变更，请使用下方的核心索引作为参考地图。
 
-配置位于 `pyproject.toml`：
+### 🗺️ 核心组件与模块索引
 
-- `target-version = "py310"` — 兼容 Python 3.10+ 语法
-- `extend-select = ["C4"]` — 在默认规则基础上额外启用 `flake8-comprehensions`
+指示 AI 或指导新开发者在哪里实施变更时，请参考此结构索引：
 
----
+| 领域 / 层级 | 仓库目录 | 职责 / 架构目的 |
+| :--- | :--- | :--- |
+| ... | ... | ... |
 
-## 发布流程
-
-发布前需通过完整检查：
-
-```bash
-# 执行测试 + 严格 lint（无自动修复）
-uv run jun-build release
-```
-
-`release` 命令会依次执行：lock → sync → build → pytest → ruff check（严格模式，不会自动修复），全部通过后方可发布。
-
-### 版本号管理
-
-版本号维护在 `pyproject.toml` 的 `version` 字段，遵循 [SemVer](https://semver.org/) 规范。
+### 如何维护本文档
+* **应当** 在引入全新的架构层或顶层目录时更新此索引。
+* **应当** 为复杂的算法块编写行内代码注释（`JSDoc`、`TSDoc` 等），因为 AI 会直接从源代码中读取这些内容。
+* **不应** 在 Markdown 文件中记录具体的函数签名、参数列表或内部对象结构。让类型系统（TypeScript）和代码结构成为唯一的真相来源。
