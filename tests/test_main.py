@@ -4,7 +4,7 @@ import pytest
 import typer
 from typer.testing import CliRunner
 
-from jun_build.main import app, finalize_build, run_step
+from jumbo_build.main import app, finalize_build, run_step
 
 runner = CliRunner()
 
@@ -15,18 +15,18 @@ runner = CliRunner()
 
 
 class TestRunStep:
-    @patch("jun_build.main.subprocess.run")
+    @patch("jumbo_build.main.subprocess.run")
     def test_returns_true_on_success(self, mock_run):
         mock_run.return_value = MagicMock(returncode=0)
         assert run_step("echo ok", "Step description") is True
         mock_run.assert_called_once_with("echo ok", shell=True)
 
-    @patch("jun_build.main.subprocess.run")
+    @patch("jumbo_build.main.subprocess.run")
     def test_returns_false_on_failure(self, mock_run):
         mock_run.return_value = MagicMock(returncode=1)
         assert run_step("false", "Failing step") is False
 
-    @patch("jun_build.main.subprocess.run")
+    @patch("jumbo_build.main.subprocess.run")
     def test_passes_command_with_shell(self, mock_run):
         mock_run.return_value = MagicMock(returncode=0)
         run_step("uv build", "Building")
@@ -73,7 +73,7 @@ def _success():
 
 
 class TestDefaultCommand:
-    @patch("jun_build.main.subprocess.run", return_value=_success())
+    @patch("jumbo_build.main.subprocess.run", return_value=_success())
     def test_runs_three_steps(self, mock_run):
         result = runner.invoke(app)
         assert mock_run.call_count == 3
@@ -84,12 +84,12 @@ class TestDefaultCommand:
             "uv build",
         ]
 
-    @patch("jun_build.main.subprocess.run", return_value=_success())
+    @patch("jumbo_build.main.subprocess.run", return_value=_success())
     def test_exits_with_code_0(self, mock_run):
         result = runner.invoke(app)
         assert result.exit_code == 0
 
-    @patch("jun_build.main.subprocess.run")
+    @patch("jumbo_build.main.subprocess.run")
     def test_stops_on_first_failure(self, mock_run):
         mock_run.return_value = MagicMock(returncode=1)
         result = runner.invoke(app)
@@ -99,7 +99,7 @@ class TestDefaultCommand:
 
 
 class TestTestCommand:
-    @patch("jun_build.main.subprocess.run", return_value=_success())
+    @patch("jumbo_build.main.subprocess.run", return_value=_success())
     def test_runs_four_steps(self, mock_run):
         result = runner.invoke(app, ["test"])
         assert mock_run.call_count == 4
@@ -111,12 +111,12 @@ class TestTestCommand:
             "pytest -v",
         ]
 
-    @patch("jun_build.main.subprocess.run", return_value=_success())
+    @patch("jumbo_build.main.subprocess.run", return_value=_success())
     def test_exits_with_code_0(self, mock_run):
         result = runner.invoke(app, ["test"])
         assert result.exit_code == 0
 
-    @patch("jun_build.main.subprocess.run")
+    @patch("jumbo_build.main.subprocess.run")
     def test_stops_on_pytest_failure(self, mock_run):
         # First 3 succeed, 4th (pytest) fails
         mock_run.side_effect = [
@@ -131,7 +131,7 @@ class TestTestCommand:
 
 
 class TestFormatCommand:
-    @patch("jun_build.main.subprocess.run", return_value=_success())
+    @patch("jumbo_build.main.subprocess.run", return_value=_success())
     def test_runs_five_steps(self, mock_run):
         result = runner.invoke(app, ["format"])
         assert mock_run.call_count == 5
@@ -144,14 +144,14 @@ class TestFormatCommand:
             "ruff check --fix .",
         ]
 
-    @patch("jun_build.main.subprocess.run", return_value=_success())
+    @patch("jumbo_build.main.subprocess.run", return_value=_success())
     def test_exits_with_code_0(self, mock_run):
         result = runner.invoke(app, ["format"])
         assert result.exit_code == 0
 
 
 class TestReleaseCommand:
-    @patch("jun_build.main.subprocess.run", return_value=_success())
+    @patch("jumbo_build.main.subprocess.run", return_value=_success())
     def test_runs_five_steps(self, mock_run):
         result = runner.invoke(app, ["release"])
         assert mock_run.call_count == 5
@@ -164,12 +164,12 @@ class TestReleaseCommand:
             "ruff check .",
         ]
 
-    @patch("jun_build.main.subprocess.run", return_value=_success())
+    @patch("jumbo_build.main.subprocess.run", return_value=_success())
     def test_exits_with_code_0(self, mock_run):
         result = runner.invoke(app, ["release"])
         assert result.exit_code == 0
 
-    @patch("jun_build.main.subprocess.run")
+    @patch("jumbo_build.main.subprocess.run")
     def test_fails_when_ruff_check_fails(self, mock_run):
         # All succeed except the last ruff check
         mock_run.side_effect = [

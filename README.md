@@ -3,6 +3,7 @@
 Jumbo Build 是 Juntai 内部统一构建系统，旨在为 Juntai 各项目提供一致、可靠的构建与开发体验。当前已支持 Python 项目，未来将扩展至更多编程语言。
 
 ![Coverage](./badges/coverage.svg) ![Duration](./badges/duration.svg) ![Last Run](./badges/last-run.svg)
+
 ![Skipped](./badges/skipped.svg) ![Tests](./badges/tests.svg) ![Warnings](./badges/warnings.svg) ![XFailed](./badges/xfailed.svg)
 
 ---
