@@ -8,7 +8,7 @@ use std::path::Path;
 use std::thread;
 use std::time::Duration;
 
-use crate::language::{detect_language, get_registry};
+use crate::language::get_registry;
 use metadata::{IdeConfig, JumboToml, RepoInfo, WorkspaceConfig};
 
 /// Create a new workspace at the given path.
@@ -173,14 +173,28 @@ pub fn sync_workspace(workspace_root: &Path, _local: bool) -> Result<()> {
     // Update metadata with current state
     metadata.workspace.repositories = current_repos.workspace.repositories;
 
-    // Run language-specific sync for each repo
+    // Run language-specific sync with all repos (each language filters its own)
     let registry = get_registry();
-    for repo in &metadata.workspace.repositories {
-        let repo_path = workspace_root.join(&repo.path);
-        if let Some(lang) = detect_language(&registry, &repo_path) {
-            println!("  Syncing {} project: {}", lang.name(), repo.name);
-            if let Err(e) = lang.sync_workspace(workspace_root, repo, true) {
-                eprintln!("  {} Failed to sync {}: {}", "✗".red(), repo.name, e);
+    for lang in &registry {
+        // Collect repos that this language supports
+        let matching_repos: Vec<_> = metadata
+            .workspace
+            .repositories
+            .iter()
+            .filter(|repo| {
+                let repo_path = workspace_root.join(&repo.path);
+                lang.detect(&repo_path)
+            })
+            .cloned()
+            .collect();
+
+        // Also include repos that are NOT detected by any language (for exclude lists)
+        let all_repos = &metadata.workspace.repositories;
+
+        if !matching_repos.is_empty() {
+            println!("  Syncing {} projects", lang.name());
+            if let Err(e) = lang.sync_workspace(workspace_root, all_repos, true) {
+                eprintln!("  {} Failed to sync {}: {}", "✗".red(), lang.name(), e);
             }
         }
     }

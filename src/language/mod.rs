@@ -14,8 +14,9 @@ pub trait LanguageSupport: Send + Sync {
     /// Detect whether the given repository path contains a project of this language.
     fn detect(&self, repo_path: &Path) -> bool;
 
-    /// Sync workspace configuration for this language (e.g., update pyproject.toml).
-    fn sync_workspace(&self, workspace_root: &Path, repo: &RepoInfo, local: bool) -> Result<()>;
+    /// Sync workspace configuration for ALL repositories of this language at once.
+    /// This allows generating complete config files (e.g., pyproject.toml) in one pass.
+    fn sync_workspace(&self, workspace_root: &Path, repos: &[RepoInfo], local: bool) -> Result<()>;
 
     /// Run the build pipeline for this language.
     fn build(&self, workspace_root: &Path, repo_path: &Path) -> Result<()>;
