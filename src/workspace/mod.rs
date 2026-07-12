@@ -289,6 +289,16 @@ pub fn clean_workspace(workspace_root: &Path) -> Result<()> {
         }
     }
 
+    // Remove any stale jumbo entry point from .venv/bin to avoid PATH conflicts
+    let venv_jumbo = workspace_root.join(".venv").join("bin").join("jumbo");
+    if venv_jumbo.exists() {
+        let _ = std::fs::remove_file(&venv_jumbo);
+    }
+    let venv_jumbo_build = workspace_root.join(".venv").join("bin").join("jumbo-build");
+    if venv_jumbo_build.exists() {
+        let _ = std::fs::remove_file(&venv_jumbo_build);
+    }
+
     // --- Per-repo language-specific artifacts ---
     for repo in &metadata.workspace.repositories {
         let repo_path = workspace_root.join(&repo.path);
