@@ -90,6 +90,21 @@ jumbo workspace watch -i 30
 
 `workspace` 可简写为 `ws`。
 
+### Python 工作空间依赖
+
+Jumbo 会在创建、导入、使用、移除和同步项目时维护工作空间根目录的
+`pyproject.toml`。该文件定义 uv workspace 成员，并在根目录的
+`[tool.uv.sources]` 中维护内部 Python 包的来源：
+
+- `jumbo workspace sync -l` 优先使用已检出的包（`{ workspace = true }`）；
+- 未检出的、已记录远程地址的 Python 包会回退到其 Git 远程地址；
+- 不带 `-l` 的 `workspace sync` 使用已记录的 Git 远程地址。
+
+各项目自己的 `pyproject.toml` 仍负责声明 `project.dependencies`。根目录来源
+配置会应用到所有 uv workspace 成员，除非某个成员为同一依赖提供了自己的来源。
+Jumbo 仅更新它记录在 `[tool.jumbo.workspace_sources]` 中的来源条目，并保留其它
+根目录配置。
+
 ### 构建指令表
 
 | 指令 | 步骤 |

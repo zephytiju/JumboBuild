@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use colored::Colorize;
+use std::collections::BTreeMap;
 use std::path::Path;
 use walkdir::WalkDir;
 
@@ -21,128 +22,116 @@ impl LanguageSupport for PythonSupport {
 
     fn sync_workspace(&self, workspace_root: &Path, repos: &[RepoInfo], local: bool) -> Result<()> {
         let workspace_toml_path = workspace_root.join("pyproject.toml");
+        let content = std::fs::read_to_string(&workspace_toml_path)
+            .with_context(|| format!("Failed to read {}", workspace_toml_path.display()))?;
+        let mut doc: toml::Table = content
+            .parse::<toml::Table>()
+            .with_context(|| "Failed to parse root pyproject.toml")?;
 
-        // Load existing root pyproject.toml or create a fresh one
-        let mut doc: toml::Table = if workspace_toml_path.exists() {
-            let content = std::fs::read_to_string(&workspace_toml_path)
-                .with_context(|| format!("Failed to read {}", workspace_toml_path.display()))?;
-            content
-                .parse::<toml::Table>()
-                .with_context(|| "Failed to parse root pyproject.toml")?
-        } else {
-            return Ok(());
-        };
-
-        // Collect info from each Python repo
-        let mut pkg_names: Vec<String> = Vec::new();
-        let mut member_paths: Vec<String> = Vec::new();
+        let previous_sources = managed_source_names(&doc);
+        let mut generated_sources = BTreeMap::new();
+        let mut member_paths = Vec::new();
+        let mut exclude_paths = Vec::new();
 
         for repo in repos {
-            let repo_toml_path = workspace_root.join(&repo.path).join("pyproject.toml");
-            if !repo_toml_path.exists() {
-                continue;
-            }
-            let repo_content = std::fs::read_to_string(&repo_toml_path)?;
-            let repo_doc: toml::Table = repo_content.parse::<toml::Table>()?;
+            let repo_path = workspace_root.join(&repo.path);
+            let repo_toml_path = repo_path.join("pyproject.toml");
+            let package_name = if repo_toml_path.exists() {
+                let repo_content = std::fs::read_to_string(&repo_toml_path)?;
+                let repo_doc: toml::Table = repo_content.parse::<toml::Table>()?;
+                repo_doc
+                    .get("project")
+                    .and_then(|value| value.as_table())
+                    .and_then(|project| project.get("name"))
+                    .and_then(|name| name.as_str())
+                    .map(str::to_owned)
+            } else {
+                repo.package.clone()
+            };
 
-            if let Some(project) = repo_doc.get("project").and_then(|v| v.as_table()) {
-                if let Some(name) = project.get("name").and_then(|v| v.as_str()) {
-                    pkg_names.push(name.to_string());
+            if let Some(package_name) = package_name {
+                if repo_toml_path.exists() {
                     member_paths.push(repo.path.clone());
                 }
+
+                let source = if local && repo_toml_path.exists() {
+                    let mut source = toml::Table::new();
+                    source.insert("workspace".to_string(), toml::Value::Boolean(true));
+                    Some(source)
+                } else {
+                    repo.remote.as_ref().map(|remote| {
+                        let mut source = toml::Table::new();
+                        source.insert("git".to_string(), toml::Value::String(remote.clone()));
+                        source
+                    })
+                };
+
+                if let Some(source) = source {
+                    generated_sources.insert(package_name, toml::Value::Table(source));
+                }
+            } else if repo_path.exists() {
+                exclude_paths.push(repo.path.clone());
             }
         }
 
-        // --- [project] dependencies ---
-        let project = doc
-            .entry("project")
-            .or_insert_with(|| toml::Value::Table(toml::Table::new()));
-        let project_table = project.as_table_mut().context("[project] is not a table")?;
-        let deps: Vec<toml::Value> = pkg_names
-            .iter()
-            .map(|n| toml::Value::String(n.clone()))
-            .collect();
-        project_table.insert("dependencies".to_string(), toml::Value::Array(deps));
-
-        // --- [tool.uv.sources] ---
         let tool = doc
             .entry("tool")
             .or_insert_with(|| toml::Value::Table(toml::Table::new()));
         let tool_table = tool.as_table_mut().context("[tool] is not a table")?;
-
         let uv = tool_table
             .entry("uv")
             .or_insert_with(|| toml::Value::Table(toml::Table::new()));
         let uv_table = uv.as_table_mut().context("[tool.uv] is not a table")?;
-
-        // Generate sources for each Python package
-        let mut sources_table = toml::Table::new();
-        for repo in repos {
-            let repo_toml_path = workspace_root.join(&repo.path).join("pyproject.toml");
-            if !repo_toml_path.exists() {
-                continue;
-            }
-            let repo_content = std::fs::read_to_string(&repo_toml_path)?;
-            let repo_doc: toml::Table = repo_content.parse::<toml::Table>()?;
-
-            if let Some(project) = repo_doc.get("project").and_then(|v| v.as_table()) {
-                if let Some(pkg_name) = project.get("name").and_then(|v| v.as_str()) {
-                    if local {
-                        let mut source = toml::Table::new();
-                        source.insert(
-                            "workspace".to_string(),
-                            toml::Value::Boolean(true),
-                        );
-                        sources_table.insert(
-                            pkg_name.to_string(),
-                            toml::Value::Table(source),
-                        );
-                    } else if let Some(remote) = &repo.remote {
-                        let mut source = toml::Table::new();
-                        let mut git_table = toml::Table::new();
-                        git_table.insert(
-                            "url".to_string(),
-                            toml::Value::String(remote.clone()),
-                        );
-                        source.insert("git".to_string(), toml::Value::Table(git_table));
-                        sources_table.insert(
-                            pkg_name.to_string(),
-                            toml::Value::Table(source),
-                        );
-                    }
-                }
-            }
+        let mut sources_table = uv_table
+            .get("sources")
+            .and_then(|value| value.as_table())
+            .cloned()
+            .unwrap_or_default();
+        for package_name in previous_sources {
+            sources_table.remove(&package_name);
+        }
+        for (package_name, source) in &generated_sources {
+            sources_table.insert(package_name.clone(), source.clone());
         }
         uv_table.insert("sources".to_string(), toml::Value::Table(sources_table));
 
-        // --- [tool.uv.workspace] members & exclude ---
         let mut ws_table = toml::Table::new();
-
-        // members: explicit list of Python project paths
-        let members: Vec<toml::Value> = member_paths
-            .iter()
-            .map(|p| toml::Value::String(p.clone()))
-            .collect();
-        ws_table.insert("members".to_string(), toml::Value::Array(members));
-
-        // exclude: non-Python repo paths
-        let exclude_paths: Vec<String> = repos
-            .iter()
-            .filter(|repo| {
-                let repo_toml = workspace_root.join(&repo.path).join("pyproject.toml");
-                !repo_toml.exists()
-            })
-            .map(|repo| repo.path.clone())
-            .collect();
+        ws_table.insert(
+            "members".to_string(),
+            toml::Value::Array(
+                member_paths
+                    .into_iter()
+                    .map(toml::Value::String)
+                    .collect(),
+            ),
+        );
         if !exclude_paths.is_empty() {
-            let exclude: Vec<toml::Value> = exclude_paths
-                .iter()
-                .map(|p| toml::Value::String(p.clone()))
-                .collect();
-            ws_table.insert("exclude".to_string(), toml::Value::Array(exclude));
+            ws_table.insert(
+                "exclude".to_string(),
+                toml::Value::Array(
+                    exclude_paths
+                        .into_iter()
+                        .map(toml::Value::String)
+                        .collect(),
+                ),
+            );
         }
-
         uv_table.insert("workspace".to_string(), toml::Value::Table(ws_table));
+
+        let jumbo = tool_table
+            .entry("jumbo")
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+        let jumbo_table = jumbo.as_table_mut().context("[tool.jumbo] is not a table")?;
+        jumbo_table.insert(
+            "workspace_sources".to_string(),
+            toml::Value::Array(
+                generated_sources
+                    .keys()
+                    .cloned()
+                    .map(toml::Value::String)
+                    .collect(),
+            ),
+        );
 
         // Write back
         let new_content = toml::to_string_pretty(&doc)
@@ -254,4 +243,20 @@ impl LanguageSupport for PythonSupport {
         }
         Ok(())
     }
+}
+
+fn managed_source_names(doc: &toml::Table) -> Vec<String> {
+    doc.get("tool")
+        .and_then(|value| value.as_table())
+        .and_then(|tool| tool.get("jumbo"))
+        .and_then(|value| value.as_table())
+        .and_then(|jumbo| jumbo.get("workspace_sources"))
+        .and_then(|value| value.as_array())
+        .map(|sources| {
+            sources
+                .iter()
+                .filter_map(|value| value.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default()
 }
