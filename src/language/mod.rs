@@ -18,16 +18,16 @@ pub trait LanguageSupport: Send + Sync {
     fn sync_workspace(&self, workspace_root: &Path, repo: &RepoInfo, local: bool) -> Result<()>;
 
     /// Run the build pipeline for this language.
-    fn build(&self, repo_path: &Path) -> Result<()>;
+    fn build(&self, workspace_root: &Path, repo_path: &Path) -> Result<()>;
 
     /// Run tests for this language.
-    fn test(&self, repo_path: &Path) -> Result<()>;
+    fn test(&self, workspace_root: &Path, repo_path: &Path) -> Result<()>;
 
     /// Run formatting for this language.
-    fn format(&self, repo_path: &Path) -> Result<()>;
+    fn format(&self, workspace_root: &Path, repo_path: &Path) -> Result<()>;
 
     /// Run release pipeline for this language.
-    fn release(&self, repo_path: &Path) -> Result<()>;
+    fn release(&self, workspace_root: &Path, repo_path: &Path) -> Result<()>;
 }
 
 /// Build the language support registry.

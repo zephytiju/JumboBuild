@@ -89,44 +89,72 @@ impl LanguageSupport for PythonSupport {
         Ok(())
     }
 
-    fn build(&self, _repo_path: &Path) -> Result<()> {
-        let steps = [
-            ("uv lock --upgrade", "Updating lockfile"),
-            ("uv sync", "Syncing environment metadata"),
-            ("uv build", "Running python build"),
-        ];
-        run_steps(&steps)
+    fn build(&self, workspace_root: &Path, repo_path: &Path) -> Result<()> {
+        // uv lock/sync run at workspace root
+        run_steps(
+            &[
+                ("uv lock --upgrade", "Updating lockfile"),
+                ("uv sync", "Syncing environment metadata"),
+            ],
+            workspace_root,
+        )?;
+        // uv build runs in the repo directory
+        run_steps(
+            &[("uv build", "Running python build")],
+            repo_path,
+        )
     }
 
-    fn test(&self, _repo_path: &Path) -> Result<()> {
-        let steps = [
-            ("uv lock --upgrade", "Updating lockfile"),
-            ("uv sync", "Syncing environment metadata"),
-            ("uv build", "Running python build"),
-            ("pytest -v", "Executing rigorous testing suite"),
-        ];
-        run_steps(&steps)
+    fn test(&self, workspace_root: &Path, repo_path: &Path) -> Result<()> {
+        run_steps(
+            &[
+                ("uv lock --upgrade", "Updating lockfile"),
+                ("uv sync", "Syncing environment metadata"),
+            ],
+            workspace_root,
+        )?;
+        run_steps(
+            &[
+                ("uv build", "Running python build"),
+                ("pytest -v", "Executing rigorous testing suite"),
+            ],
+            repo_path,
+        )
     }
 
-    fn format(&self, _repo_path: &Path) -> Result<()> {
-        let steps = [
-            ("uv lock --upgrade", "Updating lockfile"),
-            ("uv sync", "Syncing environment metadata"),
-            ("uv build", "Running python build"),
-            ("ruff format .", "Structuring formats"),
-            ("ruff check --fix .", "Applying automated code lint fixes"),
-        ];
-        run_steps(&steps)
+    fn format(&self, workspace_root: &Path, repo_path: &Path) -> Result<()> {
+        run_steps(
+            &[
+                ("uv lock --upgrade", "Updating lockfile"),
+                ("uv sync", "Syncing environment metadata"),
+            ],
+            workspace_root,
+        )?;
+        run_steps(
+            &[
+                ("uv build", "Running python build"),
+                ("ruff format .", "Structuring formats"),
+                ("ruff check --fix .", "Applying automated code lint fixes"),
+            ],
+            repo_path,
+        )
     }
 
-    fn release(&self, _repo_path: &Path) -> Result<()> {
-        let steps = [
-            ("uv lock --upgrade", "Updating lockfile"),
-            ("uv sync", "Syncing environment metadata"),
-            ("uv build", "Running python build"),
-            ("pytest -v", "Executing rigorous testing suite"),
-            ("ruff check .", "Validating strict rule compliance checks"),
-        ];
-        run_steps(&steps)
+    fn release(&self, workspace_root: &Path, repo_path: &Path) -> Result<()> {
+        run_steps(
+            &[
+                ("uv lock --upgrade", "Updating lockfile"),
+                ("uv sync", "Syncing environment metadata"),
+            ],
+            workspace_root,
+        )?;
+        run_steps(
+            &[
+                ("uv build", "Running python build"),
+                ("pytest -v", "Executing rigorous testing suite"),
+                ("ruff check .", "Validating strict rule compliance checks"),
+            ],
+            repo_path,
+        )
     }
 }

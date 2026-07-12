@@ -52,11 +52,13 @@ pub fn execute(action: Option<BuildAction>) -> Result<()> {
             );
 
             let result = match &action {
-                None | Some(BuildAction::Test) if matches!(action, None) => lang.build(&repo_path),
-                Some(BuildAction::Test) => lang.test(&repo_path),
-                Some(BuildAction::Format) => lang.format(&repo_path),
-                Some(BuildAction::Release) => lang.release(&repo_path),
-                _ => lang.build(&repo_path),
+                None | Some(BuildAction::Test) if matches!(action, None) => {
+                    lang.build(&workspace_root, &repo_path)
+                }
+                Some(BuildAction::Test) => lang.test(&workspace_root, &repo_path),
+                Some(BuildAction::Format) => lang.format(&workspace_root, &repo_path),
+                Some(BuildAction::Release) => lang.release(&workspace_root, &repo_path),
+                _ => lang.build(&workspace_root, &repo_path),
             };
 
             if let Err(e) = result {
