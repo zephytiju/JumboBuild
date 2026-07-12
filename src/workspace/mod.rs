@@ -233,10 +233,42 @@ pub fn clean_workspace(workspace_root: &Path) -> Result<()> {
     let registry = get_registry();
 
     println!(
-        "{} Cleaning build artifacts for all repositories...",
+        "{} Cleaning build artifacts...",
         "➔".blue().bold()
     );
 
+    // --- Workspace root level artifacts ---
+    println!("  Cleaning workspace root...");
+    let mut root_cleaned = 0u32;
+
+    // Remove dist/ directory
+    let dist_dir = workspace_root.join("dist");
+    if dist_dir.exists() {
+        if std::fs::remove_dir_all(&dist_dir).is_ok() {
+            println!("    {} Removed {}", "-".dimmed(), dist_dir.display());
+            root_cleaned += 1;
+        }
+    }
+
+    // Remove *.egg-info/ directories
+    if let Ok(entries) = std::fs::read_dir(workspace_root) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if entry.path().is_dir() && name_str.ends_with(".egg-info") {
+                if std::fs::remove_dir_all(entry.path()).is_ok() {
+                    println!("    {} Removed {}", "-".dimmed(), entry.path().display());
+                    root_cleaned += 1;
+                }
+            }
+        }
+    }
+
+    if root_cleaned == 0 {
+        println!("    {} No workspace-level artifacts found", "-".dimmed());
+    }
+
+    // --- Per-repo language-specific artifacts ---
     for repo in &metadata.workspace.repositories {
         let repo_path = workspace_root.join(&repo.path);
         if !repo_path.exists() {
