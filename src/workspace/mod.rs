@@ -24,7 +24,7 @@ pub fn create_workspace(path: &Path, name: &str, import_existing: bool) -> Resul
         workspace: WorkspaceConfig {
             name: name.to_string(),
             repositories: Vec::new(),
-            ide: Some(IdeConfig { ide_type: "vscode".to_string() }),
+            ide: Some(IdeConfig { ide_type: "vscode".to_string(), ..Default::default() }),
         },
     };
 

@@ -31,6 +31,20 @@ pub struct RepoInfo {
 pub struct IdeConfig {
     #[serde(rename = "type")]
     pub ide_type: String,
+    /// Enable VSCode git auto repository detection
+    #[serde(default = "default_true")]
+    pub git_auto_repo_detection: bool,
+    /// Max depth for VSCode git repository scanning
+    #[serde(default = "default_scan_depth")]
+    pub git_repo_scan_max_depth: u32,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_scan_depth() -> u32 {
+    2
 }
 
 impl JumboToml {

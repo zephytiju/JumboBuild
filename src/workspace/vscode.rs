@@ -10,20 +10,31 @@ pub fn generate_vscode_workspace(workspace_root: &Path, metadata: &JumboToml) ->
     let file_name = format!("{}.code-workspace", name);
     let file_path = workspace_root.join(&file_name);
 
-    let folders: Vec<_> = metadata
-        .workspace
-        .repositories
-        .iter()
-        .map(|repo| {
-            json!({
-                "path": repo.path
-            })
-        })
-        .collect();
+    // Root folder entry for the entire workspace
+    let mut folders = vec![json!({
+        "name": "ALL REPOSITORIES (ROOT)",
+        "path": "."
+    })];
+
+    // Add each repository as a folder
+    for repo in &metadata.workspace.repositories {
+        folders.push(json!({
+            "path": repo.path
+        }));
+    }
+
+    // Build settings from IDE config
+    let settings = match &metadata.workspace.ide {
+        Some(ide) => json!({
+            "git.autoRepositoryDetection": ide.git_auto_repo_detection,
+            "git.repositoryScanMaxDepth": ide.git_repo_scan_max_depth
+        }),
+        None => json!({}),
+    };
 
     let workspace_json = json!({
         "folders": folders,
-        "settings": {}
+        "settings": settings
     });
 
     let content = serde_json::to_string_pretty(&workspace_json)
