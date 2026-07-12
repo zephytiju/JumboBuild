@@ -9,6 +9,7 @@ use std::thread;
 use std::time::Duration;
 
 use crate::language::{detect_language, get_registry};
+use crate::utils::runner::run_steps;
 use metadata::{IdeConfig, JumboToml, RepoInfo, WorkspaceConfig};
 
 /// Create a new workspace at the given path.
@@ -250,6 +251,15 @@ pub fn clean_workspace(workspace_root: &Path) -> Result<()> {
         }
     }
 
+    // Remove .venv/ directory
+    let venv_dir = workspace_root.join(".venv");
+    if venv_dir.exists() {
+        if std::fs::remove_dir_all(&venv_dir).is_ok() {
+            println!("    {} Removed {}", "-".dimmed(), venv_dir.display());
+            root_cleaned += 1;
+        }
+    }
+
     // Remove *.egg-info/ directories
     if let Ok(entries) = std::fs::read_dir(workspace_root) {
         for entry in entries.flatten() {
@@ -266,6 +276,17 @@ pub fn clean_workspace(workspace_root: &Path) -> Result<()> {
 
     if root_cleaned == 0 {
         println!("    {} No workspace-level artifacts found", "-".dimmed());
+    }
+
+    // Rebuild environment if .venv was removed
+    if !venv_dir.exists() && workspace_root.join("pyproject.toml").exists() {
+        println!("  Rebuilding environment...");
+        if let Err(e) = run_steps(
+            &[("uv sync", "Syncing dependencies")],
+            workspace_root,
+        ) {
+            eprintln!("  {} Failed to rebuild environment: {}", "✗".red(), e);
+        }
     }
 
     // --- Per-repo language-specific artifacts ---
