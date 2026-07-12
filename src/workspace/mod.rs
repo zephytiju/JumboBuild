@@ -140,23 +140,18 @@ pub fn use_repository(workspace_root: &Path, repo_url: &str) -> Result<()> {
     Ok(())
 }
 
-/// Import an existing folder as a repository in the workspace.
-pub fn import_project(workspace_root: &Path, project_path: &str) -> Result<()> {
+/// Import a single project by name, looking it up under `projects/` in the workspace.
+pub fn import_project(workspace_root: &Path, project_name: &str) -> Result<()> {
     let mut metadata = JumboToml::load(workspace_root)?;
 
-    let abs_path = workspace_root.join(project_path);
+    let rel_path = format!("projects/{}", project_name);
+    let abs_path = workspace_root.join(&rel_path);
     if !abs_path.exists() {
-        bail!("Path does not exist: {}", abs_path.display());
+        bail!("Project not found at {}", abs_path.display());
     }
 
-    let name = abs_path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .map(String::from)
-        .context("Invalid project path")?;
-
-    if metadata.find_repo(&name).is_some() {
-        bail!("Repository '{}' is already registered in the workspace", name);
+    if metadata.find_repo(project_name).is_some() {
+        bail!("Repository '{}' is already registered in the workspace", project_name);
     }
 
     // Detect git remote if available
@@ -169,20 +164,90 @@ pub fn import_project(workspace_root: &Path, project_path: &str) -> Result<()> {
         });
 
     let repo_info = RepoInfo {
-        name: name.clone(),
-        path: project_path.to_string(),
+        name: project_name.to_string(),
+        path: rel_path,
         remote,
     };
 
     metadata.workspace.repositories.push(repo_info);
     metadata.save(workspace_root)?;
 
-    println!("{} Project '{}' imported into workspace", "✓".green().bold(), name);
+    println!("{} Project '{}' imported into workspace", "✓".green().bold(), project_name);
 
     // Update VSCode workspace
     if let Some(ref ide) = metadata.workspace.ide {
         if ide.ide_type == "vscode" {
             vscode::generate_vscode_workspace(workspace_root, &metadata)?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Import all folders under `projects/` that are not yet registered in the workspace.
+pub fn import_all_projects(workspace_root: &Path) -> Result<()> {
+    let mut metadata = JumboToml::load(workspace_root)?;
+
+    let projects_dir = workspace_root.join("projects");
+    if !projects_dir.exists() {
+        bail!("projects/ directory not found in workspace");
+    }
+
+    let mut imported = 0u32;
+    for entry in std::fs::read_dir(&projects_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(String::from)
+            .unwrap_or_default();
+
+        if name.is_empty() {
+            continue;
+        }
+
+        // Skip already registered repositories
+        if metadata.find_repo(&name).is_some() {
+            continue;
+        }
+
+        let rel_path = format!("projects/{}", name);
+
+        // Detect git remote if available
+        let remote = git2::Repository::open(&path)
+            .ok()
+            .and_then(|repo| {
+                repo.find_remote("origin")
+                    .ok()
+                    .and_then(|r| r.url().map(String::from))
+            });
+
+        let repo_info = RepoInfo {
+            name: name.clone(),
+            path: rel_path,
+            remote,
+        };
+
+        metadata.workspace.repositories.push(repo_info);
+        println!("{} Project '{}' imported into workspace", "✓".green().bold(), name);
+        imported += 1;
+    }
+
+    if imported == 0 {
+        println!("{} No new projects to import", "➔".blue().bold());
+    } else {
+        metadata.save(workspace_root)?;
+
+        // Update VSCode workspace
+        if let Some(ref ide) = metadata.workspace.ide {
+            if ide.ide_type == "vscode" {
+                vscode::generate_vscode_workspace(workspace_root, &metadata)?;
+            }
         }
     }
 

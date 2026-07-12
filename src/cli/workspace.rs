@@ -2,7 +2,8 @@ use anyhow::{bail, Context, Result};
 use clap::{Args, Subcommand};
 
 use crate::workspace::{
-    clean_workspace, create_workspace, import_project, sync_workspace, use_repository, watch_workspace,
+    clean_workspace, create_workspace, import_all_projects, import_project, sync_workspace,
+    use_repository, watch_workspace,
 };
 use crate::workspace::detection::ensure_in_workspace;
 
@@ -47,8 +48,9 @@ pub struct UseArgs {
 
 #[derive(Args)]
 pub struct ImportArgs {
-    /// Path(s) to the project folder(s) to import (relative to workspace root, can be specified multiple times)
-    #[arg(short, long, required = true, num_args = 1..)]
+    /// Name(s) of project(s) under projects/ to import.
+    /// If omitted, all folders under projects/ are imported automatically.
+    #[arg(short, long, num_args = 1..)]
     pub project: Vec<String>,
 }
 
@@ -103,8 +105,13 @@ pub fn execute(args: WorkspaceArgs) -> Result<()> {
         }
         WorkspaceAction::Import(import_args) => {
             let workspace_root = ensure_in_workspace()?;
-            for project_path in &import_args.project {
-                import_project(&workspace_root, project_path)?;
+            if import_args.project.is_empty() {
+                // No -p: auto-import all folders under projects/
+                import_all_projects(&workspace_root)?;
+            } else {
+                for project_path in &import_args.project {
+                    import_project(&workspace_root, project_path)?;
+                }
             }
         }
         WorkspaceAction::Sync(sync_args) => {

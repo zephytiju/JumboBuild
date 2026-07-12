@@ -69,8 +69,11 @@ jumbo workspace create <name> -i
 # 克隆仓库到工作空间（支持多个）
 jumbo workspace use -r <git-repo-url> [-r <git-repo-url> ...]
 
-# 导入本地已有项目（支持多个）
-jumbo workspace import -p <project-path> [-p <project-path> ...]
+# 自动导入 projects/ 下所有项目（推荐）
+jumbo workspace import
+
+# 导入指定项目（支持多个，名称位于 projects/ 下）
+jumbo workspace import -p <project-name> [-p <project-name> ...]
 
 # 同步工作空间配置（更新依赖源等）
 jumbo workspace sync -l
