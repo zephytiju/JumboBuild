@@ -29,6 +29,9 @@ pub trait LanguageSupport: Send + Sync {
 
     /// Run release pipeline for this language.
     fn release(&self, workspace_root: &Path, repo_path: &Path) -> Result<()>;
+
+    /// Clean build artifacts for this language in the given repository.
+    fn clean(&self, repo_path: &Path) -> Result<()>;
 }
 
 /// Build the language support registry.

@@ -21,6 +21,8 @@ pub enum Commands {
     Format,
     /// Run release pipeline (= build release)
     Release,
+    /// Clean build artifacts (= build clear)
+    Clear,
     /// Manage Jumbo workspace
     #[command(alias = "ws")]
     Workspace(workspace::WorkspaceArgs),

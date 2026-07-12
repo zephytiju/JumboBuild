@@ -2,7 +2,7 @@ use anyhow::Result;
 use clap::{Args, Subcommand};
 
 use crate::workspace::{
-    create_workspace, import_project, sync_workspace, use_repository, watch_workspace,
+    clear_workspace, create_workspace, import_project, sync_workspace, use_repository, watch_workspace,
 };
 use crate::workspace::detection::ensure_in_workspace;
 
@@ -24,6 +24,8 @@ pub enum WorkspaceAction {
     Sync(SyncArgs),
     /// Watch workspace and periodically sync
     Watch(WatchArgs),
+    /// Clean build artifacts for all repositories
+    Clear,
 }
 
 #[derive(Args)]
@@ -95,6 +97,10 @@ pub fn execute(args: WorkspaceArgs) -> Result<()> {
         WorkspaceAction::Watch(watch_args) => {
             let workspace_root = ensure_in_workspace()?;
             watch_workspace(&workspace_root, watch_args.interval)?;
+        }
+        WorkspaceAction::Clear => {
+            let workspace_root = ensure_in_workspace()?;
+            clear_workspace(&workspace_root)?;
         }
     }
     Ok(())

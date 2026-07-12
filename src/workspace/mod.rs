@@ -8,7 +8,7 @@ use std::path::Path;
 use std::thread;
 use std::time::Duration;
 
-use crate::language::get_registry;
+use crate::language::{detect_language, get_registry};
 use metadata::{IdeConfig, JumboToml, RepoInfo, WorkspaceConfig};
 
 /// Create a new workspace at the given path.
@@ -225,6 +225,34 @@ pub fn watch_workspace(workspace_root: &Path, interval_secs: u64) -> Result<()> 
         }
         thread::sleep(Duration::from_secs(interval_secs));
     }
+}
+
+/// Clean build artifacts for all repositories in the workspace.
+pub fn clear_workspace(workspace_root: &Path) -> Result<()> {
+    let metadata = JumboToml::load(workspace_root)?;
+    let registry = get_registry();
+
+    println!(
+        "{} Cleaning build artifacts for all repositories...",
+        "➔".blue().bold()
+    );
+
+    for repo in &metadata.workspace.repositories {
+        let repo_path = workspace_root.join(&repo.path);
+        if !repo_path.exists() {
+            continue;
+        }
+
+        if let Some(lang) = detect_language(&registry, &repo_path) {
+            println!("  Cleaning {} project: {}", lang.name(), repo.name);
+            if let Err(e) = lang.clean(&repo_path) {
+                eprintln!("  {} Failed to clean {}: {}", "✗".red(), repo.name, e);
+            }
+        }
+    }
+
+    println!("{} Workspace cleaned", "✓".green().bold());
+    Ok(())
 }
 
 /// Scan the projects/ directory and build a metadata structure.

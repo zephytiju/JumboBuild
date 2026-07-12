@@ -1,5 +1,7 @@
 use anyhow::{Context, Result};
+use colored::Colorize;
 use std::path::Path;
+use walkdir::WalkDir;
 
 use super::LanguageSupport;
 use crate::utils::runner::run_steps;
@@ -217,5 +219,39 @@ impl LanguageSupport for PythonSupport {
             ],
             repo_path,
         )
+    }
+
+    fn clean(&self, repo_path: &Path) -> Result<()> {
+        let dir_patterns = &["__pycache__", ".pytest_cache", "dist", "build", "htmlcov", ".mypy_cache", ".ruff_cache"];
+        let file_patterns = &[".coverage"];
+        let glob_suffixes = &[".egg-info"];
+
+        let mut cleaned = 0u32;
+
+        // Remove matching directories (walk bottom-up to handle nested __pycache__)
+        for entry in WalkDir::new(repo_path).into_iter().filter_map(|e| e.ok()) {
+            let name = entry.file_name().to_string_lossy();
+
+            if entry.file_type().is_dir() {
+                if dir_patterns.contains(&name.as_ref()) || glob_suffixes.iter().any(|s| name.ends_with(s)) {
+                    if std::fs::remove_dir_all(entry.path()).is_ok() {
+                        println!("    {} Removed {}", "-".dimmed(), entry.path().display());
+                        cleaned += 1;
+                    }
+                }
+            } else if entry.file_type().is_file() {
+                if file_patterns.contains(&name.as_ref()) {
+                    if std::fs::remove_file(entry.path()).is_ok() {
+                        println!("    {} Removed {}", "-".dimmed(), entry.path().display());
+                        cleaned += 1;
+                    }
+                }
+            }
+        }
+
+        if cleaned > 0 {
+            println!("  {} Cleaned {} Python artifact(s) in {}", "✓".green(), cleaned, repo_path.display());
+        }
+        Ok(())
     }
 }

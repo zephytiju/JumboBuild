@@ -16,6 +16,7 @@ fn main() -> Result<()> {
         Some(Commands::Test) => build::execute_test()?,
         Some(Commands::Format) => build::execute_format()?,
         Some(Commands::Release) => build::execute_release()?,
+        Some(Commands::Clear) => build::execute_clear()?,
         Some(Commands::Workspace(args)) => cli::workspace::execute(args)?,
         None => {
             // Default: run build
