@@ -1,96 +1,193 @@
 # 开发指南
 
-本文档概述了为本项目做贡献的工程师所需的工作流、环境搭建以及架构指南。
+本文档面向 Jumbo Build 内部开发者，涵盖环境搭建、架构设计与语言扩展指南。
 
 ---
 
-## 🛠️ 快速开始与命令中心
+## 快速开始
 
 ```bash
-# 使用 uv 安装项目依赖
-uv sync
+# 克隆仓库
+git clone <repo-url> && cd JumboBuild
 
-# 更新依赖并打包
-uv run jumbo
+# 构建开发版本
+cargo build
 
-# 单元测试
-uv run jumbo test
+# 构建发布版本
+cargo build --release
 
-# 构建生产版本代码包
-uv run jumbo release
+# 运行并测试 CLI
+cargo run -- --help
+
+# 运行单元测试
+cargo test
 ```
 
-_参考[Jumbo Build](https://github.com/zephytiju/JumboBuild)了解更多信息。_
+## 本地环境搭建
 
-## 💻 本地环境搭建
+### 前置条件
 
-_如果你希望逐步配置环境或需要排查问题，请按以下步骤操作：_
+- Rust stable（推荐通过 rustup 安装）
+- macOS 或 Linux
 
-### 依赖安装
-
-克隆仓库后，使用 uv 安装所有开发依赖：
+### 验证环境
 
 ```bash
-uv sync
+cargo run -- --version
+cargo run -- workspace --help
 ```
 
-### 本地验证
+---
 
-安装完成后，可直接运行以验证环境是否正常：
+## 架构概览
 
-```bash
-uv run jumbo --help
+Jumbo Build 采用模块化设计，核心分为四个层次：
+
+```
+src/
+├── main.rs              # 入口：CLI 解析与命令分发
+├── cli/                  # 命令定义层：clap derive 宏定义所有子命令
+│   ├── mod.rs            # Cli struct + Commands enum
+│   ├── build.rs          # build / test / format / release 命令执行
+│   └── workspace.rs      # workspace (ws) 子命令执行
+├── workspace/            # 工作空间核心层
+│   ├── mod.rs            # 工作空间操作（create/use/import/sync/watch）
+│   ├── metadata.rs       # jumbo.toml 元数据模型与读写
+│   ├── detection.rs      # 工作空间根目录检测（向上递归）
+│   └── vscode.rs         # VSCode .code-workspace 文件生成
+├── language/             # 语言插件层
+│   ├── mod.rs            # LanguageSupport trait 定义 + 注册表
+│   └── python.rs         # Python 语言支持实现
+└── utils/
+    ├── mod.rs
+    └── runner.rs          # Shell 命令执行器
 ```
 
-### 测试验证
+### 核心数据流
 
-```bash
-uv run jumbo test
-un run jumbo format
+1. `main.rs` 解析 CLI 参数，分发到 `cli/` 层
+2. `cli/` 层调用 `workspace/` 获取元数据和环境信息
+3. `cli/` 层调用 `language/` 插件执行语言特定操作
+4. `utils/runner.rs` 负责实际 shell 命令执行与输出
+
+### 技术栈
+
+- **语言**: Rust (edition 2021)
+- **CLI 框架**: clap 4 (derive 宏)
+- **序列化**: serde + toml (元数据) + serde_json (VSCode workspace)
+- **Git 操作**: git2 (原生 libgit2 绑定)
+- **错误处理**: anyhow + thiserror
+- **终端着色**: colored
+
+---
+
+## 工作空间元数据
+
+工作空间根目录维护 `jumbo.toml` 文件：
+
+```toml
+[workspace]
+name = "my_workspace"
+
+[[workspace.repositories]]
+name = "RepoA"
+path = "projects/RepoA"
+
+[[workspace.repositories]]
+name = "RepoB"
+path = "projects/RepoB"
+remote = "https://github.com/org/RepoB.git"
+
+[workspace.ide]
+type = "vscode"
 ```
 
-## 📐 开发指南与模式
+`sync` 命令会根据 `projects/` 目录的实际状态更新此文件，并在本地模式下将依赖源配置为 workspace 成员。
 
-_为了保持代码库的整洁与可维护性，我们遵循强调可预测性和解耦的模式，而非僵化的规则。_
+---
 
-### 代码组织
+## 语言扩展指南
 
-* 关注点分离：基础设施应与业务逻辑解耦。根据需要引入新的代码模块，以维护架构的可扩展性与可维护性。
-* 异步边界设计：向代理发布事件或任务时，确保消息是自包含的，或使用可预测的资源标识符。避免在线路上传递大量载荷，应改为传递引用。
-* 幂等性：将 Worker 设计为幂等的，可确保对网络抖动和重复消息投递的弹性。
+添加新语言支持只需三步：
 
-### 错误处理理念
+### 1. 实现 LanguageSupport trait
 
-* 快速且明确地失败。避免使用静默的 catch 块吞掉错误。
-* 区分操作型错误（例如：外部 API 超时、无效的用户输入）和程序型错误（例如：空指针异常、语法错误）。
-* 确保在异常处理期间干净地关闭资源或将资源归还池（连接、通道、文件描述符）。
+在 `src/language/` 下新建文件，例如 `rust_lang.rs`：
 
-### Pull Request 与代码审查流程
+```rust
+use super::LanguageSupport;
+use crate::workspace::metadata::RepoInfo;
+use anyhow::Result;
+use std::path::Path;
 
-* 提交格式：遵循[Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/)。
-* 分支命名：feat/功能名称、fix/错误名称 或 chore/任务名称。
-* 自动验证：每个 PR 都会通过 CI/CD 自动运行验证矩阵（lint、类型检查、测试）。在请求审查之前，请先修复所有流水线阻塞问题。
-* 审查重点：代码审查高度关注架构一致性、测试覆盖率质量、可扩展性考量以及边缘情况处理，而非繁琐的代码格式风格（格式问题由 linter 自动处理）。
+pub struct RustSupport;
 
-## 🧠 文档理念
+impl LanguageSupport for RustSupport {
+    fn name(&self) -> &str { "rust" }
+    fn detect(&self, repo_path: &Path) -> bool {
+        repo_path.join("Cargo.toml").exists()
+    }
+    fn sync_workspace(&self, ws_root: &Path, repo: &RepoInfo, local: bool) -> Result<()> {
+        Ok(()) // 按需实现
+    }
+    fn build(&self, _repo_path: &Path) -> Result<()> { /* ... */ Ok(()) }
+    fn test(&self, _repo_path: &Path) -> Result<()> { /* ... */ Ok(()) }
+    fn format(&self, _repo_path: &Path) -> Result<()> { /* ... */ Ok(()) }
+    fn release(&self, _repo_path: &Path) -> Result<()> { /* ... */ Ok(()) }
+}
+```
 
-我们的文档遵循一条严格规则：**为意图和架构而设计，而非复制代码。** 代码变化迅速；维护一份逐行详尽的代码文件文本日志会产生僵化的、高维护成本的文档负担，且不可避免地会过时。取而代之的是，我们为两类受众提供高层次的上下文文档：**人类工程师** 寻找系统原理，以及 **AI 协作者** 寻找结构上下文。
+### 2. 在 language/mod.rs 中声明模块
 
-### 面向 AI 的文档模式
+```rust
+pub mod rust_lang;
+```
 
-在与 AI 编码助手协作时，充斥着复制粘贴代码细节的长文件会污染上下文窗口并导致幻觉。AI 模型擅长直接读取源代码——它们所欠缺的是**架构意图**以及**事物的归属位置**的理解。
+### 3. 注册到 get_registry()
 
-为了帮助 AI 正确定位上下文并生成精确的代码变更，请使用下方的核心索引作为参考地图。
+```rust
+pub fn get_registry() -> Vec<Box<dyn LanguageSupport>> {
+    vec![
+        Box::new(python::PythonSupport),
+        Box::new(rust_lang::RustSupport),
+    ]
+}
+```
 
-### 🗺️ 核心组件与模块索引
+语言检测自动进行——`detect()` 返回 true 的第一个匹配语言将被使用。
 
-指示 AI 或指导新开发者在哪里实施变更时，请参考此结构索引：
+---
 
-| 领域 / 层级 | 仓库目录 | 职责 / 架构目的 |
-| :--- | :--- | :--- |
-| ... | ... | ... |
+## 开发规范
 
-### 如何维护本文档
-* **应当** 在引入全新的架构层或顶层目录时更新此索引。
-* **应当** 为复杂的算法块编写行内代码注释（`JSDoc`、`TSDoc` 等），因为 AI 会直接从源代码中读取这些内容。
-* **不应** 在 Markdown 文件中记录具体的函数签名、参数列表或内部对象结构。让类型系统（TypeScript）和代码结构成为唯一的真相来源。
+### 提交格式
+
+遵循 [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/)：`feat:`, `fix:`, `chore:`, `refactor:` 等。
+
+### 代码风格
+
+- 使用 `cargo fmt` 格式化代码
+- 使用 `cargo clippy` 检查代码质量
+- 提交前确保 `cargo build` 和 `cargo test` 通过
+
+### 模块组织原则
+
+- **关注点分离**: CLI 定义、工作空间逻辑、语言插件各自独立
+- **插件化**: 新语言只需实现 trait + 注册，不修改核心代码
+- **自动检测**: 语言识别通过文件签名（如 `pyproject.toml`）自动完成
+
+---
+
+## 核心模块索引
+
+| 领域 | 文件 | 职责 |
+|------|------|------|
+| CLI 入口 | `cli/mod.rs` | clap 命令结构定义 |
+| 构建执行 | `cli/build.rs` | 遍历仓库，调用语言插件执行构建 |
+| 工作空间命令 | `cli/workspace.rs` | create/use/import/sync/watch 参数解析 |
+| 元数据 | `workspace/metadata.rs` | jumbo.toml 模型定义与 IO |
+| 空间检测 | `workspace/detection.rs` | 向上递归查找 workspace root |
+| IDE 集成 | `workspace/vscode.rs` | .code-workspace 文件生成 |
+| 语言 trait | `language/mod.rs` | LanguageSupport 定义 + 注册表 |
+| Python 支持 | `language/python.rs` | Python 构建/测试/格式化/sync |
+| 命令执行 | `utils/runner.rs` | shell 命令封装 |
