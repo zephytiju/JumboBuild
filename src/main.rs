@@ -4,11 +4,18 @@ mod utils;
 mod workspace;
 
 use anyhow::Result;
-use clap::Parser;
+use clap::{CommandFactory, Parser};
+use clap_complete::generate;
+use clap_complete::CompleteEnv;
 
 use cli::{build, Cli, Commands};
 
 fn main() -> Result<()> {
+    // Dynamic shell completion: activated via `COMPLETE=<shell> jumbo`.
+    // When the env var is set, this generates the registration script or
+    // returns completion candidates and exits. Otherwise it is a no-op.
+    CompleteEnv::with_factory(Cli::command).complete();
+
     let cli = Cli::parse();
 
     match cli.command {
@@ -18,6 +25,10 @@ fn main() -> Result<()> {
         Some(Commands::Release) => build::execute_release()?,
         Some(Commands::Clean) => build::execute_clean()?,
         Some(Commands::Workspace(args)) => cli::workspace::execute(args)?,
+        Some(Commands::Completions(args)) => {
+            let mut cmd = Cli::command();
+            generate(args.shell, &mut cmd, "jumbo", &mut std::io::stdout());
+        }
         None => {
             // Default: run build
             build::execute(None)?;

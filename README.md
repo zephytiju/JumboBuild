@@ -75,6 +75,12 @@ jumbo workspace import
 # 导入指定项目（支持多个，名称位于 projects/ 下）
 jumbo workspace import -p <project-name> [-p <project-name> ...]
 
+# 移除项目（同时删除目录、更新元数据、IDE 配置；若有未提交更改会提示确认）
+jumbo workspace remove -p <project-name> [-p <project-name> ...]
+
+# 跳过确认直接移除（适合脚本使用）
+jumbo workspace remove -p <project-name> --yes
+
 # 同步工作空间配置（更新依赖源等）
 jumbo workspace sync -l
 
@@ -92,6 +98,27 @@ jumbo workspace watch -i 30
 | `jumbo test` | lock → sync → build → pytest |
 | `jumbo format` | lock → sync → build → ruff format → ruff check --fix |
 | `jumbo release` | lock → sync → build → pytest → ruff check（严格模式） |
+
+---
+
+### Shell 自动补全
+
+安装脚本 `install.sh` 会自动配置动态补全（支持 zsh / bash / fish），无需手动设置。
+
+安装后，按 Tab 即可实时补全 `projects/` 下的项目名称（如 `import -p`、`remove -p`）。
+
+如需手动配置：
+
+```bash
+# zsh
+echo 'source <(COMPLETE=zsh jumbo)' >> ~/.zshrc
+
+# bash
+echo 'source <(COMPLETE=bash jumbo)' >> ~/.bashrc
+
+# fish
+echo 'COMPLETE=fish jumbo | source' >> ~/.config/fish/completions/jumbo.fish
+```
 
 ---
 

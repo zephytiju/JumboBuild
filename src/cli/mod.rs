@@ -2,6 +2,7 @@ pub mod build;
 pub mod workspace;
 
 use clap::{Parser, Subcommand};
+use clap_complete::Shell;
 
 /// Jumbo Build - Juntai internal unified build tool
 #[derive(Parser)]
@@ -26,4 +27,12 @@ pub enum Commands {
     /// Manage Jumbo workspace
     #[command(alias = "ws")]
     Workspace(workspace::WorkspaceArgs),
+    /// Generate shell completion scripts
+    Completions(CompletionsArgs),
+}
+
+#[derive(Parser)]
+pub struct CompletionsArgs {
+    /// Target shell
+    pub shell: Shell,
 }

@@ -4,6 +4,7 @@ pub mod vscode;
 
 use anyhow::{bail, Context, Result};
 use colored::Colorize;
+use std::io::{self, BufRead, Write};
 use std::path::Path;
 use std::thread;
 use std::time::Duration;
@@ -181,6 +182,148 @@ pub fn import_project(workspace_root: &Path, project_name: &str) -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+/// Remove a project from the workspace: metadata, directory, and IDE configuration.
+/// If the project has uncommitted git changes and `force` is false, prompt the user for confirmation.
+pub fn remove_project(workspace_root: &Path, project_name: &str, force: bool) -> Result<()> {
+    let mut metadata = JumboToml::load(workspace_root)?;
+
+    // Verify the project is registered in the workspace
+    let repo = metadata
+        .find_repo(project_name)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("Project '{}' is not registered in the workspace", project_name))?;
+
+    let abs_path = workspace_root.join(&repo.path);
+
+    // Check for pending git changes
+    let has_pending_changes = if abs_path.exists() {
+        check_pending_git_changes(&abs_path)?
+    } else {
+        false
+    };
+
+    if has_pending_changes && !force {
+        eprintln!(
+            "{} Project '{}' has uncommitted changes:",
+            "!".yellow().bold(),
+            project_name
+        );
+        print_pending_changes_summary(&abs_path)?;
+        eprint!("  Are you sure you want to remove it? [y/N] ");
+        io::stderr().flush()?;
+
+        let stdin = io::stdin();
+        let mut answer = String::new();
+        stdin.lock().read_line(&mut answer)?;
+        let answer = answer.trim().to_lowercase();
+
+        if answer != "y" && answer != "yes" {
+            println!("{} Removal of '{}' cancelled", "➔".blue().bold(), project_name);
+            return Ok(());
+        }
+    }
+
+    // Remove the project directory from disk
+    if abs_path.exists() {
+        std::fs::remove_dir_all(&abs_path).with_context(|| {
+            format!("Failed to remove project directory at {}", abs_path.display())
+        })?;
+        println!("{} Removed directory {}", "✓".green().bold(), abs_path.display());
+    }
+
+    // Remove from metadata
+    metadata.workspace.repositories.retain(|r| r.name != project_name);
+    metadata.save(workspace_root)?;
+    println!(
+        "{} Removed project '{}' from workspace metadata",
+        "✓".green().bold(),
+        project_name
+    );
+
+    // Run language-specific sync to update workspace configs (e.g. pyproject.toml)
+    let registry = get_registry();
+    let all_repos = &metadata.workspace.repositories;
+    for lang in &registry {
+        let matching: Vec<_> = metadata
+            .workspace
+            .repositories
+            .iter()
+            .filter(|r| {
+                let rp = workspace_root.join(&r.path);
+                lang.detect(&rp)
+            })
+            .cloned()
+            .collect();
+        if !matching.is_empty() || lang.name() == "python" {
+            // Always re-sync Python to rebuild members/dependencies after removal
+            if let Err(e) = lang.sync_workspace(workspace_root, all_repos, true) {
+                eprintln!("  {} Failed to sync {}: {}", "✗".red(), lang.name(), e);
+            }
+        }
+    }
+
+    // Regenerate VSCode workspace file
+    if let Some(ref ide) = metadata.workspace.ide {
+        if ide.ide_type == "vscode" {
+            vscode::generate_vscode_workspace(workspace_root, &metadata)?;
+        }
+    }
+
+    println!(
+        "{} Project '{}' removed from workspace",
+        "✓".green().bold(),
+        project_name
+    );
+    Ok(())
+}
+
+/// Check whether a git repository has uncommitted changes (staged, unstaged, or untracked files).
+fn check_pending_git_changes(repo_path: &Path) -> Result<bool> {
+    let repo = match git2::Repository::open(repo_path) {
+        Ok(r) => r,
+        Err(_) => return Ok(false), // Not a git repo, treat as clean
+    };
+
+    let statuses = repo.statuses(None).with_context(|| {
+        format!("Failed to read git status at {}", repo_path.display())
+    })?;
+
+    Ok(!statuses.is_empty())
+}
+
+/// Print a brief summary of pending git changes to stderr.
+fn print_pending_changes_summary(repo_path: &Path) -> Result<()> {
+    let repo = match git2::Repository::open(repo_path) {
+        Ok(r) => r,
+        Err(_) => return Ok(()),
+    };
+
+    let statuses = repo.statuses(None)?;
+    let mut shown = 0u32;
+    for entry in statuses.iter().take(10) {
+        let status = entry.status();
+        let path_str = entry.path().unwrap_or("?");
+        let label = if status.is_index_new() || status.is_wt_new() {
+            "new"
+        } else if status.is_index_modified() || status.is_wt_modified() {
+            "modified"
+        } else if status.is_index_deleted() || status.is_wt_deleted() {
+            "deleted"
+        } else if status.is_index_renamed() {
+            "renamed"
+        } else {
+            "changed"
+        };
+        eprintln!("    {} {} ({})", "-".dimmed(), path_str, label);
+        shown += 1;
+    }
+    let total = statuses.len() as u32;
+    if total > shown {
+        eprintln!("    {} ... and {} more", "-".dimmed(), total - shown);
+    }
     Ok(())
 }
 
@@ -495,4 +638,36 @@ fn extract_repo_name(url: &str) -> Result<String> {
         bail!("Could not extract repository name from URL: {}", url);
     }
     Ok(name)
+}
+
+/// Shell completion helper: returns an `ArgValueCompleter` that lists
+/// sub-directories under `projects/` in the current workspace.
+/// Used by `import -p` and `remove -p` via `#[arg(add = "...")]`.
+pub fn complete_project_names() -> clap_complete::engine::ArgValueCompleter {
+    clap_complete::engine::ArgValueCompleter::new(project_name_completer)
+}
+
+fn project_name_completer(_current: &std::ffi::OsStr) -> Vec<clap_complete::engine::CompletionCandidate> {
+    let Some(root) = detection::find_workspace_root().ok().flatten() else {
+        return Vec::new();
+    };
+    let projects_dir = root.join("projects");
+    if !projects_dir.exists() {
+        return Vec::new();
+    }
+    let Ok(entries) = std::fs::read_dir(&projects_dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter(|e| e.path().is_dir())
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().to_string();
+            if name.is_empty() {
+                None
+            } else {
+                Some(clap_complete::engine::CompletionCandidate::new(name))
+            }
+        })
+        .collect()
 }

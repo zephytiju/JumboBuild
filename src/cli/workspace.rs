@@ -2,8 +2,8 @@ use anyhow::{bail, Context, Result};
 use clap::{Args, Subcommand};
 
 use crate::workspace::{
-    clean_workspace, create_workspace, import_all_projects, import_project, sync_workspace,
-    use_repository, watch_workspace,
+    clean_workspace, create_workspace, import_all_projects, import_project, remove_project,
+    sync_workspace, use_repository, watch_workspace,
 };
 use crate::workspace::detection::ensure_in_workspace;
 
@@ -21,6 +21,8 @@ pub enum WorkspaceAction {
     Use(UseArgs),
     /// Import an existing local project into the workspace
     Import(ImportArgs),
+    /// Remove a project from the workspace (metadata, directory, and IDE config)
+    Remove(RemoveArgs),
     /// Sync workspace configuration with local repositories
     Sync(SyncArgs),
     /// Watch workspace and periodically sync
@@ -50,8 +52,19 @@ pub struct UseArgs {
 pub struct ImportArgs {
     /// Name(s) of project(s) under projects/ to import.
     /// If omitted, all folders under projects/ are imported automatically.
-    #[arg(short, long, num_args = 1..)]
+    #[arg(short, long, num_args = 1.., add = crate::workspace::complete_project_names())]
     pub project: Vec<String>,
+}
+
+#[derive(Args)]
+pub struct RemoveArgs {
+    /// Name(s) of project(s) to remove from the workspace.
+    #[arg(short, long, required = true, num_args = 1.., add = crate::workspace::complete_project_names())]
+    pub project: Vec<String>,
+
+    /// Skip confirmation prompt and remove immediately (even with pending changes)
+    #[arg(short, long)]
+    pub yes: bool,
 }
 
 #[derive(Args)]
@@ -112,6 +125,12 @@ pub fn execute(args: WorkspaceArgs) -> Result<()> {
                 for project_path in &import_args.project {
                     import_project(&workspace_root, project_path)?;
                 }
+            }
+        }
+        WorkspaceAction::Remove(remove_args) => {
+            let workspace_root = ensure_in_workspace()?;
+            for project_name in &remove_args.project {
+                remove_project(&workspace_root, project_name, remove_args.yes)?;
             }
         }
         WorkspaceAction::Sync(sync_args) => {

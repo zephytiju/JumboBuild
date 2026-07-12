@@ -114,6 +114,42 @@ configure_path() {
     echo "Run 'source $SHELL_RC' or open a new terminal to use jumbo."
 }
 
+# --- Configure shell completions ---
+configure_completions() {
+    SHELL_NAME="$(basename "$SHELL")"
+    BINARY="$INSTALL_DIR/$BINARY_NAME"
+
+    case "$SHELL_NAME" in
+        zsh)
+            SHELL_RC="$HOME/.zshrc"
+            COMPLETE_LINE="source <(COMPLETE=zsh $BINARY)"
+            ;;
+        bash)
+            SHELL_RC="$HOME/.bashrc"
+            COMPLETE_LINE="source <(COMPLETE=bash $BINARY)"
+            ;;
+        fish)
+            SHELL_RC="$HOME/.config/fish/completions/$BINARY_NAME.fish"
+            COMPLETE_LINE="COMPLETE=fish $BINARY | source"
+            mkdir -p "$(dirname "$SHELL_RC")"
+            ;;
+        *)
+            echo "Shell completions: unsupported shell '$SHELL_NAME'. Skipping."
+            echo "  You can enable manually — see: jumbo completions --help"
+            return
+            ;;
+    esac
+
+    if [ -f "$SHELL_RC" ] && grep -qF "COMPLETE=" "$SHELL_RC" && grep -qF "$BINARY_NAME" "$SHELL_RC"; then
+        echo "Shell completions already configured in $SHELL_RC"
+    else
+        echo "" >> "$SHELL_RC"
+        echo "# Jumbo Build shell completions" >> "$SHELL_RC"
+        echo "$COMPLETE_LINE" >> "$SHELL_RC"
+        echo "Shell completions ($SHELL_NAME) configured in $SHELL_RC"
+    fi
+}
+
 # --- Main ---
 main() {
     echo "=== Jumbo Build Installer ==="
@@ -123,9 +159,11 @@ main() {
     build_binary
     install_binary
     configure_path
+    configure_completions
     echo ""
     echo "=== Installation complete! ==="
     echo "Run 'jumbo --help' to get started."
+    echo "Open a new terminal or run 'source ~/.zshrc' (or equivalent) to enable completions."
 }
 
 main
