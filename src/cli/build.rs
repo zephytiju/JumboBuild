@@ -22,7 +22,7 @@ pub enum BuildAction {
     /// Run release pipeline
     Release,
     /// Clean build artifacts for all languages
-    Clear,
+    Clean,
 }
 
 /// Execute the build command (default or with a specific action).
@@ -54,7 +54,7 @@ pub fn execute(action: Option<BuildAction>) -> Result<()> {
             );
 
             let result = match &action {
-                Some(BuildAction::Clear) => {
+                Some(BuildAction::Clean) => {
                     lang.clean(&repo_path)
                 }
                 None | Some(BuildAction::Test) if matches!(action, None) => {
@@ -97,7 +97,7 @@ pub fn execute_release() -> Result<()> {
     execute(Some(BuildAction::Release))
 }
 
-/// Execute clear command (shortcut for build clear).
-pub fn execute_clear() -> Result<()> {
-    execute(Some(BuildAction::Clear))
+/// Execute clean command (shortcut for build clean).
+pub fn execute_clean() -> Result<()> {
+    execute(Some(BuildAction::Clean))
 }

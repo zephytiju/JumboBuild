@@ -228,7 +228,7 @@ pub fn watch_workspace(workspace_root: &Path, interval_secs: u64) -> Result<()> 
 }
 
 /// Clean build artifacts for all repositories in the workspace.
-pub fn clear_workspace(workspace_root: &Path) -> Result<()> {
+pub fn clean_workspace(workspace_root: &Path) -> Result<()> {
     let metadata = JumboToml::load(workspace_root)?;
     let registry = get_registry();
 
