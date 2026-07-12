@@ -152,14 +152,14 @@ impl LanguageSupport for PythonSupport {
         Ok(())
     }
 
-    fn build(&self, workspace_root: &Path, repo_path: &Path) -> Result<()> {
-        // uv lock/sync run at workspace root
+    fn build(&self, _workspace_root: &Path, repo_path: &Path) -> Result<()> {
+        // Lockfiles and environments belong to each Python project, not the workspace root.
         run_steps(
             &[
                 ("uv lock --upgrade", "Updating lockfile"),
                 ("uv sync", "Syncing environment metadata"),
             ],
-            workspace_root,
+            repo_path,
         )?;
         // uv build runs in the repo directory
         run_steps(
@@ -168,13 +168,13 @@ impl LanguageSupport for PythonSupport {
         )
     }
 
-    fn test(&self, workspace_root: &Path, repo_path: &Path) -> Result<()> {
+    fn test(&self, _workspace_root: &Path, repo_path: &Path) -> Result<()> {
         run_steps(
             &[
                 ("uv lock --upgrade", "Updating lockfile"),
                 ("uv sync", "Syncing environment metadata"),
             ],
-            workspace_root,
+            repo_path,
         )?;
         run_steps(
             &[
@@ -185,13 +185,13 @@ impl LanguageSupport for PythonSupport {
         )
     }
 
-    fn format(&self, workspace_root: &Path, repo_path: &Path) -> Result<()> {
+    fn format(&self, _workspace_root: &Path, repo_path: &Path) -> Result<()> {
         run_steps(
             &[
                 ("uv lock --upgrade", "Updating lockfile"),
                 ("uv sync", "Syncing environment metadata"),
             ],
-            workspace_root,
+            repo_path,
         )?;
         run_steps(
             &[
@@ -203,13 +203,13 @@ impl LanguageSupport for PythonSupport {
         )
     }
 
-    fn release(&self, workspace_root: &Path, repo_path: &Path) -> Result<()> {
+    fn release(&self, _workspace_root: &Path, repo_path: &Path) -> Result<()> {
         run_steps(
             &[
                 ("uv lock --upgrade", "Updating lockfile"),
                 ("uv sync", "Syncing environment metadata"),
             ],
-            workspace_root,
+            repo_path,
         )?;
         run_steps(
             &[
