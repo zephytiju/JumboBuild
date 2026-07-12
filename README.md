@@ -60,23 +60,23 @@ jumbo release
 ### 工作空间管理
 
 ```bash
-# 创建新工作空间
-jumbo workspace create
+# 创建新工作空间（在当前目录下创建 <name> 文件夹作为工作空间）
+jumbo workspace create <name>
 
-# 从已有文件夹创建（仅生成缺失文件）
-jumbo workspace create -i
+# 从已有文件夹创建工作空间（<name> 文件夹必须已存在，仅生成缺失文件）
+jumbo workspace create <name> -i
 
-# 克隆仓库到工作空间
-jumbo ws use -r <git-repo-url>
+# 克隆仓库到工作空间（支持多个）
+jumbo workspace use -r <git-repo-url> [-r <git-repo-url> ...]
 
-# 导入本地已有项目
-jumbo ws import -p <project-path>
+# 导入本地已有项目（支持多个）
+jumbo workspace import -p <project-path> [-p <project-path> ...]
 
 # 同步工作空间配置（更新依赖源等）
-jumbo ws sync -l
+jumbo workspace sync -l
 
 # 定时监听并同步（间隔秒数）
-jumbo ws watch -i 30
+jumbo workspace watch -i 30
 ```
 
 `workspace` 可简写为 `ws`。

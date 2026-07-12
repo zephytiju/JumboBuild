@@ -60,7 +60,57 @@ pub fn use_repository(workspace_root: &Path, repo_url: &str) -> Result<()> {
     }
 
     println!("{} Cloning {} into {}...", "➔".blue().bold(), repo_url, target_path);
-    let repo = git2::Repository::clone(repo_url, &abs_target)
+
+    // Use RepoBuilder with credential callbacks so that SSH agent,
+    // default SSH keys, and the system git credential helper are consulted.
+    let mut callbacks = git2::RemoteCallbacks::new();
+    callbacks.credentials(|url, username_from_url, allowed_types| {
+        // Try SSH agent first
+        if allowed_types.contains(git2::CredentialType::SSH_KEY) {
+            let user = username_from_url.unwrap_or("git");
+            if let Ok(cred) = git2::Cred::ssh_key_from_agent(user) {
+                return Ok(cred);
+            }
+        }
+        // Try default SSH key (~/.ssh/id_rsa, etc.)
+        if allowed_types.contains(git2::CredentialType::SSH_KEY) {
+            let user = username_from_url.unwrap_or("git");
+            let home = std::env::var("HOME").unwrap_or_default();
+            let key_path = std::path::Path::new(&home).join(".ssh").join("id_rsa");
+            if key_path.exists() {
+                if let Ok(cred) = git2::Cred::ssh_key(user, None, &key_path, None) {
+                    return Ok(cred);
+                }
+            }
+            // Also try id_ed25519
+            let ed_key_path = std::path::Path::new(&home).join(".ssh").join("id_ed25519");
+            if ed_key_path.exists() {
+                if let Ok(cred) = git2::Cred::ssh_key(user, None, &ed_key_path, None) {
+                    return Ok(cred);
+                }
+            }
+        }
+        // Try username/password (for HTTPS with credential helpers)
+        if allowed_types.contains(git2::CredentialType::USER_PASS_PLAINTEXT) {
+            if let Ok(cred) = git2::Cred::credential_helper(
+                &git2::Config::open_default().unwrap(),
+                url,
+                username_from_url,
+            ) {
+                return Ok(cred);
+            }
+        }
+        // Fall back to default
+        git2::Cred::default()
+    });
+
+    let mut fetch_opts = git2::FetchOptions::new();
+    fetch_opts.remote_callbacks(callbacks);
+
+    let mut builder = git2::build::RepoBuilder::new();
+    builder.fetch_options(fetch_opts);
+
+    let repo = builder.clone(repo_url, &abs_target)
         .with_context(|| format!("Failed to clone {}", repo_url))?;
 
     // Get remote URL

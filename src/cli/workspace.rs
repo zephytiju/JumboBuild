@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{bail, Context, Result};
 use clap::{Args, Subcommand};
 
 use crate::workspace::{
@@ -30,27 +30,26 @@ pub enum WorkspaceAction {
 
 #[derive(Args)]
 pub struct CreateArgs {
-    /// Import existing projects folder content
+    /// Workspace name — creates a new folder with this name at the current directory
+    pub name: String,
+
+    /// Import existing projects folder content (requires <name> folder to already exist)
     #[arg(short, long)]
     pub import: bool,
-
-    /// Workspace name (defaults to directory name)
-    #[arg(short, long)]
-    pub name: Option<String>,
 }
 
 #[derive(Args)]
 pub struct UseArgs {
-    /// Git repository URL to clone
-    #[arg(short, long)]
-    pub repository: String,
+    /// Git repository URL(s) to clone (can be specified multiple times)
+    #[arg(short, long, required = true, num_args = 1..)]
+    pub repository: Vec<String>,
 }
 
 #[derive(Args)]
 pub struct ImportArgs {
-    /// Path to the project folder to import (relative to workspace root)
-    #[arg(short, long)]
-    pub project: String,
+    /// Path(s) to the project folder(s) to import (relative to workspace root, can be specified multiple times)
+    #[arg(short, long, required = true, num_args = 1..)]
+    pub project: Vec<String>,
 }
 
 #[derive(Args)]
@@ -72,23 +71,41 @@ pub fn execute(args: WorkspaceArgs) -> Result<()> {
     match args.action {
         WorkspaceAction::Create(create_args) => {
             let cwd = std::env::current_dir()?;
-            let name = create_args
-                .name
-                .unwrap_or_else(|| {
-                    cwd.file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("workspace")
-                        .to_string()
-                });
-            create_workspace(&cwd, &name, create_args.import)?;
+            let name = &create_args.name;
+            let workspace_path = cwd.join(name);
+
+            if create_args.import {
+                // -i: verify <name> folder already exists
+                if !workspace_path.exists() || !workspace_path.is_dir() {
+                    bail!(
+                        "Directory '{}' does not exist at {}",
+                        name,
+                        cwd.display()
+                    );
+                }
+            } else {
+                // Create new folder <name> at cwd
+                std::fs::create_dir_all(&workspace_path).with_context(|| {
+                    format!(
+                        "Failed to create workspace directory at {}",
+                        workspace_path.display()
+                    )
+                })?;
+            }
+
+            create_workspace(&workspace_path, name, create_args.import)?;
         }
         WorkspaceAction::Use(use_args) => {
             let workspace_root = ensure_in_workspace()?;
-            use_repository(&workspace_root, &use_args.repository)?;
+            for repo_url in &use_args.repository {
+                use_repository(&workspace_root, repo_url)?;
+            }
         }
         WorkspaceAction::Import(import_args) => {
             let workspace_root = ensure_in_workspace()?;
-            import_project(&workspace_root, &import_args.project)?;
+            for project_path in &import_args.project {
+                import_project(&workspace_root, project_path)?;
+            }
         }
         WorkspaceAction::Sync(sync_args) => {
             let workspace_root = ensure_in_workspace()?;
