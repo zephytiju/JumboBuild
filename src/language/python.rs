@@ -20,7 +20,7 @@ impl LanguageSupport for PythonSupport {
         repo_path.join("pyproject.toml").exists()
     }
 
-    fn sync_workspace(&self, workspace_root: &Path, repos: &[RepoInfo], local: bool) -> Result<()> {
+    fn sync_workspace(&self, workspace_root: &Path, repos: &[RepoInfo]) -> Result<()> {
         let workspace_toml_path = workspace_root.join("pyproject.toml");
         let content = std::fs::read_to_string(&workspace_toml_path)
             .with_context(|| format!("Failed to read {}", workspace_toml_path.display()))?;
@@ -50,11 +50,8 @@ impl LanguageSupport for PythonSupport {
             };
 
             if let Some(package_name) = package_name {
-                if repo_toml_path.exists() {
+                let source = if repo_path.exists() {
                     member_paths.push(repo.path.clone());
-                }
-
-                let source = if local && repo_toml_path.exists() {
                     let mut source = toml::Table::new();
                     source.insert("workspace".to_string(), toml::Value::Boolean(true));
                     Some(source)
