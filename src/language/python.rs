@@ -158,7 +158,7 @@ impl LanguageSupport for PythonSupport {
         )
     }
 
-    fn test(&self, _workspace_root: &Path, repo_path: &Path) -> Result<()> {
+    fn test(&self, workspace_root: &Path, repo_path: &Path) -> Result<()> {
         run_steps(
             &[
                 ("uv lock --upgrade", "Updating lockfile"),
@@ -167,21 +167,29 @@ impl LanguageSupport for PythonSupport {
             repo_path,
         )?;
         run_steps(
+            &[("source .venv/bin/activate", "Activating workspace environment")],
+            workspace_root,
+        )?;
+        run_steps(
             &[
                 ("uv build", "Running python build"),
-                ("pytest -v", "Executing rigorous testing suite"),
+                ("uv run pytest -v", "Executing rigorous testing suite"),
             ],
             repo_path,
         )
     }
 
-    fn format(&self, _workspace_root: &Path, repo_path: &Path) -> Result<()> {
+    fn format(&self, workspace_root: &Path, repo_path: &Path) -> Result<()> {
         run_steps(
             &[
                 ("uv lock --upgrade", "Updating lockfile"),
                 ("uv sync", "Syncing environment metadata"),
             ],
             repo_path,
+        )?;
+        run_steps(
+            &[("source .venv/bin/activate", "Activating workspace environment")],
+            workspace_root,
         )?;
         run_steps(
             &[
@@ -193,7 +201,7 @@ impl LanguageSupport for PythonSupport {
         )
     }
 
-    fn release(&self, _workspace_root: &Path, repo_path: &Path) -> Result<()> {
+    fn release(&self, workspace_root: &Path, repo_path: &Path) -> Result<()> {
         run_steps(
             &[
                 ("uv lock --upgrade", "Updating lockfile"),
@@ -202,9 +210,13 @@ impl LanguageSupport for PythonSupport {
             repo_path,
         )?;
         run_steps(
+            &[("source .venv/bin/activate", "Activating workspace environment")],
+            workspace_root,
+        )?;
+        run_steps(
             &[
                 ("uv build", "Running python build"),
-                ("pytest -v", "Executing rigorous testing suite"),
+                ("uv run pytest -v", "Executing rigorous testing suite"),
                 ("ruff check .", "Validating strict rule compliance checks"),
             ],
             repo_path,
