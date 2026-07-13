@@ -35,6 +35,7 @@ pub fn create_workspace(path: &Path, name: &str, import_existing: bool) -> Resul
     }
 
     metadata.save(path)?;
+    reconcile_workspace_config(path, &metadata, true)?;
     println!("{} Workspace '{}' created at {}", "✓".green().bold(), name, path.display());
 
     // Generate VSCode workspace file if IDE is vscode
@@ -124,10 +125,12 @@ pub fn use_repository(workspace_root: &Path, repo_url: &str) -> Result<()> {
         name: repo_name.clone(),
         path: target_path,
         remote: remote_url,
+        package: python_package_name(&abs_target)?,
     };
 
     metadata.workspace.repositories.push(repo_info);
     metadata.save(workspace_root)?;
+    reconcile_workspace_config(workspace_root, &metadata, true)?;
 
     println!("{} Repository '{}' added to workspace", "✓".green().bold(), repo_name);
 
@@ -168,10 +171,12 @@ pub fn import_project(workspace_root: &Path, project_name: &str) -> Result<()> {
         name: project_name.to_string(),
         path: rel_path,
         remote,
+        package: python_package_name(&abs_path)?,
     };
 
     metadata.workspace.repositories.push(repo_info);
     metadata.save(workspace_root)?;
+    reconcile_workspace_config(workspace_root, &metadata, true)?;
 
     println!("{} Project '{}' imported into workspace", "✓".green().bold(), project_name);
 
@@ -243,27 +248,7 @@ pub fn remove_project(workspace_root: &Path, project_name: &str, force: bool) ->
         project_name
     );
 
-    // Run language-specific sync to update workspace configs (e.g. pyproject.toml)
-    let registry = get_registry();
-    let all_repos = &metadata.workspace.repositories;
-    for lang in &registry {
-        let matching: Vec<_> = metadata
-            .workspace
-            .repositories
-            .iter()
-            .filter(|r| {
-                let rp = workspace_root.join(&r.path);
-                lang.detect(&rp)
-            })
-            .cloned()
-            .collect();
-        if !matching.is_empty() || lang.name() == "python" {
-            // Always re-sync Python to rebuild members/dependencies after removal
-            if let Err(e) = lang.sync_workspace(workspace_root, all_repos, true) {
-                eprintln!("  {} Failed to sync {}: {}", "✗".red(), lang.name(), e);
-            }
-        }
-    }
+    reconcile_workspace_config(workspace_root, &metadata, true)?;
 
     // Regenerate VSCode workspace file
     if let Some(ref ide) = metadata.workspace.ide {
@@ -374,6 +359,7 @@ pub fn import_all_projects(workspace_root: &Path) -> Result<()> {
             name: name.clone(),
             path: rel_path,
             remote,
+            package: python_package_name(&path)?,
         };
 
         metadata.workspace.repositories.push(repo_info);
@@ -383,14 +369,15 @@ pub fn import_all_projects(workspace_root: &Path) -> Result<()> {
 
     if imported == 0 {
         println!("{} No new projects to import", "➔".blue().bold());
-    } else {
-        metadata.save(workspace_root)?;
+    }
 
-        // Update VSCode workspace
-        if let Some(ref ide) = metadata.workspace.ide {
-            if ide.ide_type == "vscode" {
-                vscode::generate_vscode_workspace(workspace_root, &metadata)?;
-            }
+    metadata.save(workspace_root)?;
+    reconcile_workspace_config(workspace_root, &metadata, true)?;
+
+    // Update VSCode workspace
+    if let Some(ref ide) = metadata.workspace.ide {
+        if ide.ide_type == "vscode" {
+            vscode::generate_vscode_workspace(workspace_root, &metadata)?;
         }
     }
 
@@ -398,7 +385,7 @@ pub fn import_all_projects(workspace_root: &Path) -> Result<()> {
 }
 
 /// Sync workspace locally: detect languages, update pyproject.toml, etc.
-pub fn sync_workspace(workspace_root: &Path, _local: bool) -> Result<()> {
+pub fn sync_workspace(workspace_root: &Path, local: bool) -> Result<()> {
     let mut metadata = JumboToml::load(workspace_root)?;
 
     // Scan projects directory for current repositories
@@ -429,34 +416,15 @@ pub fn sync_workspace(workspace_root: &Path, _local: bool) -> Result<()> {
         }
     }
 
-    // Update metadata with current state
-    metadata.workspace.repositories = current_repos.workspace.repositories;
-
-    // Run language-specific sync with all repos (each language filters its own)
-    let registry = get_registry();
-    for lang in &registry {
-        // Collect repos that this language supports
-        let matching_repos: Vec<_> = metadata
-            .workspace
-            .repositories
-            .iter()
-            .filter(|repo| {
-                let repo_path = workspace_root.join(&repo.path);
-                lang.detect(&repo_path)
-            })
-            .cloned()
-            .collect();
-
-        // Also include repos that are NOT detected by any language (for exclude lists)
-        let all_repos = &metadata.workspace.repositories;
-
-        if !matching_repos.is_empty() {
-            println!("  Syncing {} projects", lang.name());
-            if let Err(e) = lang.sync_workspace(workspace_root, all_repos, true) {
-                eprintln!("  {} Failed to sync {}: {}", "✗".red(), lang.name(), e);
-            }
+    let mut repositories = current_repos.workspace.repositories;
+    for repo in removed {
+        if repo.remote.is_some() && repo.package.is_some() {
+            repositories.push(repo);
         }
     }
+    metadata.workspace.repositories = repositories;
+
+    reconcile_workspace_config(workspace_root, &metadata, local)?;
 
     metadata.save(workspace_root)?;
     println!("{} Workspace synced", "✓".green().bold());
@@ -576,6 +544,95 @@ pub fn clean_workspace(workspace_root: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Reconcile the root uv workspace configuration without changing package manifests.
+fn reconcile_workspace_config(
+    workspace_root: &Path,
+    metadata: &JumboToml,
+    local: bool,
+) -> Result<()> {
+    ensure_root_pyproject(workspace_root, &metadata.workspace.name)?;
+
+    for lang in get_registry() {
+        if lang.name() == "python" {
+            lang.sync_workspace(workspace_root, &metadata.workspace.repositories, local)?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Create the smallest valid uv workspace root while preserving existing user configuration.
+fn ensure_root_pyproject(workspace_root: &Path, workspace_name: &str) -> Result<()> {
+    let path = workspace_root.join("pyproject.toml");
+    let mut doc: toml::Table = if path.exists() {
+        std::fs::read_to_string(&path)
+            .with_context(|| format!("Failed to read {}", path.display()))?
+            .parse()
+            .with_context(|| format!("Failed to parse {}", path.display()))?
+    } else {
+        toml::Table::new()
+    };
+
+    let project = doc
+        .entry("project")
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+    let project_table = project.as_table_mut().context("[project] is not a table")?;
+    project_table
+        .entry("name")
+        .or_insert_with(|| toml::Value::String(workspace_project_name(workspace_name)));
+    project_table
+        .entry("version")
+        .or_insert_with(|| toml::Value::String("0.0.0".to_string()));
+
+    std::fs::write(
+        path,
+        toml::to_string_pretty(&doc).context("Failed to serialize root pyproject.toml")?,
+    )?;
+    Ok(())
+}
+
+fn workspace_project_name(workspace_name: &str) -> String {
+    let normalized: String = workspace_name
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let normalized = normalized.trim_matches('-');
+    if normalized.is_empty()
+        || !normalized
+            .chars()
+            .next()
+            .is_some_and(|character| character.is_ascii_alphabetic())
+    {
+        "jumbo-workspace".to_string()
+    } else {
+        normalized.to_string()
+    }
+}
+
+fn python_package_name(repo_path: &Path) -> Result<Option<String>> {
+    let path = repo_path.join("pyproject.toml");
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let doc: toml::Table = std::fs::read_to_string(&path)
+        .with_context(|| format!("Failed to read {}", path.display()))?
+        .parse()
+        .with_context(|| format!("Failed to parse {}", path.display()))?;
+    Ok(doc
+        .get("project")
+        .and_then(|value| value.as_table())
+        .and_then(|project| project.get("name"))
+        .and_then(|name| name.as_str())
+        .map(str::to_owned))
+}
+
 /// Scan the projects/ directory and build a metadata structure.
 fn scan_projects_dir(workspace_root: &Path, mut metadata: JumboToml) -> Result<JumboToml> {
     let projects_dir = workspace_root.join("projects");
@@ -618,6 +675,7 @@ fn scan_projects_dir(workspace_root: &Path, mut metadata: JumboToml) -> Result<J
                 name,
                 path: rel_path,
                 remote,
+                package: python_package_name(&path)?,
             });
         }
     }
@@ -670,4 +728,104 @@ fn project_name_completer(_current: &std::ffi::OsStr) -> Vec<clap_complete::engi
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct TempWorkspace(std::path::PathBuf);
+
+    impl TempWorkspace {
+        fn new() -> Self {
+            let suffix = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "jumbo-workspace-test-{}-{}",
+                std::process::id(),
+                suffix
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TempWorkspace {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn metadata() -> JumboToml {
+        JumboToml {
+            workspace: WorkspaceConfig {
+                name: "Example Workspace".to_string(),
+                repositories: vec![RepoInfo {
+                    name: "package-a-repo".to_string(),
+                    path: "projects/package-a-repo".to_string(),
+                    remote: Some("https://github.com/example/package-a-repo.git".to_string()),
+                    package: Some("package-a".to_string()),
+                }],
+                ide: None,
+            },
+        }
+    }
+
+    fn root_doc(path: &Path) -> toml::Table {
+        std::fs::read_to_string(path.join("pyproject.toml"))
+            .unwrap()
+            .parse()
+            .unwrap()
+    }
+
+    #[test]
+    fn reconciliation_creates_a_workspace_root_and_switches_sources() {
+        let workspace = TempWorkspace::new();
+        let project_dir = workspace.0.join("projects/package-a-repo");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        std::fs::write(
+            project_dir.join("pyproject.toml"),
+            "[project]\nname = \"package-a\"\nversion = \"1.0.0\"\n",
+        )
+        .unwrap();
+        std::fs::write(workspace.0.join("pyproject.toml"), "[tool.custom]\nkeep = true\n")
+            .unwrap();
+
+        let metadata = metadata();
+        reconcile_workspace_config(&workspace.0, &metadata, true).unwrap();
+
+        let doc = root_doc(&workspace.0);
+        assert_eq!(doc["project"]["name"].as_str(), Some("example-workspace"));
+        assert_eq!(doc["tool"]["custom"]["keep"].as_bool(), Some(true));
+        assert_eq!(
+            doc["tool"]["uv"]["workspace"]["members"][0].as_str(),
+            Some("projects/package-a-repo")
+        );
+        assert_eq!(
+            doc["tool"]["uv"]["sources"]["package-a"]["workspace"].as_bool(),
+            Some(true)
+        );
+
+        std::fs::remove_dir_all(project_dir).unwrap();
+        reconcile_workspace_config(&workspace.0, &metadata, true).unwrap();
+
+        let doc = root_doc(&workspace.0);
+        assert!(doc["tool"]["uv"]["workspace"]["members"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            doc["tool"]["uv"]["sources"]["package-a"]["git"].as_str(),
+            Some("https://github.com/example/package-a-repo.git")
+        );
+    }
+
+    #[test]
+    fn workspace_project_names_are_valid_and_stable() {
+        assert_eq!(workspace_project_name("123 workspace"), "jumbo-workspace");
+        assert_eq!(workspace_project_name("My Workspace!"), "my-workspace");
+    }
 }

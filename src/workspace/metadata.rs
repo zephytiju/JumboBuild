@@ -25,6 +25,9 @@ pub struct RepoInfo {
     pub path: String,
     #[serde(default)]
     pub remote: Option<String>,
+    /// Distribution name from the repository's Python project, when known.
+    #[serde(default)]
+    pub package: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
