@@ -68,11 +68,7 @@ pub struct RemoveArgs {
 }
 
 #[derive(Args)]
-pub struct SyncArgs {
-    /// Sync with local repository state
-    #[arg(short, long)]
-    pub local: bool,
-}
+pub struct SyncArgs {}
 
 #[derive(Args)]
 pub struct WatchArgs {
@@ -133,9 +129,9 @@ pub fn execute(args: WorkspaceArgs) -> Result<()> {
                 remove_project(&workspace_root, project_name, remove_args.yes)?;
             }
         }
-        WorkspaceAction::Sync(sync_args) => {
+        WorkspaceAction::Sync(_sync_args) => {
             let workspace_root = ensure_in_workspace()?;
-            sync_workspace(&workspace_root, sync_args.local)?;
+            sync_workspace(&workspace_root)?;
         }
         WorkspaceAction::Watch(watch_args) => {
             let workspace_root = ensure_in_workspace()?;

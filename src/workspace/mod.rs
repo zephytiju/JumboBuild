@@ -35,7 +35,7 @@ pub fn create_workspace(path: &Path, name: &str, import_existing: bool) -> Resul
     }
 
     metadata.save(path)?;
-    reconcile_workspace_config(path, &metadata, true)?;
+    reconcile_workspace_config(path, &metadata)?;
     println!("{} Workspace '{}' created at {}", "✓".green().bold(), name, path.display());
 
     // Generate VSCode workspace file if IDE is vscode
@@ -130,7 +130,7 @@ pub fn use_repository(workspace_root: &Path, repo_url: &str) -> Result<()> {
 
     metadata.workspace.repositories.push(repo_info);
     metadata.save(workspace_root)?;
-    reconcile_workspace_config(workspace_root, &metadata, true)?;
+    reconcile_workspace_config(workspace_root, &metadata)?;
 
     println!("{} Repository '{}' added to workspace", "✓".green().bold(), repo_name);
 
@@ -176,7 +176,7 @@ pub fn import_project(workspace_root: &Path, project_name: &str) -> Result<()> {
 
     metadata.workspace.repositories.push(repo_info);
     metadata.save(workspace_root)?;
-    reconcile_workspace_config(workspace_root, &metadata, true)?;
+    reconcile_workspace_config(workspace_root, &metadata)?;
 
     println!("{} Project '{}' imported into workspace", "✓".green().bold(), project_name);
 
@@ -248,7 +248,7 @@ pub fn remove_project(workspace_root: &Path, project_name: &str, force: bool) ->
         project_name
     );
 
-    reconcile_workspace_config(workspace_root, &metadata, true)?;
+    reconcile_workspace_config(workspace_root, &metadata)?;
 
     // Regenerate VSCode workspace file
     if let Some(ref ide) = metadata.workspace.ide {
@@ -372,7 +372,7 @@ pub fn import_all_projects(workspace_root: &Path) -> Result<()> {
     }
 
     metadata.save(workspace_root)?;
-    reconcile_workspace_config(workspace_root, &metadata, true)?;
+    reconcile_workspace_config(workspace_root, &metadata)?;
 
     // Update VSCode workspace
     if let Some(ref ide) = metadata.workspace.ide {
@@ -385,7 +385,7 @@ pub fn import_all_projects(workspace_root: &Path) -> Result<()> {
 }
 
 /// Sync workspace locally: detect languages, update pyproject.toml, etc.
-pub fn sync_workspace(workspace_root: &Path, local: bool) -> Result<()> {
+pub fn sync_workspace(workspace_root: &Path) -> Result<()> {
     let mut metadata = JumboToml::load(workspace_root)?;
 
     // Scan projects directory for current repositories
@@ -424,7 +424,7 @@ pub fn sync_workspace(workspace_root: &Path, local: bool) -> Result<()> {
     }
     metadata.workspace.repositories = repositories;
 
-    reconcile_workspace_config(workspace_root, &metadata, local)?;
+    reconcile_workspace_config(workspace_root, &metadata)?;
 
     metadata.save(workspace_root)?;
     println!("{} Workspace synced", "✓".green().bold());
@@ -447,7 +447,7 @@ pub fn watch_workspace(workspace_root: &Path, interval_secs: u64) -> Result<()> 
         interval_secs
     );
     loop {
-        if let Err(e) = sync_workspace(workspace_root, true) {
+        if let Err(e) = sync_workspace(workspace_root) {
             eprintln!("{} Sync error: {}", "✗".red(), e);
         }
         thread::sleep(Duration::from_secs(interval_secs));
@@ -548,13 +548,12 @@ pub fn clean_workspace(workspace_root: &Path) -> Result<()> {
 fn reconcile_workspace_config(
     workspace_root: &Path,
     metadata: &JumboToml,
-    local: bool,
 ) -> Result<()> {
     ensure_root_pyproject(workspace_root, &metadata.workspace.name)?;
 
     for lang in get_registry() {
         if lang.name() == "python" {
-            lang.sync_workspace(workspace_root, &metadata.workspace.repositories, local)?;
+            lang.sync_workspace(workspace_root, &metadata.workspace.repositories)?;
         }
     }
 
@@ -795,7 +794,7 @@ mod tests {
             .unwrap();
 
         let metadata = metadata();
-        reconcile_workspace_config(&workspace.0, &metadata, true).unwrap();
+        reconcile_workspace_config(&workspace.0, &metadata).unwrap();
 
         let doc = root_doc(&workspace.0);
         assert_eq!(doc["project"]["name"].as_str(), Some("example-workspace"));
@@ -810,7 +809,7 @@ mod tests {
         );
 
         std::fs::remove_dir_all(project_dir).unwrap();
-        reconcile_workspace_config(&workspace.0, &metadata, true).unwrap();
+        reconcile_workspace_config(&workspace.0, &metadata).unwrap();
 
         let doc = root_doc(&workspace.0);
         assert!(doc["tool"]["uv"]["workspace"]["members"]

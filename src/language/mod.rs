@@ -16,7 +16,7 @@ pub trait LanguageSupport: Send + Sync {
 
     /// Sync workspace configuration for ALL repositories of this language at once.
     /// This allows generating complete config files (e.g., pyproject.toml) in one pass.
-    fn sync_workspace(&self, workspace_root: &Path, repos: &[RepoInfo], local: bool) -> Result<()>;
+    fn sync_workspace(&self, workspace_root: &Path, repos: &[RepoInfo]) -> Result<()>;
 
     /// Run the build pipeline for this language.
     fn build(&self, workspace_root: &Path, repo_path: &Path) -> Result<()>;
