@@ -138,7 +138,7 @@ impl LanguageSupport for PythonSupport {
         Ok(())
     }
 
-    fn build(&self, _workspace_root: &Path, repo_path: &Path) -> Result<()> {
+    fn build(&self, workspace_root: &Path, repo_path: &Path) -> Result<()> {
         // Lockfiles and environments belong to each Python project, not the workspace root.
         run_steps(
             &[
@@ -146,6 +146,10 @@ impl LanguageSupport for PythonSupport {
                 ("uv sync", "Syncing environment metadata"),
             ],
             repo_path,
+        )?;
+        run_steps(
+            &[("source .venv/bin/activate", "Activating workspace environment")],
+            workspace_root,
         )?;
         // uv build runs in the repo directory
         run_steps(
