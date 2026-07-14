@@ -1,12 +1,8 @@
-mod cli;
-mod language;
-mod utils;
-mod workspace;
-
 use anyhow::Result;
 use clap::{CommandFactory, Parser};
 use clap_complete::generate;
 use clap_complete::CompleteEnv;
+use jumbo_build::cli;
 
 use cli::{build, Cli, Commands};
 

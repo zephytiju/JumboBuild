@@ -1,142 +1,125 @@
 # Jumbo Build
 
-Jumbo Build 是 Juntai 内部统一构建工具，为多仓库工作空间提供一致的构建、测试、格式化与发布体验。基于 Rust + Clap 构建，具备高性能与跨平台能力。
+[简体中文](./README.zh-CN.md)
 
----
+Jumbo Build is Juntai's unified command-line interface for building projects and managing multi-repository workspaces. It gives every supported language the same build, test, format, release-check, and cleanup workflow while keeping language-specific behavior behind a small plugin interface.
 
-## 核心特性
+## Why Jumbo Build?
 
-- **统一构建入口** — 同一套命令完成 build / test / format / release
-- **多语言插件架构** — 当前支持 Python，通过插件机制可扩展至任意语言
-- **工作空间管理** — 统一管理多仓库工作空间，自动同步依赖配置与 IDE 设置
-- **跨平台原生二进制** — 编译为 macOS / Linux 原生可执行文件，无需运行时依赖
+- **One project workflow:** use the same commands across every supported language.
+- **Multi-repository workspaces:** clone, import, remove, synchronize, and watch repositories under one workspace.
+- **Local dependency wiring:** keep checked-out Python packages connected as uv workspace members and fall back to recorded Git remotes when a package is absent locally.
+- **Native CLI:** ship a single Rust binary for macOS and Linux.
+- **Extensible language support:** add another ecosystem by implementing `LanguageSupport` and registering it.
 
----
+Jumbo Build currently supports Python projects identified by a `pyproject.toml` file.
 
-## 前置条件
+## Requirements
 
-- macOS 或 Linux
-- curl（用于安装脚本）
-- Python 项目的额外依赖：uv、ruff、pytest
+- macOS or Linux on x86-64 or ARM64
+- Git
+- Rust stable and Cargo (the installer builds Jumbo Build from source)
+- For Python projects: [uv](https://docs.astral.sh/uv/); project tools such as pytest and Ruff should be declared in the project's dependency groups
 
----
+## Install
 
-## 安装
-
-使用一键安装脚本，自动检测操作系统并安装到 `~/.local/bin`：
+The installer builds the checked-out source and copies `jumbo` to `~/.local/bin`:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/zephytiju/JumboBuild/main/install.sh | sh
+git clone https://github.com/zephytiju/JumboBuild.git
+cd JumboBuild
+./install.sh
 ```
 
-安装完成后，确保 `~/.local/bin` 在 PATH 中（安装脚本会自动配置）。
-
-验证安装：
+Open a new shell after installation, then verify the binary:
 
 ```bash
 jumbo --version
+jumbo --help
 ```
 
----
+## Quick start
 
-## 使用
-
-### 构建命令
+Create a workspace and add a repository:
 
 ```bash
-# 默认构建流水线（lock → sync → build）
-jumbo
-
-# 运行测试（构建 + pytest）
-jumbo test
-
-# 格式化代码（构建 + ruff format + ruff check --fix）
-jumbo format
-
-# 发布检查（构建 + pytest + ruff check 严格模式）
-jumbo release
+jumbo workspace create my-workspace
+cd my-workspace
+jumbo workspace use -r https://github.com/example/example-package.git
 ```
 
-### 工作空间管理
+Project build commands must be run from inside a registered project. Jumbo detects the current project from `jumbo.toml` and operates only on that project:
 
 ```bash
-# 创建新工作空间（在当前目录下创建 <name> 文件夹作为工作空间）
-jumbo workspace create <name>
-
-# 从已有文件夹创建工作空间（<name> 文件夹必须已存在，仅生成缺失文件）
-jumbo workspace create <name> -i
-
-# 克隆仓库到工作空间（支持多个）
-jumbo workspace use -r <git-repo-url> [-r <git-repo-url> ...]
-
-# 自动导入 projects/ 下所有项目（推荐）
-jumbo workspace import
-
-# 导入指定项目（支持多个，名称位于 projects/ 下）
-jumbo workspace import -p <project-name> [-p <project-name> ...]
-
-# 移除项目（同时删除目录、更新元数据、IDE 配置；若有未提交更改会提示确认）
-jumbo workspace remove -p <project-name> [-p <project-name> ...]
-
-# 跳过确认直接移除（适合脚本使用）
-jumbo workspace remove -p <project-name> --yes
-
-# 同步工作空间配置（更新依赖源等）
-jumbo workspace sync -l
-
-# 定时监听并同步（间隔秒数）
-jumbo workspace watch -i 30
+cd projects/example-package
+jumbo          # update lockfile, sync, and build
+jumbo test     # build and test
+jumbo format   # build, format, and apply safe lint fixes
+jumbo release  # build, test, and run strict lint checks
+jumbo clean    # remove this project's generated artifacts
 ```
 
-`workspace` 可简写为 `ws`。
+`jumbo release` is a release-readiness check; it does not publish an artifact.
 
-### Python 工作空间依赖
+## Command reference
 
-Jumbo 会在创建、导入、使用、移除和同步项目时维护工作空间根目录的
-`pyproject.toml`。该文件定义 uv workspace 成员，并在根目录的
-`[tool.uv.sources]` 中维护内部 Python 包的来源：
+### Project commands
 
-- `jumbo workspace sync -l` 优先使用已检出的包（`{ workspace = true }`）；
-- 未检出的、已记录远程地址的 Python 包会回退到其 Git 远程地址；
-- 不带 `-l` 的 `workspace sync` 使用已记录的 Git 远程地址。
+| Command | Python pipeline |
+| --- | --- |
+| `jumbo` or `jumbo build` | `uv lock --upgrade` → `uv sync` → `uv build` |
+| `jumbo test` | build pipeline → `uv run pytest -v` |
+| `jumbo format` | build pipeline → `ruff format .` → `ruff check --fix .` |
+| `jumbo release` | build pipeline → `uv run pytest -v` → `ruff check .` |
+| `jumbo clean` | Remove caches, coverage output, and build artifacts for the current project |
 
-各项目自己的 `pyproject.toml` 仍负责声明 `project.dependencies`。根目录来源
-配置会应用到所有 uv workspace 成员，除非某个成员为同一依赖提供了自己的来源。
-Jumbo 仅更新它记录在 `[tool.jumbo.workspace_sources]` 中的来源条目，并保留其它
-根目录配置。
+The explicit forms `jumbo build test`, `jumbo build format`, `jumbo build release`, and `jumbo build clean` are equivalent to the top-level shortcuts.
 
-### 构建指令表
+### Workspace commands
 
-| 指令 | 步骤 |
-|------|------|
-| `jumbo`（默认） | lock → sync → build |
-| `jumbo test` | lock → sync → build → pytest |
-| `jumbo format` | lock → sync → build → ruff format → ruff check --fix |
-| `jumbo release` | lock → sync → build → pytest → ruff check（严格模式） |
+Run workspace commands anywhere below the workspace root unless a command says otherwise. `workspace` can be abbreviated to `ws`.
 
----
+| Command | Purpose |
+| --- | --- |
+| `jumbo workspace create <name>` | Create `<name>/`, `projects/`, `jumbo.toml`, the root `pyproject.toml`, and VS Code workspace configuration |
+| `jumbo workspace create <name> --import` | Initialize an existing `<name>/` directory and import folders already under its `projects/` directory |
+| `jumbo workspace use -r <url> [-r <url> ...]` | Clone one or more Git repositories into `projects/` and register them |
+| `jumbo workspace import` | Register all untracked directories under `projects/` |
+| `jumbo workspace import -p <name> [-p <name> ...]` | Register selected directories under `projects/` |
+| `jumbo workspace remove -p <name> [-p <name> ...]` | Delete selected project directories and update workspace metadata and IDE configuration |
+| `jumbo workspace remove -p <name> --yes` | Remove without prompting, including when uncommitted changes exist |
+| `jumbo workspace sync` | Reconcile local projects, metadata, uv sources, and IDE configuration |
+| `jumbo workspace watch --interval 30` | Repeat synchronization until interrupted |
+| `jumbo workspace clean` | Clean generated artifacts across the workspace and all registered local projects |
 
-### Shell 自动补全
+Removing a project deletes its directory. Without `--yes`, Jumbo asks for confirmation when it detects uncommitted changes.
 
-安装脚本 `install.sh` 会自动配置动态补全（支持 zsh / bash / fish），无需手动设置。
+## Python dependency behavior
 
-安装后，按 Tab 即可实时补全 `projects/` 下的项目名称（如 `import -p`、`remove -p`）。
+Each Python project remains responsible for declaring its own dependencies in `project.dependencies`. Jumbo maintains shared resolution information at the workspace root:
 
-如需手动配置：
+- local Python repositories become uv workspace members and use `{ workspace = true }` sources;
+- registered packages missing from disk can use their recorded Git remotes;
+- non-Python directories are excluded from the uv workspace;
+- only source entries listed in `[tool.jumbo.workspace_sources]` are managed, so unrelated root configuration is preserved.
+
+`jumbo.toml` records workspace membership, repository paths, remotes, package names, and IDE settings. Treat it as workspace metadata and commit it with the workspace configuration.
+
+## Shell completion
+
+The installer configures dynamic completion for zsh, Bash, or fish. You can also generate a static completion script:
 
 ```bash
-# zsh
-echo 'source <(COMPLETE=zsh jumbo)' >> ~/.zshrc
-
-# bash
-echo 'source <(COMPLETE=bash jumbo)' >> ~/.bashrc
-
-# fish
-echo 'COMPLETE=fish jumbo | source' >> ~/.config/fish/completions/jumbo.fish
+jumbo completions zsh > _jumbo
+jumbo completions bash > jumbo.bash
+jumbo completions fish > jumbo.fish
 ```
 
----
+Install the generated file in the location expected by your shell. See `jumbo completions --help` for every supported shell.
 
-## 其它资源
+## Development and support
 
-许可证参见 [LICENSE](./LICENSE) 文件。
+- [Development guide](./DEVELOPMENT.md)
+- [Generated CLI reference](./docs/cli-reference.md)
+- For complete, version-matched command details, run `jumbo --help` or `jumbo <command> --help`.
+- [License](./LICENSE)

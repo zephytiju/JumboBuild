@@ -1,193 +1,201 @@
-# 开发指南
+# Jumbo Build development guide
 
-本文档面向 Jumbo Build 内部开发者，涵盖环境搭建、架构设计与语言扩展指南。
+[User guide](./README.md) · [Generated CLI reference](./docs/cli-reference.md)
 
----
+This guide is for contributors changing Jumbo Build itself. It explains the development workflow, the boundaries between modules, and the contracts that should remain stable as the CLI evolves.
 
-## 快速开始
+## Set up a development environment
+
+### Requirements
+
+- Rust stable and Cargo, preferably installed through [rustup](https://rustup.rs/)
+- Git
+- macOS or Linux
+- uv and a small Python fixture project when exercising the Python backend end to end
+
+### Build and verify
 
 ```bash
-# 克隆仓库
-git clone <repo-url> && cd JumboBuild
+git clone https://github.com/zephytiju/JumboBuild.git
+cd JumboBuild
 
-# 构建开发版本
 cargo build
-
-# 构建发布版本
-cargo build --release
-
-# 运行并测试 CLI
-cargo run -- --help
-
-# 运行单元测试
 cargo test
+cargo fmt --check
+cargo clippy --all-targets --all-features
+cargo run -- --help
 ```
 
-## 本地环境搭建
+Build an optimized binary with `cargo build --release`. The result is `target/release/jumbo`.
 
-### 前置条件
+### Exercise the CLI locally
 
-- Rust stable（推荐通过 rustup 安装）
-- macOS 或 Linux
-
-### 验证环境
+Use `cargo run --` in place of `jumbo` while developing:
 
 ```bash
-cargo run -- --version
 cargo run -- workspace --help
+cargo run -- completions zsh
 ```
 
----
+Project commands require a real Jumbo workspace and must be launched from a registered project directory. For an end-to-end check, build the binary, create or reuse a fixture workspace, register a Python project, and run the binary from that project's directory. Do not use a production workspace as a destructive `remove` or `clean` fixture.
 
-## 架构概览
+## Architecture
 
-Jumbo Build 采用模块化设计，核心分为四个层次：
+Jumbo separates command parsing, workspace coordination, language behavior, and process execution. Preserve these boundaries when adding functionality:
 
-```
+```text
 src/
-├── main.rs              # 入口：CLI 解析与命令分发
-├── cli/                  # 命令定义层：clap derive 宏定义所有子命令
-│   ├── mod.rs            # Cli struct + Commands enum
-│   ├── build.rs          # build / test / format / release 命令执行
-│   └── workspace.rs      # workspace (ws) 子命令执行
-├── workspace/            # 工作空间核心层
-│   ├── mod.rs            # 工作空间操作（create/use/import/sync/watch）
-│   ├── metadata.rs       # jumbo.toml 元数据模型与读写
-│   ├── detection.rs      # 工作空间根目录检测（向上递归）
-│   └── vscode.rs         # VSCode .code-workspace 文件生成
-├── language/             # 语言插件层
-│   ├── mod.rs            # LanguageSupport trait 定义 + 注册表
-│   └── python.rs         # Python 语言支持实现
+├── lib.rs                  # Shared module root used by the CLI and doc generator
+├── main.rs                 # Startup, dynamic completion, and top-level dispatch
+├── cli/
+│   ├── mod.rs              # clap command and argument model
+│   ├── build.rs            # Current-project build command dispatch
+│   └── workspace.rs        # Workspace subcommand dispatch
+├── workspace/
+│   ├── mod.rs              # Workspace lifecycle and configuration reconciliation
+│   ├── detection.rs        # Upward search for the workspace root
+│   ├── metadata.rs         # jumbo.toml data model and persistence
+│   └── vscode.rs           # VS Code workspace generation
+├── language/
+│   ├── mod.rs              # LanguageSupport contract, registry, and detection
+│   └── python.rs           # uv, pytest, Ruff, and Python cleanup behavior
 └── utils/
-    ├── mod.rs
-    └── runner.rs          # Shell 命令执行器
+    └── runner.rs           # Child-process execution and build result reporting
 ```
 
-### 核心数据流
+### Request flow
 
-1. `main.rs` 解析 CLI 参数，分发到 `cli/` 层
-2. `cli/` 层调用 `workspace/` 获取元数据和环境信息
-3. `cli/` 层调用 `language/` 插件执行语言特定操作
-4. `utils/runner.rs` 负责实际 shell 命令执行与输出
+1. `main.rs` lets clap parse arguments and dispatches the selected top-level command.
+2. `cli/` validates command context and delegates the operation.
+3. Workspace operations discover the root, load `jumbo.toml`, and reconcile generated configuration.
+4. Project build operations identify the registered repository containing the current directory, detect its language, and call one `LanguageSupport` implementation.
+5. The language implementation describes the external tool steps; `utils::runner` executes them and reports the result.
 
-### 技术栈
+The CLI model in `src/cli/` is the source of truth for commands, arguments, aliases, defaults, and help text. User documentation should explain workflows and intent; it should not become a second hand-maintained command schema.
 
-- **语言**: Rust (edition 2021)
-- **CLI 框架**: clap 4 (derive 宏)
-- **序列化**: serde + toml (元数据) + serde_json (VSCode workspace)
-- **Git 操作**: git2 (原生 libgit2 绑定)
-- **错误处理**: anyhow + thiserror
-- **终端着色**: colored
+## Core contracts
 
----
+### Workspace layout
 
-## 工作空间元数据
+A Jumbo workspace has this conceptual shape:
 
-工作空间根目录维护 `jumbo.toml` 文件：
+```text
+my-workspace/
+├── jumbo.toml
+├── pyproject.toml
+├── my-workspace.code-workspace
+└── projects/
+    ├── PackageA/
+    └── ServiceB/
+```
+
+- `jumbo.toml` records repository identity, location, optional remote and package name, and IDE settings.
+- The root `pyproject.toml` is the uv workspace configuration. Jumbo creates the minimum required project metadata and preserves unrelated user settings.
+- Repositories live under `projects/`; paths stored in metadata are relative to the workspace root.
+- Project commands act on the registered repository containing the current working directory. Workspace commands may coordinate every repository.
+
+Example metadata:
 
 ```toml
 [workspace]
-name = "my_workspace"
+name = "my-workspace"
 
 [[workspace.repositories]]
-name = "RepoA"
-path = "projects/RepoA"
-
-[[workspace.repositories]]
-name = "RepoB"
-path = "projects/RepoB"
-remote = "https://github.com/org/RepoB.git"
+name = "PackageA"
+path = "projects/PackageA"
+remote = "https://github.com/example/PackageA.git"
+package = "package-a"
 
 [workspace.ide]
 type = "vscode"
+git_auto_repo_detection = true
+git_repo_scan_max_depth = 2
 ```
 
-`sync` 命令会根据 `projects/` 目录的实际状态更新此文件，并在本地模式下将依赖源配置为 workspace 成员。
+### Managed Python configuration
 
----
+The Python backend updates uv workspace membership and sources in one pass for all registered repositories. It records the package names it owns in `[tool.jumbo.workspace_sources]`, removes only previously managed source entries, and preserves everything else. Changes to this logic must remain idempotent: running `jumbo workspace sync` twice without filesystem changes should not change the generated files the second time.
 
-## 语言扩展指南
+### Failure behavior
 
-添加新语言支持只需三步：
+External commands run sequentially and stop the pipeline on the first non-zero exit status. A project pipeline exits the process after printing its final success or failure banner. Workspace operations return structured `anyhow::Result` errors to `main`.
 
-### 1. 实现 LanguageSupport trait
+## Make a change
 
-在 `src/language/` 下新建文件，例如 `rust_lang.rs`：
+### Add or change a command
+
+1. Define the clap command, argument, help text, aliases, and defaults in `src/cli/`.
+2. Keep dispatch thin; put workspace state transitions in `workspace/` and language-specific behavior in `language/`.
+3. Update or add tests for parsing and behavior.
+4. Check `cargo run -- <command> --help` and all affected parent help pages.
+5. Update the user guides only when the workflow or conceptual behavior changed.
+
+Help text should be specific enough to stand on its own because it is also the best version-matched reference for users and coding agents.
+
+### Add a language backend
+
+1. Add `src/language/<language>.rs` and implement every method of `LanguageSupport`:
 
 ```rust
-use super::LanguageSupport;
-use crate::workspace::metadata::RepoInfo;
-use anyhow::Result;
-use std::path::Path;
-
-pub struct RustSupport;
-
-impl LanguageSupport for RustSupport {
-    fn name(&self) -> &str { "rust" }
-    fn detect(&self, repo_path: &Path) -> bool {
-        repo_path.join("Cargo.toml").exists()
-    }
-    fn sync_workspace(&self, ws_root: &Path, repo: &RepoInfo, local: bool) -> Result<()> {
-        Ok(()) // 按需实现
-    }
-    fn build(&self, _repo_path: &Path) -> Result<()> { /* ... */ Ok(()) }
-    fn test(&self, _repo_path: &Path) -> Result<()> { /* ... */ Ok(()) }
-    fn format(&self, _repo_path: &Path) -> Result<()> { /* ... */ Ok(()) }
-    fn release(&self, _repo_path: &Path) -> Result<()> { /* ... */ Ok(()) }
+pub trait LanguageSupport: Send + Sync {
+    fn name(&self) -> &str;
+    fn detect(&self, repo_path: &Path) -> bool;
+    fn sync_workspace(&self, workspace_root: &Path, repos: &[RepoInfo]) -> Result<()>;
+    fn build(&self, workspace_root: &Path, repo_path: &Path) -> Result<()>;
+    fn test(&self, workspace_root: &Path, repo_path: &Path) -> Result<()>;
+    fn format(&self, workspace_root: &Path, repo_path: &Path) -> Result<()>;
+    fn release(&self, workspace_root: &Path, repo_path: &Path) -> Result<()>;
+    fn clean(&self, repo_path: &Path) -> Result<()>;
 }
 ```
 
-### 2. 在 language/mod.rs 中声明模块
+2. Export the module and register one instance in `get_registry()` in `src/language/mod.rs`.
+3. Make `detect()` narrow enough not to capture another language's projects. The first matching backend wins.
+4. Keep workspace synchronization idempotent and preserve user-owned configuration.
+5. Define what build, test, format, release check, and cleanup mean for the ecosystem, then document any new prerequisite in both user guides.
+6. Add detection, synchronization, pipeline, cleanup, and failure-path tests.
 
-```rust
-pub mod rust_lang;
+## Verification strategy
+
+Run checks proportional to the change. The baseline before opening a pull request is:
+
+```bash
+cargo fmt --check
+cargo clippy --all-targets --all-features
+cargo test
+cargo build --release
 ```
 
-### 3. 注册到 get_registry()
+For CLI changes, also inspect generated help and verify both the shortcut and explicit command form where applicable. For workspace changes, use a temporary workspace covering local repositories, absent repositories with remotes, non-language directories, and a second sync to test idempotence. For process changes, verify that failing child commands produce a non-zero exit code.
 
-```rust
-pub fn get_registry() -> Vec<Box<dyn LanguageSupport>> {
-    vec![
-        Box::new(python::PythonSupport),
-        Box::new(rust_lang::RustSupport),
-    ]
-}
-```
+## Contribution conventions
 
-语言检测自动进行——`detect()` 返回 true 的第一个匹配语言将被使用。
+- Use [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/) such as `feat:`, `fix:`, `docs:`, `refactor:`, and `chore:`.
+- Keep CLI parsing, workspace state, language integrations, and command execution separate.
+- Add context to I/O and external-tool errors so the failing path or operation is visible.
+- Let `cargo fmt` decide formatting and resolve all relevant Clippy warnings.
+- Never test destructive workspace behavior against a developer's only local checkout.
 
----
+## Documentation maintenance
 
-## 开发规范
+- Keep `README.md` and `README.zh-CN.md` aligned in meaning, not necessarily word for word.
+- Keep this English development guide as the single contributor reference.
+- Describe design intent and ownership boundaries here; keep exact signatures next to the Rust code unless a signature defines an extension contract.
+- Generate command reference material from clap rather than manually copying command trees.
+- Run `cargo run --example generate-cli-docs` after changing the clap model and commit the updated `docs/cli-reference.md`.
+- Update the architecture index only when ownership or top-level structure changes.
 
-### 提交格式
+## Module index
 
-遵循 [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/)：`feat:`, `fix:`, `chore:`, `refactor:` 等。
-
-### 代码风格
-
-- 使用 `cargo fmt` 格式化代码
-- 使用 `cargo clippy` 检查代码质量
-- 提交前确保 `cargo build` 和 `cargo test` 通过
-
-### 模块组织原则
-
-- **关注点分离**: CLI 定义、工作空间逻辑、语言插件各自独立
-- **插件化**: 新语言只需实现 trait + 注册，不修改核心代码
-- **自动检测**: 语言识别通过文件签名（如 `pyproject.toml`）自动完成
-
----
-
-## 核心模块索引
-
-| 领域 | 文件 | 职责 |
-|------|------|------|
-| CLI 入口 | `cli/mod.rs` | clap 命令结构定义 |
-| 构建执行 | `cli/build.rs` | 遍历仓库，调用语言插件执行构建 |
-| 工作空间命令 | `cli/workspace.rs` | create/use/import/sync/watch 参数解析 |
-| 元数据 | `workspace/metadata.rs` | jumbo.toml 模型定义与 IO |
-| 空间检测 | `workspace/detection.rs` | 向上递归查找 workspace root |
-| IDE 集成 | `workspace/vscode.rs` | .code-workspace 文件生成 |
-| 语言 trait | `language/mod.rs` | LanguageSupport 定义 + 注册表 |
-| Python 支持 | `language/python.rs` | Python 构建/测试/格式化/sync |
-| 命令执行 | `utils/runner.rs` | shell 命令封装 |
+| Concern | Primary location | Responsibility |
+| --- | --- | --- |
+| Shared crate root | `src/lib.rs` | Expose the CLI model to the binary and documentation generator |
+| CLI schema and help | `src/cli/mod.rs`, `src/cli/*.rs` | Commands, arguments, defaults, aliases, dispatch |
+| Current-project pipelines | `src/cli/build.rs` | Repository selection and language pipeline choice |
+| Workspace lifecycle | `src/workspace/mod.rs` | Create, clone, import, remove, sync, watch, and clean |
+| Workspace discovery | `src/workspace/detection.rs` | Find and validate workspace context |
+| Metadata | `src/workspace/metadata.rs` | Parse and write `jumbo.toml` |
+| IDE integration | `src/workspace/vscode.rs` | Generate VS Code workspace settings |
+| Language contract | `src/language/mod.rs` | Backend interface, registry, and detection order |
+| Python backend | `src/language/python.rs` | uv configuration and Python project tool pipelines |
+| Process runner | `src/utils/runner.rs` | Execute sequential shell steps and finalize builds |

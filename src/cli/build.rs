@@ -23,7 +23,7 @@ pub enum BuildAction {
     Format,
     /// Run release pipeline
     Release,
-    /// Clean build artifacts for all languages
+    /// Clean build artifacts for the current project
     Clean,
 }
 
