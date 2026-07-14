@@ -1,4 +1,0 @@
-interface:
-  display_name: "Jumbo CLI"
-  short_description: "Consult version-matched Jumbo CLI commands"
-  default_prompt: "Use $jumbo-cli to verify the current Jumbo command and flags before proceeding."
