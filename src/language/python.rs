@@ -11,6 +11,9 @@ use crate::workspace::metadata::RepoInfo;
 /// Python language support.
 pub struct PythonSupport;
 
+const ACTIVATE_WORKSPACE_ENVIRONMENT: (&str, &str) =
+    (". .venv/bin/activate", "Activating workspace environment");
+
 impl LanguageSupport for PythonSupport {
     fn name(&self) -> &str {
         "python"
@@ -147,10 +150,7 @@ impl LanguageSupport for PythonSupport {
             ],
             repo_path,
         )?;
-        run_steps(
-            &[("source .venv/bin/activate", "Activating workspace environment")],
-            workspace_root,
-        )?;
+        run_steps(&[ACTIVATE_WORKSPACE_ENVIRONMENT], workspace_root)?;
         // uv build runs in the repo directory
         run_steps(
             &[("uv build", "Running python build")],
@@ -166,10 +166,7 @@ impl LanguageSupport for PythonSupport {
             ],
             repo_path,
         )?;
-        run_steps(
-            &[("source .venv/bin/activate", "Activating workspace environment")],
-            workspace_root,
-        )?;
+        run_steps(&[ACTIVATE_WORKSPACE_ENVIRONMENT], workspace_root)?;
         run_steps(
             &[
                 ("uv build", "Running python build"),
@@ -187,10 +184,7 @@ impl LanguageSupport for PythonSupport {
             ],
             repo_path,
         )?;
-        run_steps(
-            &[("source .venv/bin/activate", "Activating workspace environment")],
-            workspace_root,
-        )?;
+        run_steps(&[ACTIVATE_WORKSPACE_ENVIRONMENT], workspace_root)?;
         run_steps(
             &[
                 ("uv build", "Running python build"),
@@ -209,10 +203,7 @@ impl LanguageSupport for PythonSupport {
             ],
             repo_path,
         )?;
-        run_steps(
-            &[("source .venv/bin/activate", "Activating workspace environment")],
-            workspace_root,
-        )?;
+        run_steps(&[ACTIVATE_WORKSPACE_ENVIRONMENT], workspace_root)?;
         run_steps(
             &[
                 ("uv build", "Running python build"),
@@ -272,4 +263,46 @@ fn managed_source_names(doc: &toml::Table) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::process::Command;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::ACTIVATE_WORKSPACE_ENVIRONMENT;
+
+    #[test]
+    fn activation_command_runs_under_posix_sh() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after the Unix epoch")
+            .as_nanos();
+        let workspace = std::env::temp_dir().join(format!(
+            "jumbo-python-activation-{}-{unique}",
+            std::process::id()
+        ));
+        let activate_script = workspace.join(".venv/bin/activate");
+        fs::create_dir_all(activate_script.parent().expect("activation parent exists"))
+            .expect("create activation directory");
+        fs::write(
+            &activate_script,
+            "VIRTUAL_ENV=workspace; export VIRTUAL_ENV\n",
+        )
+        .expect("write activation script");
+
+        let status = Command::new("sh")
+            .arg("-c")
+            .arg(ACTIVATE_WORKSPACE_ENVIRONMENT.0)
+            .current_dir(&workspace)
+            .status()
+            .expect("POSIX sh should start");
+
+        fs::remove_dir_all(&workspace).expect("remove activation fixture");
+        assert!(
+            status.success(),
+            "POSIX sh should source the activation script"
+        );
+    }
 }
