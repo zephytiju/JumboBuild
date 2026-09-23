@@ -220,11 +220,18 @@ pub fn generate_lock_inputs(
     })?;
 
     // Write the rewritten manifest last: on disk, marker + sources always
-    // precede the rewrite that references them.
-    std::fs::write(manifest, &rewritten).map_err(|e| FingerprintError::LockGeneration {
-        manifest: manifest.display().to_string(),
-        reason: format!("failed to write rewritten manifest: {e}"),
-    })?;
+    // precede the rewrite that references them. When nothing was injected
+    // the rewrite would only re-serialize the manifest (TOML
+    // re-serialization drops comments and reorders keys), which the
+    // promotion clean-tree guard rightly flags as a change beyond jumbo
+    // injection — a package with no internal dependencies must stay
+    // byte-identical after `jumbo lock`, so the declared form is kept.
+    if !injected.is_empty() {
+        std::fs::write(manifest, &rewritten).map_err(|e| FingerprintError::LockGeneration {
+            manifest: manifest.display().to_string(),
+            reason: format!("failed to write rewritten manifest: {e}"),
+        })?;
+    }
 
     Ok(LockGeneration {
         manifest: manifest.to_path_buf(),
@@ -393,6 +400,14 @@ fn rewrite_python_dependency_strings(doc: &mut toml::Table, source: &InjectedSou
 /// restored manifest is a no-op, which is what the promotion guard relies
 /// on to compare the working tree against HEAD.
 pub fn restore_python_manifest(content: &str, sources: &[InjectedSource]) -> String {
+    // Nothing to un-inject and no managed section to prune: keep the bytes
+    // exactly. Re-serialization would drop comments and reorder keys, which
+    // the promotion clean-tree guard flags as a change beyond jumbo
+    // injection (a package with no internal dependencies must stay
+    // byte-identical across repeated jumbo invocations).
+    if sources.is_empty() && !content.contains("[tool.jumbo") {
+        return content.to_string();
+    }
     let Ok(mut doc) = content.parse::<toml::Table>() else {
         return content.to_string();
     };
@@ -556,6 +571,11 @@ fn apply_npm_injection(
 /// (`file:deps/<slug>/<file>.tgz`) — anything under the package's overlay
 /// coordinate is jumbo-owned and reverts to the declared range.
 pub fn restore_npm_manifest(content: &str, sources: &[InjectedSource]) -> String {
+    // Nothing to un-inject: keep the bytes exactly (see
+    // restore_python_manifest for the rationale).
+    if sources.is_empty() {
+        return content.to_string();
+    }
     let Ok(mut doc) = serde_json::from_str::<serde_json::Value>(content) else {
         return content.to_string();
     };
@@ -778,6 +798,28 @@ mod tests {
                 .as_str()
                 .unwrap(),
             "deps/demo-alpha"
+        );
+        let _ = std::fs::remove_dir_all(&project);
+    }
+
+    #[test]
+    fn empty_injection_leaves_the_manifest_byte_identical() {
+        // A manifest with no internal dependencies must survive `jumbo
+        // lock` byte-identical: the promotion clean-tree guard treats any
+        // manifest change beyond a recorded injection as a dirty tree, and
+        // re-serialization (comment loss, key reordering) is such a change.
+        let (_index_dir, index) = fixture_index("py-empty");
+        let project = temp_project("py-empty");
+        let manifest = project.join("pyproject.toml");
+        let original = "# SPDX-License-Identifier: Apache-2.0\n\n[build-system]\nrequires = [\"hatchling==1.27.0\"]\nbuild-backend = \"hatchling.build\"\n\n[project]\nname = \"solo\"\nversion = \"1.1.0\"\ndependencies = [\"numpy>=1.26\"]\n";
+        std::fs::write(&manifest, original).expect("write manifest");
+
+        let generation = generate_lock_inputs(&manifest, &index).expect("generate");
+        assert!(generation.injected.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(&manifest).expect("read manifest"),
+            original,
+            "no internal dependencies means no manifest rewrite"
         );
         let _ = std::fs::remove_dir_all(&project);
     }

@@ -16,8 +16,11 @@
 //! - Python names PEP 503-normalized; npm names kept verbatim;
 //! - injected internal sources carry the stable relative coordinate
 //!   `deps/<slug>` regardless of how the tool wrote the path;
-//! - digests are the lock's own integrity strings (uv `sha256:…` sdist
-//!   hash, npm `sha512-…` integrity), never lock formatting.
+//! - digests are the lock's own integrity strings, never lock formatting:
+//!   uv `sha256:…` hashes normalized to the bare lowercase hex the
+//!   JumboIndex record schema requires (sdist hash preferred, else the
+//!   smallest of the sorted unique wheel hashes), npm `sha512-…`
+//!   integrity verbatim.
 //!
 //! A formatting-only lock change produces the same extract and therefore
 //! no fingerprint change; any real resolution change produces a different
@@ -273,16 +276,27 @@ pub fn extract_uv_lock(content: &str) -> Result<CanonicalExtract, FingerprintErr
 }
 
 /// The integrity digest of a uv package: the sdist hash when present,
-/// otherwise the sorted unique wheel hashes joined with `,`. Both are
-/// fixed per released version, so the choice is stable across uv
-/// formatting versions.
+/// otherwise the lexicographically first of the sorted unique wheel
+/// hashes. Both are fixed per released version, so the choice is stable
+/// across uv formatting versions. Algorithm prefixes (`sha256:`) are
+/// stripped and the hex lowercased: the JumboIndex record schema's
+/// `digest` pattern accepts only the bare hex digest (or an npm-style
+/// integrity string), and the index record must store exactly the
+/// extract the fingerprint hashed — so the normalized form is what both
+/// the fingerprint and the record use.
 fn uv_digest(package: &toml::Value) -> Option<String> {
+    let bare = |hash: &str| {
+        hash.trim()
+            .strip_prefix("sha256:")
+            .unwrap_or(hash.trim())
+            .to_ascii_lowercase()
+    };
     if let Some(hash) = package
         .get("sdist")
         .and_then(|s| s.get("hash"))
         .and_then(|h| h.as_str())
     {
-        return Some(hash.to_string());
+        return Some(bare(hash));
     }
     let mut hashes: Vec<String> = package
         .get("wheels")
@@ -291,7 +305,7 @@ fn uv_digest(package: &toml::Value) -> Option<String> {
             wheels
                 .iter()
                 .filter_map(|w| w.get("hash").and_then(|h| h.as_str()))
-                .map(str::to_string)
+                .map(bare)
                 .collect()
         })
         .unwrap_or_default();
@@ -300,7 +314,7 @@ fn uv_digest(package: &toml::Value) -> Option<String> {
     } else {
         hashes.sort();
         hashes.dedup();
-        Some(hashes.join(","))
+        Some(hashes.remove(0))
     }
 }
 
@@ -617,7 +631,7 @@ sdist = { hash = "sha256:aaaa1111", url = "https://files.pythonhosted.org/packag
                     "numpy",
                     "1.26.4",
                     EntrySource::PyPI,
-                    Some("sha256:aaaa1111"),
+                    Some("aaaa1111"),
                     None
                 ),
             ]
@@ -634,7 +648,7 @@ sdist = { hash = "sha256:aaaa1111", url = "https://files.pythonhosted.org/packag
     }
 
     #[test]
-    fn uv_lock_wheel_only_digest_is_sorted_and_stable() {
+    fn uv_lock_wheel_only_digest_is_stable() {
         let lock = r#"
 [[package]]
 name = "wheel-only"
@@ -651,10 +665,9 @@ wheels = [
             .replace("w2", "w1")
             .replace("tmp", "w2");
         let two = extract_uv_lock(&shuffled).expect("extract shuffled");
-        assert_eq!(
-            one.entries[0].digest.as_deref(),
-            Some("sha256:aaaa,sha256:zzzz")
-        );
+        // Wheel-only digests: the schema-valid bare form of the smallest
+        // of the sorted unique hashes.
+        assert_eq!(one.entries[0].digest.as_deref(), Some("aaaa"));
         assert_eq!(one, two);
     }
 
