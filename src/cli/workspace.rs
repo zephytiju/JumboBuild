@@ -1,11 +1,11 @@
 use anyhow::{bail, Context, Result};
 use clap::{Args, Subcommand};
 
+use crate::workspace::detection::ensure_in_workspace;
 use crate::workspace::{
     clean_workspace, create_workspace, import_all_projects, import_project, remove_project,
     sync_workspace, use_repository, watch_workspace,
 };
-use crate::workspace::detection::ensure_in_workspace;
 
 #[derive(Args)]
 pub struct WorkspaceArgs {
@@ -88,11 +88,7 @@ pub fn execute(args: WorkspaceArgs) -> Result<()> {
             if create_args.import {
                 // -i: verify <name> folder already exists
                 if !workspace_path.exists() || !workspace_path.is_dir() {
-                    bail!(
-                        "Directory '{}' does not exist at {}",
-                        name,
-                        cwd.display()
-                    );
+                    bail!("Directory '{}' does not exist at {}", name, cwd.display());
                 }
             } else {
                 // Create new folder <name> at cwd

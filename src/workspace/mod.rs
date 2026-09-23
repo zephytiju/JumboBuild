@@ -19,14 +19,21 @@ pub fn create_workspace(path: &Path, name: &str, import_existing: bool) -> Resul
     detection::ensure_not_in_workspace()?;
 
     let projects_dir = path.join("projects");
-    std::fs::create_dir_all(&projects_dir)
-        .with_context(|| format!("Failed to create projects directory at {}", projects_dir.display()))?;
+    std::fs::create_dir_all(&projects_dir).with_context(|| {
+        format!(
+            "Failed to create projects directory at {}",
+            projects_dir.display()
+        )
+    })?;
 
     let mut metadata = JumboToml {
         workspace: WorkspaceConfig {
             name: name.to_string(),
             repositories: Vec::new(),
-            ide: Some(IdeConfig { ide_type: "vscode".to_string(), ..Default::default() }),
+            ide: Some(IdeConfig {
+                ide_type: "vscode".to_string(),
+                ..Default::default()
+            }),
         },
     };
 
@@ -36,7 +43,12 @@ pub fn create_workspace(path: &Path, name: &str, import_existing: bool) -> Resul
 
     metadata.save(path)?;
     reconcile_workspace_config(path, &metadata)?;
-    println!("{} Workspace '{}' created at {}", "✓".green().bold(), name, path.display());
+    println!(
+        "{} Workspace '{}' created at {}",
+        "✓".green().bold(),
+        name,
+        path.display()
+    );
 
     // Generate VSCode workspace file if IDE is vscode
     if let Some(ref ide) = metadata.workspace.ide {
@@ -58,10 +70,18 @@ pub fn use_repository(workspace_root: &Path, repo_url: &str) -> Result<()> {
     let abs_target = workspace_root.join(&target_path);
 
     if abs_target.exists() {
-        bail!("Repository directory already exists: {}", abs_target.display());
+        bail!(
+            "Repository directory already exists: {}",
+            abs_target.display()
+        );
     }
 
-    println!("{} Cloning {} into {}...", "➔".blue().bold(), repo_url, target_path);
+    println!(
+        "{} Cloning {} into {}...",
+        "➔".blue().bold(),
+        repo_url,
+        target_path
+    );
 
     // Use RepoBuilder with credential callbacks so that SSH agent,
     // default SSH keys, and the system git credential helper are consulted.
@@ -112,7 +132,8 @@ pub fn use_repository(workspace_root: &Path, repo_url: &str) -> Result<()> {
     let mut builder = git2::build::RepoBuilder::new();
     builder.fetch_options(fetch_opts);
 
-    let repo = builder.clone(repo_url, &abs_target)
+    let repo = builder
+        .clone(repo_url, &abs_target)
         .with_context(|| format!("Failed to clone {}", repo_url))?;
 
     // Get remote URL
@@ -121,18 +142,27 @@ pub fn use_repository(workspace_root: &Path, repo_url: &str) -> Result<()> {
         .ok()
         .and_then(|r| r.url().map(String::from));
 
+    let (package, ecosystem) = detect_package(&abs_target)?
+        .map_or((None, None), |(name, ecosystem)| {
+            (Some(name), Some(ecosystem))
+        });
     let repo_info = RepoInfo {
         name: repo_name.clone(),
         path: target_path,
         remote: remote_url,
-        package: python_package_name(&abs_target)?,
+        package,
+        ecosystem,
     };
 
     metadata.workspace.repositories.push(repo_info);
     metadata.save(workspace_root)?;
     reconcile_workspace_config(workspace_root, &metadata)?;
 
-    println!("{} Repository '{}' added to workspace", "✓".green().bold(), repo_name);
+    println!(
+        "{} Repository '{}' added to workspace",
+        "✓".green().bold(),
+        repo_name
+    );
 
     // Update VSCode workspace
     if let Some(ref ide) = metadata.workspace.ide {
@@ -155,30 +185,40 @@ pub fn import_project(workspace_root: &Path, project_name: &str) -> Result<()> {
     }
 
     if metadata.find_repo(project_name).is_some() {
-        bail!("Repository '{}' is already registered in the workspace", project_name);
+        bail!(
+            "Repository '{}' is already registered in the workspace",
+            project_name
+        );
     }
 
     // Detect git remote if available
-    let remote = git2::Repository::open(&abs_path)
-        .ok()
-        .and_then(|repo| {
-            repo.find_remote("origin")
-                .ok()
-                .and_then(|r| r.url().map(String::from))
-        });
+    let remote = git2::Repository::open(&abs_path).ok().and_then(|repo| {
+        repo.find_remote("origin")
+            .ok()
+            .and_then(|r| r.url().map(String::from))
+    });
 
+    let (package, ecosystem) = detect_package(&abs_path)?
+        .map_or((None, None), |(name, ecosystem)| {
+            (Some(name), Some(ecosystem))
+        });
     let repo_info = RepoInfo {
         name: project_name.to_string(),
         path: rel_path,
         remote,
-        package: python_package_name(&abs_path)?,
+        package,
+        ecosystem,
     };
 
     metadata.workspace.repositories.push(repo_info);
     metadata.save(workspace_root)?;
     reconcile_workspace_config(workspace_root, &metadata)?;
 
-    println!("{} Project '{}' imported into workspace", "✓".green().bold(), project_name);
+    println!(
+        "{} Project '{}' imported into workspace",
+        "✓".green().bold(),
+        project_name
+    );
 
     // Update VSCode workspace
     if let Some(ref ide) = metadata.workspace.ide {
@@ -196,10 +236,12 @@ pub fn remove_project(workspace_root: &Path, project_name: &str, force: bool) ->
     let mut metadata = JumboToml::load(workspace_root)?;
 
     // Verify the project is registered in the workspace
-    let repo = metadata
-        .find_repo(project_name)
-        .cloned()
-        .ok_or_else(|| anyhow::anyhow!("Project '{}' is not registered in the workspace", project_name))?;
+    let repo = metadata.find_repo(project_name).cloned().ok_or_else(|| {
+        anyhow::anyhow!(
+            "Project '{}' is not registered in the workspace",
+            project_name
+        )
+    })?;
 
     let abs_path = workspace_root.join(&repo.path);
 
@@ -226,7 +268,11 @@ pub fn remove_project(workspace_root: &Path, project_name: &str, force: bool) ->
         let answer = answer.trim().to_lowercase();
 
         if answer != "y" && answer != "yes" {
-            println!("{} Removal of '{}' cancelled", "➔".blue().bold(), project_name);
+            println!(
+                "{} Removal of '{}' cancelled",
+                "➔".blue().bold(),
+                project_name
+            );
             return Ok(());
         }
     }
@@ -234,13 +280,23 @@ pub fn remove_project(workspace_root: &Path, project_name: &str, force: bool) ->
     // Remove the project directory from disk
     if abs_path.exists() {
         std::fs::remove_dir_all(&abs_path).with_context(|| {
-            format!("Failed to remove project directory at {}", abs_path.display())
+            format!(
+                "Failed to remove project directory at {}",
+                abs_path.display()
+            )
         })?;
-        println!("{} Removed directory {}", "✓".green().bold(), abs_path.display());
+        println!(
+            "{} Removed directory {}",
+            "✓".green().bold(),
+            abs_path.display()
+        );
     }
 
     // Remove from metadata
-    metadata.workspace.repositories.retain(|r| r.name != project_name);
+    metadata
+        .workspace
+        .repositories
+        .retain(|r| r.name != project_name);
     metadata.save(workspace_root)?;
     println!(
         "{} Removed project '{}' from workspace metadata",
@@ -272,9 +328,9 @@ fn check_pending_git_changes(repo_path: &Path) -> Result<bool> {
         Err(_) => return Ok(false), // Not a git repo, treat as clean
     };
 
-    let statuses = repo.statuses(None).with_context(|| {
-        format!("Failed to read git status at {}", repo_path.display())
-    })?;
+    let statuses = repo
+        .statuses(None)
+        .with_context(|| format!("Failed to read git status at {}", repo_path.display()))?;
 
     Ok(!statuses.is_empty())
 }
@@ -347,23 +403,30 @@ pub fn import_all_projects(workspace_root: &Path) -> Result<()> {
         let rel_path = format!("projects/{}", name);
 
         // Detect git remote if available
-        let remote = git2::Repository::open(&path)
-            .ok()
-            .and_then(|repo| {
-                repo.find_remote("origin")
-                    .ok()
-                    .and_then(|r| r.url().map(String::from))
-            });
+        let remote = git2::Repository::open(&path).ok().and_then(|repo| {
+            repo.find_remote("origin")
+                .ok()
+                .and_then(|r| r.url().map(String::from))
+        });
 
+        let (package, ecosystem) = detect_package(&path)?
+            .map_or((None, None), |(name, ecosystem)| {
+                (Some(name), Some(ecosystem))
+            });
         let repo_info = RepoInfo {
             name: name.clone(),
             path: rel_path,
             remote,
-            package: python_package_name(&path)?,
+            package,
+            ecosystem,
         };
 
         metadata.workspace.repositories.push(repo_info);
-        println!("{} Project '{}' imported into workspace", "✓".green().bold(), name);
+        println!(
+            "{} Project '{}' imported into workspace",
+            "✓".green().bold(),
+            name
+        );
         imported += 1;
     }
 
@@ -401,7 +464,13 @@ pub fn sync_workspace(workspace_root: &Path) -> Result<()> {
         .workspace
         .repositories
         .iter()
-        .filter(|r| !current_repos.workspace.repositories.iter().any(|c| c.name == r.name))
+        .filter(|r| {
+            !current_repos
+                .workspace
+                .repositories
+                .iter()
+                .any(|c| c.name == r.name)
+        })
         .cloned()
         .collect();
 
@@ -459,10 +528,7 @@ pub fn clean_workspace(workspace_root: &Path) -> Result<()> {
     let metadata = JumboToml::load(workspace_root)?;
     let registry = get_registry();
 
-    println!(
-        "{} Cleaning build artifacts...",
-        "➔".blue().bold()
-    );
+    println!("{} Cleaning build artifacts...", "➔".blue().bold());
 
     // --- Workspace root level artifacts ---
     println!("  Cleaning workspace root...");
@@ -470,20 +536,16 @@ pub fn clean_workspace(workspace_root: &Path) -> Result<()> {
 
     // Remove dist/ directory
     let dist_dir = workspace_root.join("dist");
-    if dist_dir.exists() {
-        if std::fs::remove_dir_all(&dist_dir).is_ok() {
-            println!("    {} Removed {}", "-".dimmed(), dist_dir.display());
-            root_cleaned += 1;
-        }
+    if dist_dir.exists() && std::fs::remove_dir_all(&dist_dir).is_ok() {
+        println!("    {} Removed {}", "-".dimmed(), dist_dir.display());
+        root_cleaned += 1;
     }
 
     // Remove .venv/ directory
     let venv_dir = workspace_root.join(".venv");
-    if venv_dir.exists() {
-        if std::fs::remove_dir_all(&venv_dir).is_ok() {
-            println!("    {} Removed {}", "-".dimmed(), venv_dir.display());
-            root_cleaned += 1;
-        }
+    if venv_dir.exists() && std::fs::remove_dir_all(&venv_dir).is_ok() {
+        println!("    {} Removed {}", "-".dimmed(), venv_dir.display());
+        root_cleaned += 1;
     }
 
     // Remove *.egg-info/ directories
@@ -491,11 +553,12 @@ pub fn clean_workspace(workspace_root: &Path) -> Result<()> {
         for entry in entries.flatten() {
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
-            if entry.path().is_dir() && name_str.ends_with(".egg-info") {
-                if std::fs::remove_dir_all(entry.path()).is_ok() {
-                    println!("    {} Removed {}", "-".dimmed(), entry.path().display());
-                    root_cleaned += 1;
-                }
+            if entry.path().is_dir()
+                && name_str.ends_with(".egg-info")
+                && std::fs::remove_dir_all(entry.path()).is_ok()
+            {
+                println!("    {} Removed {}", "-".dimmed(), entry.path().display());
+                root_cleaned += 1;
             }
         }
     }
@@ -507,10 +570,7 @@ pub fn clean_workspace(workspace_root: &Path) -> Result<()> {
     // Rebuild environment if .venv was removed
     if !venv_dir.exists() && workspace_root.join("pyproject.toml").exists() {
         println!("  Rebuilding environment...");
-        if let Err(e) = run_steps(
-            &[("uv sync", "Syncing dependencies")],
-            workspace_root,
-        ) {
+        if let Err(e) = run_steps(&[("uv sync", "Syncing dependencies")], workspace_root) {
             eprintln!("  {} Failed to rebuild environment: {}", "✗".red(), e);
         }
     }
@@ -544,17 +604,15 @@ pub fn clean_workspace(workspace_root: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Reconcile the root uv workspace configuration without changing package manifests.
-fn reconcile_workspace_config(
-    workspace_root: &Path,
-    metadata: &JumboToml,
-) -> Result<()> {
+/// Reconcile generated workspace configuration through every registered
+/// language backend. Each backend owns its own root configuration (Python:
+/// the uv workspace in the root pyproject.toml) and leaves the others'
+/// projects alone.
+fn reconcile_workspace_config(workspace_root: &Path, metadata: &JumboToml) -> Result<()> {
     ensure_root_pyproject(workspace_root, &metadata.workspace.name)?;
 
     for lang in get_registry() {
-        if lang.name() == "python" {
-            lang.sync_workspace(workspace_root, &metadata.workspace.repositories)?;
-        }
+        lang.sync_workspace(workspace_root, &metadata.workspace.repositories)?;
     }
 
     Ok(())
@@ -632,6 +690,37 @@ fn python_package_name(repo_path: &Path) -> Result<Option<String>> {
         .map(str::to_owned))
 }
 
+/// The recorded package identity of a repository: the distribution or
+/// package name plus the ecosystem it belongs to. Python projects are read
+/// from `pyproject.toml`, Node projects from `package.json` (including the
+/// `@juntai/*` standard and legacy `@zephytiju/*` scopes). Directories with
+/// neither manifest carry no package identity.
+fn detect_package(repo_path: &Path) -> Result<Option<(String, String)>> {
+    if let Some(name) = python_package_name(repo_path)? {
+        return Ok(Some((name, metadata::ECOSYSTEM_PYTHON.to_string())));
+    }
+    if let Some(name) = node_package_name(repo_path)? {
+        return Ok(Some((name, metadata::ECOSYSTEM_NODE.to_string())));
+    }
+    Ok(None)
+}
+
+fn node_package_name(repo_path: &Path) -> Result<Option<String>> {
+    let path = repo_path.join("package.json");
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let doc: serde_json::Value = std::fs::read_to_string(&path)
+        .with_context(|| format!("Failed to read {}", path.display()))?
+        .parse()
+        .with_context(|| format!("Failed to parse {}", path.display()))?;
+    Ok(doc
+        .get("name")
+        .and_then(|value| value.as_str())
+        .map(str::to_owned))
+}
+
 /// Scan the projects/ directory and build a metadata structure.
 fn scan_projects_dir(workspace_root: &Path, mut metadata: JumboToml) -> Result<JumboToml> {
     let projects_dir = workspace_root.join("projects");
@@ -661,20 +750,23 @@ fn scan_projects_dir(workspace_root: &Path, mut metadata: JumboToml) -> Result<J
                 .find_repo(&name)
                 .and_then(|r| r.remote.clone())
                 .or_else(|| {
-                    git2::Repository::open(&path)
-                        .ok()
-                        .and_then(|repo| {
-                            repo.find_remote("origin")
-                                .ok()
-                                .and_then(|r| r.url().map(String::from))
-                        })
+                    git2::Repository::open(&path).ok().and_then(|repo| {
+                        repo.find_remote("origin")
+                            .ok()
+                            .and_then(|r| r.url().map(String::from))
+                    })
                 });
 
+            let (package, ecosystem) = detect_package(&path)?
+                .map_or((None, None), |(name, ecosystem)| {
+                    (Some(name), Some(ecosystem))
+                });
             repos.push(RepoInfo {
                 name,
                 path: rel_path,
                 remote,
-                package: python_package_name(&path)?,
+                package,
+                ecosystem,
             });
         }
     }
@@ -704,7 +796,9 @@ pub fn complete_project_names() -> clap_complete::engine::ArgValueCompleter {
     clap_complete::engine::ArgValueCompleter::new(project_name_completer)
 }
 
-fn project_name_completer(_current: &std::ffi::OsStr) -> Vec<clap_complete::engine::CompletionCandidate> {
+fn project_name_completer(
+    _current: &std::ffi::OsStr,
+) -> Vec<clap_complete::engine::CompletionCandidate> {
     let Some(root) = detection::find_workspace_root().ok().flatten() else {
         return Vec::new();
     };
@@ -767,6 +861,7 @@ mod tests {
                     path: "projects/package-a-repo".to_string(),
                     remote: Some("https://github.com/example/package-a-repo.git".to_string()),
                     package: Some("package-a".to_string()),
+                    ecosystem: Some(metadata::ECOSYSTEM_PYTHON.to_string()),
                 }],
                 ide: None,
             },
@@ -790,8 +885,11 @@ mod tests {
             "[project]\nname = \"package-a\"\nversion = \"1.0.0\"\n",
         )
         .unwrap();
-        std::fs::write(workspace.0.join("pyproject.toml"), "[tool.custom]\nkeep = true\n")
-            .unwrap();
+        std::fs::write(
+            workspace.0.join("pyproject.toml"),
+            "[tool.custom]\nkeep = true\n",
+        )
+        .unwrap();
 
         let metadata = metadata();
         reconcile_workspace_config(&workspace.0, &metadata).unwrap();
@@ -826,5 +924,120 @@ mod tests {
     fn workspace_project_names_are_valid_and_stable() {
         assert_eq!(workspace_project_name("123 workspace"), "jumbo-workspace");
         assert_eq!(workspace_project_name("My Workspace!"), "my-workspace");
+    }
+
+    #[test]
+    fn node_repositories_are_identified_and_excluded_from_the_uv_workspace() {
+        let workspace = TempWorkspace::new();
+        let python_dir = workspace.0.join("projects/package-a-repo");
+        std::fs::create_dir_all(&python_dir).unwrap();
+        std::fs::write(
+            python_dir.join("pyproject.toml"),
+            "[project]\nname = \"package-a\"\nversion = \"1.0.0\"\n",
+        )
+        .unwrap();
+        let node_dir = workspace.0.join("projects/vangu-kit");
+        std::fs::create_dir_all(&node_dir).unwrap();
+        std::fs::write(
+            node_dir.join("package.json"),
+            r#"{ "name": "@juntai/vangu-kit", "version": "1.0.0" }"#,
+        )
+        .unwrap();
+
+        let (package, ecosystem) = detect_package(&node_dir)
+            .unwrap()
+            .expect("node package identity");
+        assert_eq!(package, "@juntai/vangu-kit");
+        assert_eq!(ecosystem, metadata::ECOSYSTEM_NODE);
+
+        let node_repo = RepoInfo {
+            name: "vangu-kit".to_string(),
+            path: "projects/vangu-kit".to_string(),
+            remote: None,
+            package: Some(package),
+            ecosystem: Some(ecosystem),
+        };
+        assert!(node_repo.is_node_package());
+        assert!(!node_repo.is_python_package());
+
+        // A legacy entry without an ecosystem stays a Python package.
+        let legacy = RepoInfo {
+            ecosystem: None,
+            ..node_repo.clone()
+        };
+        assert!(legacy.is_python_package());
+
+        let mut mixed = metadata();
+        mixed.workspace.repositories.push(node_repo);
+        reconcile_workspace_config(&workspace.0, &mixed).unwrap();
+
+        let root = root_doc(&workspace.0);
+        let members = root["tool"]["uv"]["workspace"]["members"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert_eq!(members.len(), 1, "only the Python project is a member");
+        assert!(!root["tool"]["uv"]["sources"]
+            .as_table()
+            .unwrap()
+            .contains_key("@juntai/vangu-kit"));
+        // The node project is excluded from the uv workspace instead.
+        let excluded = root["tool"]["uv"]["workspace"]["exclude"]
+            .as_array()
+            .unwrap();
+        assert!(excluded
+            .iter()
+            .any(|path| path.as_str() == Some("projects/vangu-kit")));
+
+        // The metadata round-trips the ecosystem through jumbo.toml.
+        mixed.save(&workspace.0).unwrap();
+        let reloaded = JumboToml::load(&workspace.0).unwrap();
+        assert_eq!(
+            reloaded.workspace.repositories[1].ecosystem.as_deref(),
+            Some(metadata::ECOSYSTEM_NODE)
+        );
+        let _ = std::fs::remove_dir_all(&workspace.0);
+    }
+
+    #[test]
+    fn absent_node_repositories_do_not_become_uv_git_sources() {
+        let workspace = TempWorkspace::new();
+        let mut doc = metadata();
+        doc.workspace.repositories.push(RepoInfo {
+            name: "vangu-kit".to_string(),
+            path: "projects/vangu-kit".to_string(),
+            remote: Some("https://github.com/example/vangu-kit.git".to_string()),
+            package: Some("@juntai/vangu-kit".to_string()),
+            ecosystem: Some(metadata::ECOSYSTEM_NODE.to_string()),
+        });
+
+        reconcile_workspace_config(&workspace.0, &doc).unwrap();
+        let root = root_doc(&workspace.0);
+        assert!(root["tool"]["uv"]["sources"]
+            .as_table()
+            .unwrap()
+            .contains_key("package-a"));
+        assert!(!root["tool"]["uv"]["sources"]
+            .as_table()
+            .unwrap()
+            .contains_key("@juntai/vangu-kit"));
+        let _ = std::fs::remove_dir_all(&workspace.0);
+    }
+
+    #[test]
+    fn legacy_jumbo_tom_without_ecosystem_still_parses() {
+        let workspace = TempWorkspace::new();
+        std::fs::write(
+            workspace.0.join("jumbo.toml"),
+            "[workspace]\nname = \"Old\"\n\n[[workspace.repositories]]\nname = \"a\"\npath = \"projects/a\"\nremote = \"https://github.com/example/a.git\"\npackage = \"a\"\n",
+        )
+        .unwrap();
+
+        let loaded = JumboToml::load(&workspace.0).unwrap();
+        let repo = &loaded.workspace.repositories[0];
+        assert_eq!(repo.package.as_deref(), Some("a"));
+        assert_eq!(repo.ecosystem, None);
+        assert!(repo.is_python_package());
+        let _ = std::fs::remove_dir_all(&workspace.0);
     }
 }

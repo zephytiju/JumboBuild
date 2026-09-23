@@ -1,3 +1,4 @@
+pub mod node;
 pub mod python;
 
 use anyhow::Result;
@@ -36,8 +37,13 @@ pub trait LanguageSupport: Send + Sync {
 
 /// Build the language support registry.
 /// To add a new language, add it here.
+///
+/// Detection order matters: the first backend whose `detect()` matches wins,
+/// so a repository carrying both a `pyproject.toml` and a `package.json`
+/// builds as Python (existing Python projects may add a package.json for
+/// tooling) and pure Node/TypeScript repositories build as Node.
 pub fn get_registry() -> Vec<Box<dyn LanguageSupport>> {
-    vec![Box::new(python::PythonSupport)]
+    vec![Box::new(python::PythonSupport), Box::new(node::NodeSupport)]
 }
 
 /// Detect the language of a repository by trying all registered language supports.

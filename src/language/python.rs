@@ -48,8 +48,15 @@ impl LanguageSupport for PythonSupport {
                     .and_then(|project| project.get("name"))
                     .and_then(|name| name.as_str())
                     .map(str::to_owned)
-            } else {
+            } else if repo.is_python_package() {
+                // Absent Python repositories keep their recorded
+                // distribution name as the git-source fallback. Repositories
+                // recorded for another ecosystem (node) never enter the uv
+                // workspace: they stay excluded when present and ignored
+                // when absent.
                 repo.package.clone()
+            } else {
+                None
             };
 
             if let Some(package_name) = package_name {
@@ -98,22 +105,12 @@ impl LanguageSupport for PythonSupport {
         let mut ws_table = toml::Table::new();
         ws_table.insert(
             "members".to_string(),
-            toml::Value::Array(
-                member_paths
-                    .into_iter()
-                    .map(toml::Value::String)
-                    .collect(),
-            ),
+            toml::Value::Array(member_paths.into_iter().map(toml::Value::String).collect()),
         );
         if !exclude_paths.is_empty() {
             ws_table.insert(
                 "exclude".to_string(),
-                toml::Value::Array(
-                    exclude_paths
-                        .into_iter()
-                        .map(toml::Value::String)
-                        .collect(),
-                ),
+                toml::Value::Array(exclude_paths.into_iter().map(toml::Value::String).collect()),
             );
         }
         uv_table.insert("workspace".to_string(), toml::Value::Table(ws_table));
@@ -121,7 +118,9 @@ impl LanguageSupport for PythonSupport {
         let jumbo = tool_table
             .entry("jumbo")
             .or_insert_with(|| toml::Value::Table(toml::Table::new()));
-        let jumbo_table = jumbo.as_table_mut().context("[tool.jumbo] is not a table")?;
+        let jumbo_table = jumbo
+            .as_table_mut()
+            .context("[tool.jumbo] is not a table")?;
         jumbo_table.insert(
             "workspace_sources".to_string(),
             toml::Value::Array(
@@ -134,8 +133,8 @@ impl LanguageSupport for PythonSupport {
         );
 
         // Write back
-        let new_content = toml::to_string_pretty(&doc)
-            .context("Failed to serialize pyproject.toml")?;
+        let new_content =
+            toml::to_string_pretty(&doc).context("Failed to serialize pyproject.toml")?;
         std::fs::write(&workspace_toml_path, new_content)?;
 
         Ok(())
@@ -152,10 +151,7 @@ impl LanguageSupport for PythonSupport {
         )?;
         run_steps(&[ACTIVATE_WORKSPACE_ENVIRONMENT], workspace_root)?;
         // uv build runs in the repo directory
-        run_steps(
-            &[("uv build", "Running python build")],
-            repo_path,
-        )
+        run_steps(&[("uv build", "Running python build")], repo_path)
     }
 
     fn test(&self, workspace_root: &Path, repo_path: &Path) -> Result<()> {
@@ -215,7 +211,15 @@ impl LanguageSupport for PythonSupport {
     }
 
     fn clean(&self, repo_path: &Path) -> Result<()> {
-        let dir_patterns = &["__pycache__", ".pytest_cache", "dist", "build", "htmlcov", ".mypy_cache", ".ruff_cache"];
+        let dir_patterns = &[
+            "__pycache__",
+            ".pytest_cache",
+            "dist",
+            "build",
+            "htmlcov",
+            ".mypy_cache",
+            ".ruff_cache",
+        ];
         let file_patterns = &[".coverage"];
         let glob_suffixes = &[".egg-info"];
 
@@ -226,24 +230,29 @@ impl LanguageSupport for PythonSupport {
             let name = entry.file_name().to_string_lossy();
 
             if entry.file_type().is_dir() {
-                if dir_patterns.contains(&name.as_ref()) || glob_suffixes.iter().any(|s| name.ends_with(s)) {
-                    if std::fs::remove_dir_all(entry.path()).is_ok() {
-                        println!("    {} Removed {}", "-".dimmed(), entry.path().display());
-                        cleaned += 1;
-                    }
+                if (dir_patterns.contains(&name.as_ref())
+                    || glob_suffixes.iter().any(|s| name.ends_with(s)))
+                    && std::fs::remove_dir_all(entry.path()).is_ok()
+                {
+                    println!("    {} Removed {}", "-".dimmed(), entry.path().display());
+                    cleaned += 1;
                 }
-            } else if entry.file_type().is_file() {
-                if file_patterns.contains(&name.as_ref()) {
-                    if std::fs::remove_file(entry.path()).is_ok() {
-                        println!("    {} Removed {}", "-".dimmed(), entry.path().display());
-                        cleaned += 1;
-                    }
-                }
+            } else if entry.file_type().is_file()
+                && file_patterns.contains(&name.as_ref())
+                && std::fs::remove_file(entry.path()).is_ok()
+            {
+                println!("    {} Removed {}", "-".dimmed(), entry.path().display());
+                cleaned += 1;
             }
         }
 
         if cleaned > 0 {
-            println!("  {} Cleaned {} Python artifact(s) in {}", "✓".green(), cleaned, repo_path.display());
+            println!(
+                "  {} Cleaned {} Python artifact(s) in {}",
+                "✓".green(),
+                cleaned,
+                repo_path.display()
+            );
         }
         Ok(())
     }

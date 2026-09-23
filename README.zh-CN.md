@@ -8,11 +8,11 @@ Jumbo Build 是 Juntai 统一的项目构建与多仓库工作空间管理命令
 
 - **统一的项目工作流：** 在所有受支持的语言中使用同一组命令。
 - **多仓库工作空间：** 在一个工作空间内克隆、导入、移除、同步和监听多个仓库。
-- **本地依赖连接：** 将已检出的 Python 包作为 uv workspace 成员连接；本地缺失时可回退到已记录的 Git 远程地址。
+- **本地依赖连接：** 将已检出的 Python 包作为 uv workspace 成员连接，本地缺失时可回退到已记录的 Git 远程地址；Node 项目同样以 npm 包身份注册在其中。
 - **原生 CLI：** 为 macOS 和 Linux 提供单个 Rust 二进制文件。
 - **可扩展的语言支持：** 实现并注册 `LanguageSupport` 即可接入新的生态系统。
 
-Jumbo Build 目前支持通过 `pyproject.toml` 识别的 Python 项目。
+Jumbo Build 目前支持通过 `pyproject.toml` 识别的 Python 项目，以及通过 `package.json` 识别的 Node.js / TypeScript 项目。
 
 ## 前置条件
 
@@ -20,6 +20,7 @@ Jumbo Build 目前支持通过 `pyproject.toml` 识别的 Python 项目。
 - Git
 - Rust stable 与 Cargo（安装脚本会从源码构建 Jumbo Build）
 - Python 项目需要 [uv](https://docs.astral.sh/uv/)；pytest、Ruff 等项目工具应声明在项目的依赖组中
+- Node 项目需要 PATH 中的 Node.js ≥ 18 与 npm ≥ 9（lockfileVersion 2/3 的硬性下限是 npm ≥ 7）
 
 ## 安装
 
@@ -65,13 +66,13 @@ jumbo clean    # 清理当前项目的生成文件
 
 ### 项目命令
 
-| 命令 | Python 流程 |
-| --- | --- |
-| `jumbo` 或 `jumbo build` | `uv lock --upgrade` → `uv sync` → `uv build` |
-| `jumbo test` | 构建流程 → `uv run pytest -v` |
-| `jumbo format` | 构建流程 → `ruff format .` → `ruff check --fix .` |
-| `jumbo release` | 构建流程 → `uv run pytest -v` → `ruff check .` |
-| `jumbo clean` | 删除当前项目的缓存、覆盖率结果和构建产物 |
+| 命令 | Python 流程 | Node 流程 |
+| --- | --- | --- |
+| `jumbo` 或 `jumbo build` | `uv lock --upgrade` → `uv sync` → `uv build` | `npm install --package-lock-only --ignore-scripts` → `npm ci` → `npm run build`（配置了 `build` 脚本时） |
+| `jumbo test` | 构建流程 → `uv run pytest -v` | 构建流程 → `npm test`（已配置时；npm 生成的 "no test specified" 占位脚本视为未配置）或 `node --test`（存在 Node 测试文件时） |
+| `jumbo format` | 构建流程 → `ruff format .` → `ruff check --fix .` | 构建流程 → `npm run format`（已配置时）或 `npx --no-install prettier --write .`（已配置 Prettier 时） |
+| `jumbo release` | 构建流程 → `uv run pytest -v` → `ruff check .` | 构建流程 → 测试步骤 → `npm run format:check`（已配置时）或 `npx --no-install prettier --check .` |
+| `jumbo clean` | 删除当前项目的缓存、覆盖率结果和构建产物 | 删除 `node_modules/`、构建输出（`dist`、`build`、`out`）、覆盖率结果、`.eslintcache` 和 `*.tsbuildinfo` |
 
 显式形式 `jumbo build test`、`jumbo build format`、`jumbo build release` 和 `jumbo build clean` 与对应的顶层快捷命令等价。
 
@@ -104,6 +105,23 @@ jumbo clean    # 清理当前项目的生成文件
 - Jumbo 只管理 `[tool.jumbo.workspace_sources]` 中列出的来源条目，因此会保留其它根目录配置。
 
 `jumbo.toml` 记录工作空间成员、仓库路径、远程地址、包名与 IDE 设置。应将它视为工作空间元数据，并与工作空间配置一同提交。
+
+## Node.js 项目行为
+
+Node.js / TypeScript 项目通过 `package.json` 识别。当仓库同时包含 `pyproject.toml` 和 `package.json` 时按 Python 项目构建 —— 注册表优先检查 Python，使既有 Python 项目可以为工具链添加 `package.json` 而不改变识别结果。
+
+各步骤依据项目自身配置选择：
+
+- **锁文件与安装：** 每条流程先用 `npm install --package-lock-only --ignore-scripts` 刷新 `package-lock.json`（与指纹引擎 `jumbo lock` 的命令完全一致，因此工作空间构建与锁生成产出同一份文件），再用 `npm ci` 安装。仅解析的步骤绝不执行生命周期脚本；`npm ci` 是真实安装，会正常执行脚本。由于安装总是紧跟一次全新的锁步骤，流程对生成锁的 npm 版本不敏感（npm ≥ 7 生成 lockfileVersion 2/3；旧版 v1 锁会在同一步骤中被重新解析并升级）。
+- **构建：** 配置了 `build` 脚本时运行它；没有构建脚本的包执行仅安装的构建。
+- **测试：** 配置了真实 `test` 脚本时运行 `npm test`；否则当项目包含 Node 测试文件（`*.test.js` 等）时运行 `node --test`；否则跳过该步骤并给出提示。
+- **格式化：** 配置了 `format` / `format:check` 脚本时运行它们；否则在检测到 Prettier 配置（`prettier` 依赖、package.json 中的 `prettier` 键或 Prettier 配置文件）时直接运行 Prettier。`npx --no-install` 只使用本地已安装的二进制，不会下载任何内容。
+- **Engines：** 任何步骤运行前都会校验 `engines.node` —— 不满足的范围会立即失败并给出两个版本号；无法静态求值的范围交给 npm 自行检查。
+- **Release：** `jumbo release` 是严格变体：构建流程 → 测试 → 严格格式检查。它不会发布；产物发布由发布契约中的执行器负责。
+
+npm 是受支持的包管理器；选择其它工具的 `packageManager` 字段暂不支持。内部依赖使用 `@juntai/*` 作用域（兼容旧版 `@zephytiju/*`），由 `jumbo lock` 与 materializer 以 `file:deps/<slug>` 坐标注入 —— 工作空间流程本身只运行普通工具链。
+
+Node 仓库在 `jumbo.toml` 中以 npm 包身份注册（`package = "@juntai/kit"`、`ecosystem = "node"`），并被排除在 uv workspace 之外，因此 Python + Node 混合工作空间无需改动即可使用：不会生成根级 npm workspace，因为 npm workspace 会把 `node_modules` 集中到根目录，改变 jumbo file 协议注入模型所依赖的单项目安装语义。
 
 ## 依赖解析（Jumbo 索引）
 

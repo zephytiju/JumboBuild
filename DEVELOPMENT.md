@@ -12,6 +12,7 @@ This guide is for contributors changing Jumbo Build itself. It explains the deve
 - Git
 - macOS or Linux
 - uv and a small Python fixture project when exercising the Python backend end to end
+- Node.js ≥ 18 and npm ≥ 9 when exercising the Node backend end to end (the offline CLI fixtures carry zero third-party dependencies)
 
 ### Build and verify
 
@@ -73,7 +74,8 @@ src/
 │   └── vscode.rs           # VS Code workspace generation
 ├── language/
 │   ├── mod.rs              # LanguageSupport contract, registry, and detection
-│   └── python.rs           # uv, pytest, Ruff, and Python cleanup behavior
+│   ├── python.rs           # uv, pytest, Ruff, and Python cleanup behavior
+│   └── node.rs             # npm, Node test runner, Prettier, and Node cleanup behavior
 └── utils/
     └── runner.rs           # Child-process execution and build result reporting
 ```
@@ -130,6 +132,10 @@ git_repo_scan_max_depth = 2
 ### Managed Python configuration
 
 The Python backend updates uv workspace membership and sources in one pass for all registered repositories. It records the package names it owns in `[tool.jumbo.workspace_sources]`, removes only previously managed source entries, and preserves everything else. Changes to this logic must remain idempotent: running `jumbo workspace sync` twice without filesystem changes should not change the generated files the second time.
+
+### Managed Node configuration
+
+Node projects need no workspace-root configuration: internal dependencies resolve through the Jumbo index (`jumbo lock` injects `file:deps/<slug>` sources; the materializer ingests release assets the same way), so `NodeSupport::sync_workspace` is a deliberate no-op and no root npm workspace is generated. `jumbo.toml` records each Node repository's npm package identity (`package` plus `ecosystem = "node"`); the Python backend's git-source fallback is gated on the recorded ecosystem so npm names never enter the uv workspace, while legacy metadata without the field stays Python by construction.
 
 ### Resolver core contract
 
@@ -246,4 +252,5 @@ For CLI changes, also inspect generated help and verify both the shortcut and ex
 | IDE integration | `src/workspace/vscode.rs` | Generate VS Code workspace settings |
 | Language contract | `src/language/mod.rs` | Backend interface, registry, and detection order |
 | Python backend | `src/language/python.rs` | uv configuration and Python project tool pipelines |
+| Node backend | `src/language/node.rs` | npm pipelines, engines enforcement, Prettier selection, Node cleanup |
 | Process runner | `src/utils/runner.rs` | Execute sequential shell steps and finalize builds |
