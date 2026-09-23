@@ -148,11 +148,23 @@ fn normalize_local_path(raw: &str, origin: &str) -> Result<Option<String>, Finge
 
 /// Classify a local (non-registry) source path.
 ///
-/// A path whose parent directory component is `deps` is a jumbo-injected
-/// index source and is rewritten to the stable coordinate `deps/<basename>`
-/// — even when the tool wrote it relative to a workspace root. Anything
-/// else is a plain local path entry.
+/// A jumbo-injected index coordinate is `deps/<slug>` — including an
+/// artifact file the materializer ingested under it
+/// (`deps/<slug>/<file>.whl`, `deps/<slug>/<file>.tgz`). Both forms are
+/// the same index coordinate: the synthetic source overlay and the
+/// recorded artifact of the same internal package, so the extract (and
+/// therefore the fingerprint) is identical however the dependency
+/// materialized. A path whose parent directory component is `deps` (the
+/// tool wrote it relative to a workspace root) is rewritten to the stable
+/// coordinate `deps/<basename>` the same way. Anything else is a plain
+/// local path entry.
 fn classify_local_path(p: &str) -> (EntrySource, String) {
+    let mut segments = p.split('/');
+    if segments.next() == Some("deps") {
+        if let Some(slug) = segments.next().filter(|s| !s.is_empty()) {
+            return (EntrySource::Index, format!("deps/{slug}"));
+        }
+    }
     let mut parts = p.split('/');
     let _ = parts.next_back();
     let parent = parts.next_back();
@@ -896,6 +908,50 @@ source = { path = "/Users/someone/deps/local-pinned" }
             compute_fingerprint("ABCDEF0123456789abcdef0123456789abcdef012", &extract).is_err()
         );
         assert!(compute_fingerprint("short", &extract).is_err());
+    }
+
+    #[test]
+    fn materialized_artifacts_keep_the_index_coordinate() {
+        // The materializer ingests a recorded artifact at
+        // `deps/<slug>/<file>`; the extract must classify it exactly like
+        // the source overlay at `deps/<slug>`, or reuse would change the
+        // fingerprint of identical inputs.
+        let source_overlay = r#"
+[[package]]
+name = "demo-alpha"
+version = "2.4.0"
+source = { directory = "deps/demo-alpha" }
+"#;
+        let artifact = r#"
+[[package]]
+name = "demo-alpha"
+version = "2.4.0"
+source = { path = "deps/demo-alpha/demo_alpha-2.4.0-py3-none-any.whl" }
+"#;
+        let a = extract_uv_lock(source_overlay).expect("source overlay extract");
+        let b = extract_uv_lock(artifact).expect("artifact extract");
+        assert_eq!(a, b);
+        assert_eq!(a.canonical_json(), b.canonical_json());
+
+        let npm_source = r#"{
+  "lockfileVersion": 3,
+  "packages": {
+    "deps/juntai-demo-kit": { "name": "@juntai/demo-kit", "version": "1.2.0" }
+  }
+}"#;
+        let npm_artifact = r#"{
+  "lockfileVersion": 3,
+  "packages": {
+    "node_modules/@juntai/demo-kit": {
+      "version": "1.2.0",
+      "resolved": "deps/juntai-demo-kit/juntai-demo-kit-1.2.0.tgz"
+    }
+  }
+}"#;
+        let x = extract_npm_lock(npm_source).expect("npm source extract");
+        let y = extract_npm_lock(npm_artifact).expect("npm artifact extract");
+        assert_eq!(x, y);
+        assert_eq!(x.canonical_json(), y.canonical_json());
     }
 
     #[test]
