@@ -13,9 +13,33 @@ use crate::workspace::metadata::{JumboToml, RepoInfo};
 pub struct BuildArgs {
     #[command(subcommand)]
     pub action: Option<BuildAction>,
+
+    /// Reproduce the pinned build this buildId refers to instead of
+    /// building the current project: resolve the record, verify the
+    /// recomputed fingerprint against the recorded one, and materialize
+    /// the recorded closure and artifact (sha256-enforced). The
+    /// reproduction flags below apply only with --pinned
+    #[arg(long, value_name = "BUILD_ID")]
+    pub pinned: Option<String>,
+
+    /// Jumbo index location for --pinned: a local clone path or an
+    /// https://github.com URL
+    /// (default: JUMBO_INDEX_PATH, then JUMBO_INDEX_URL, then the JumboIndex repository)
+    #[arg(short, long, value_name = "PATH_OR_URL")]
+    pub index: Option<String>,
+
+    /// With --pinned: resolve artifacts by exact file name from a local
+    /// directory instead of downloading; the recorded SHA-256 is still
+    /// enforced (default: JUMBO_ARTIFACT_DIR when set, otherwise download)
+    #[arg(long, value_name = "DIR")]
+    pub artifact_dir: Option<PathBuf>,
+
+    /// With --pinned: where the reproduction outputs land (default: ./reproduced)
+    #[arg(long, value_name = "DIR")]
+    pub out: Option<PathBuf>,
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Clone)]
 pub enum BuildAction {
     /// Run tests
     Test,
@@ -56,9 +80,24 @@ fn detect_current_repo(workspace_root: &Path, metadata: &JumboToml) -> Result<Re
 
 /// Execute the build command (default or with a specific action).
 ///
-/// Detects the current project from the working directory and runs only
-/// against that single repository.
-pub fn execute(action: Option<BuildAction>) -> Result<()> {
+/// With `--pinned <BUILD_ID>` the command reproduces that build from its
+/// index record (the `jumbo reproduce` path — no workspace required) and
+/// returns; otherwise it detects the current project from the working
+/// directory and runs only against that single repository.
+pub fn execute(args: &BuildArgs) -> Result<()> {
+    if let Some(build_id) = &args.pinned {
+        return super::reproduce::execute(super::reproduce::ReproduceArgs {
+            build_id: build_id.clone(),
+            package: None,
+            index: args.index.clone(),
+            artifact_dir: args.artifact_dir.clone(),
+            out: args.out.clone(),
+        });
+    }
+    if args.index.is_some() || args.artifact_dir.is_some() || args.out.is_some() {
+        bail!("--index, --artifact-dir, and --out apply only to `jumbo build --pinned <BUILD_ID>`");
+    }
+    let action = args.action.clone();
     let workspace_root = ensure_in_workspace()?;
     let metadata = JumboToml::load(&workspace_root)?;
     let registry = get_registry();
@@ -98,20 +137,44 @@ pub fn execute(action: Option<BuildAction>) -> Result<()> {
 
 /// Execute test command (shortcut for build test).
 pub fn execute_test() -> Result<()> {
-    execute(Some(BuildAction::Test))
+    execute(&BuildArgs {
+        action: Some(BuildAction::Test),
+        pinned: None,
+        index: None,
+        artifact_dir: None,
+        out: None,
+    })
 }
 
 /// Execute format command (shortcut for build format).
 pub fn execute_format() -> Result<()> {
-    execute(Some(BuildAction::Format))
+    execute(&BuildArgs {
+        action: Some(BuildAction::Format),
+        pinned: None,
+        index: None,
+        artifact_dir: None,
+        out: None,
+    })
 }
 
 /// Execute release command (shortcut for build release).
 pub fn execute_release() -> Result<()> {
-    execute(Some(BuildAction::Release))
+    execute(&BuildArgs {
+        action: Some(BuildAction::Release),
+        pinned: None,
+        index: None,
+        artifact_dir: None,
+        out: None,
+    })
 }
 
 /// Execute clean command (shortcut for build clean).
 pub fn execute_clean() -> Result<()> {
-    execute(Some(BuildAction::Clean))
+    execute(&BuildArgs {
+        action: Some(BuildAction::Clean),
+        pinned: None,
+        index: None,
+        artifact_dir: None,
+        out: None,
+    })
 }

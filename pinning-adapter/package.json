@@ -1,0 +1,21 @@
+{
+  "name": "@juntai/jumbo-pinning-adapter",
+  "version": "1.0.0",
+  "description": "Reference adapter mapping jumbo deployment-pin manifests to the vangu Selection and PackageLock fields (Jumbo Build & Versioning Standard, §3.6)",
+  "type": "module",
+  "private": true,
+  "sideEffects": false,
+  "license": "UNLICENSED",
+  "engines": {
+    "node": ">=24 <26"
+  },
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "default": "./src/index.ts"
+    }
+  },
+  "scripts": {
+    "test": "node --test"
+  }
+}

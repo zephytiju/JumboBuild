@@ -15,7 +15,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Some(Commands::Build(args)) => build::execute(args.action)?,
+        Some(Commands::Build(args)) => build::execute(&args)?,
         Some(Commands::Test) => build::execute_test()?,
         Some(Commands::Format) => build::execute_format()?,
         Some(Commands::Release) => build::execute_release()?,
@@ -26,13 +26,21 @@ fn main() -> Result<()> {
         Some(Commands::Fingerprint(args)) => cli::fingerprint::execute(args)?,
         Some(Commands::Dedup(args)) => cli::dedup::execute(args)?,
         Some(Commands::Promote(args)) => cli::promote::execute(args)?,
+        Some(Commands::Pin(args)) => cli::pin::execute(args)?,
+        Some(Commands::Reproduce(args)) => cli::reproduce::execute(args)?,
         Some(Commands::Completions(args)) => {
             let mut cmd = Cli::command();
             generate(args.shell, &mut cmd, "jumbo", &mut std::io::stdout());
         }
         None => {
-            // Default: run build
-            build::execute(None)?;
+            // Default: run build (an unpinned build of the current project)
+            build::execute(&cli::build::BuildArgs {
+                action: None,
+                pinned: None,
+                index: None,
+                artifact_dir: None,
+                out: None,
+            })?;
         }
     }
 

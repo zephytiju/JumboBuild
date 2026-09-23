@@ -29,6 +29,8 @@ This document contains the help content for the `jumbo` command-line program.
 * [`jumbo fingerprint`↴](#jumbo-fingerprint)
 * [`jumbo dedup`↴](#jumbo-dedup)
 * [`jumbo promote`↴](#jumbo-promote)
+* [`jumbo pin`↴](#jumbo-pin)
+* [`jumbo reproduce`↴](#jumbo-reproduce)
 * [`jumbo completions`↴](#jumbo-completions)
 
 ## `jumbo`
@@ -50,6 +52,8 @@ Juntai internal unified build tool
 * `fingerprint` — Compute sha256(own commit + canonical extract) of the generated lock
 * `dedup` — Decide build-or-reuse against the index by fingerprint; optionally materialize recorded artifacts (pull, verify, ingest)
 * `promote` — Compute the auto-promotion version bump decision (publish-on-bump contract for executors)
+* `pin` — Emit a deployment pin manifest for one promoted build (by buildId, commit, or latest of major)
+* `reproduce` — Reproduce the pinned build a buildId refers to (alias: jumbo build --pinned <BUILD_ID>)
 * `completions` — Generate shell completion scripts
 
 
@@ -58,7 +62,7 @@ Juntai internal unified build tool
 
 Run the build pipeline (default when no subcommand is given)
 
-**Usage:** `jumbo build [COMMAND]`
+**Usage:** `jumbo build [OPTIONS] [COMMAND]`
 
 ###### **Subcommands:**
 
@@ -66,6 +70,13 @@ Run the build pipeline (default when no subcommand is given)
 * `format` — Run formatting
 * `release` — Run release pipeline
 * `clean` — Clean build artifacts for the current project
+
+###### **Options:**
+
+* `--pinned <BUILD_ID>` — Reproduce the pinned build this buildId refers to instead of building the current project: resolve the record, verify the recomputed fingerprint against the recorded one, and materialize the recorded closure and artifact (sha256-enforced). The reproduction flags below apply only with --pinned
+* `-i`, `--index <PATH_OR_URL>` — Jumbo index location for --pinned: a local clone path or an https://github.com URL (default: JUMBO_INDEX_PATH, then JUMBO_INDEX_URL, then the JumboIndex repository)
+* `--artifact-dir <DIR>` — With --pinned: resolve artifacts by exact file name from a local directory instead of downloading; the recorded SHA-256 is still enforced (default: JUMBO_ARTIFACT_DIR when set, otherwise download)
+* `--out <DIR>` — With --pinned: where the reproduction outputs land (default: ./reproduced)
 
 
 
@@ -314,6 +325,46 @@ Compute the auto-promotion version bump decision (publish-on-bump contract for e
 * `-p`, `--package <NAME>` — Package name whose index history decides (default: the manifest's own name)
 * `-i`, `--index <PATH_OR_URL>` — Jumbo index location: a local clone path or an https://github.com URL (default: JUMBO_INDEX_PATH, then JUMBO_INDEX_URL, then the JumboIndex repository)
 * `-r`, `--refresh <POLICY>` — Third-party refresh policy gating the lock tool's --upgrade step: run (default) or schedule:<interval|cron> (e.g. 24h, 7d, 0 3 * * *) (default: JUMBO_REFRESH, then run)
+
+
+
+## `jumbo pin`
+
+Emit a deployment pin manifest for one promoted build (by buildId, commit, or latest of major)
+
+**Usage:** `jumbo pin [OPTIONS] <--by-build-id <BUILD_ID>|--by-commit <SHA>|--latest-of-major <MAJOR>> <PACKAGE>`
+
+###### **Arguments:**
+
+* `<PACKAGE>` — Package to pin (language-native name, e.g. juntai-fuse-api or @juntai/demo-kit)
+
+###### **Options:**
+
+* `--by-build-id <BUILD_ID>` — Pin the record with this buildId (recorded, or the documented bootstrap derivation)
+* `--by-commit <SHA>` — Pin the newest record promoted from this commit (full 40-hex SHA)
+* `--latest-of-major <MAJOR>` — Pin the newest record of the major — what dependency resolution resolves
+* `-i`, `--index <PATH_OR_URL>` — Jumbo index location: a local clone path or an https://github.com URL (default: JUMBO_INDEX_PATH, then JUMBO_INDEX_URL, then the JumboIndex repository)
+* `--image-name <NAME>` — Image name for `imageRef` (overrides the ghcr.io/<owner>/<repo> derivation from the record's artifact URL; the index records the digest, the deployment owns the reference name)
+* `--require-image` — Fail when the record published no imageDigest (the deployment pins a service image)
+
+
+
+## `jumbo reproduce`
+
+Reproduce the pinned build a buildId refers to (alias: jumbo build --pinned <BUILD_ID>)
+
+**Usage:** `jumbo reproduce [OPTIONS] <BUILD_ID>`
+
+###### **Arguments:**
+
+* `<BUILD_ID>` — The buildId to reproduce (recorded, or the documented bootstrap derivation)
+
+###### **Options:**
+
+* `-p`, `--package <NAME>` — Constrain the buildId search to one package (default: the whole index)
+* `-i`, `--index <PATH_OR_URL>` — Jumbo index location: a local clone path or an https://github.com URL (default: JUMBO_INDEX_PATH, then JUMBO_INDEX_URL, then the JumboIndex repository)
+* `--artifact-dir <DIR>` — Resolve artifacts by exact file name from a local directory (a CI asset cache or offline fixture directory) instead of downloading; the recorded SHA-256 is still enforced (default: JUMBO_ARTIFACT_DIR when set, otherwise download)
+* `--out <DIR>` — Where the reproduction outputs land (default: ./reproduced)
 
 
 
