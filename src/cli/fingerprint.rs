@@ -55,11 +55,10 @@ pub fn execute(args: FingerprintArgs) -> Result<()> {
                 anyhow::anyhow!(e).context(format!("index source: {}", source.describe()))
             })?;
             let (_generation, report) =
-                fingerprint::fingerprint_manifest(&manifest, &index, args.promote, true).map_err(
-                    |e| {
+                fingerprint::fingerprint_manifest(&manifest, &index, args.promote, true, true)
+                    .map_err(|e| {
                         anyhow::anyhow!(e).context(format!("fingerprinting {}", manifest.display()))
-                    },
-                )?;
+                    })?;
             report
         }
     };

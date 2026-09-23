@@ -28,6 +28,7 @@ This document contains the help content for the `jumbo` command-line program.
 * [`jumbo lock`↴](#jumbo-lock)
 * [`jumbo fingerprint`↴](#jumbo-fingerprint)
 * [`jumbo dedup`↴](#jumbo-dedup)
+* [`jumbo promote`↴](#jumbo-promote)
 * [`jumbo completions`↴](#jumbo-completions)
 
 ## `jumbo`
@@ -48,6 +49,7 @@ Juntai internal unified build tool
 * `lock` — Generate the language lock with jumbo-injected internal sources
 * `fingerprint` — Compute sha256(own commit + canonical extract) of the generated lock
 * `dedup` — Decide build-or-reuse against the index by fingerprint; optionally materialize recorded artifacts (pull, verify, ingest)
+* `promote` — Compute the auto-promotion version bump decision (publish-on-bump contract for executors)
 * `completions` — Generate shell completion scripts
 
 
@@ -261,6 +263,7 @@ Generate the language lock with jumbo-injected internal sources
 * `-m`, `--manifest <PATH>` — Manifest to lock (pyproject.toml or package.json); default: pyproject.toml or package.json in the current directory
 * `-i`, `--index <PATH_OR_URL>` — Jumbo index location: a local clone path or an https://github.com URL (default: JUMBO_INDEX_PATH, then JUMBO_INDEX_URL, then the JumboIndex repository)
 * `--inject-only` — Materialize the injected sources and rewrite the manifest without running the language lock tool (uv/npm)
+* `-r`, `--refresh <POLICY>` — Third-party refresh policy gating the lock tool's --upgrade step: run re-resolves declared ranges every invocation (default); schedule:<interval> (e.g. 24h, 30m, 7d, 2w) re-resolves only when the cadence has elapsed since the package's newest index record, keeping the current resolution in between (extract unchanged, no patch churn); schedule:<cron> is recorded verbatim — the cadence is honored by the executor's pipeline schedule (default: JUMBO_REFRESH, then run)
 
 
 
@@ -295,6 +298,22 @@ Decide build-or-reuse against the index by fingerprint; optionally materialize r
 * `--deps` — Materialize the recorded artifacts of the manifest's internal dependencies, replacing their source overlays (manifest: --manifest or pyproject.toml/package.json in the current directory)
 * `--dist-dir <DIR>` — Build-output directory for a pulled own-record artifact (default: dist)
 * `--artifact-dir <DIR>` — Resolve artifacts by exact file name from a local directory (a CI asset cache or offline fixture directory) instead of downloading; the recorded SHA-256 is still enforced (default: JUMBO_ARTIFACT_DIR when set, otherwise download)
+
+
+
+## `jumbo promote`
+
+Compute the auto-promotion version bump decision (publish-on-bump contract for executors)
+
+**Usage:** `jumbo promote [OPTIONS]`
+
+###### **Options:**
+
+* `-m`, `--manifest <PATH>` — Manifest of the package about to promote (pyproject.toml or package.json); its own version declares the major. Default: the manifest in the current directory
+* `-l`, `--lock <PATH>` — Consume an existing lock file (uv.lock or package-lock.json) instead of the manifest's; the sibling manifest still provides the own name and declared major
+* `-p`, `--package <NAME>` — Package name whose index history decides (default: the manifest's own name)
+* `-i`, `--index <PATH_OR_URL>` — Jumbo index location: a local clone path or an https://github.com URL (default: JUMBO_INDEX_PATH, then JUMBO_INDEX_URL, then the JumboIndex repository)
+* `-r`, `--refresh <POLICY>` — Third-party refresh policy gating the lock tool's --upgrade step: run (default) or schedule:<interval|cron> (e.g. 24h, 7d, 0 3 * * *) (default: JUMBO_REFRESH, then run)
 
 
 

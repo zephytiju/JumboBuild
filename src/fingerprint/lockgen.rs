@@ -82,16 +82,26 @@ pub struct LockGeneration {
 }
 
 impl LockGeneration {
-    /// The command (and description) that generates the lock file.
-    pub fn lock_command(&self) -> (&'static str, &'static str) {
-        match self.ecosystem {
-            Ecosystem::Python => (
+    /// The lock command under the third-party refresh policy
+    /// (Jumbo Build & Versioning Standard, §2.3): `upgrade` re-resolves
+    /// declared ranges (`uv lock --upgrade`); `upgrade == false` keeps the
+    /// current resolution — `uv lock` without `--upgrade` reuses the
+    /// existing pins (npm's lock-only install already prefers existing
+    /// pins within the declared ranges whenever a lock exists, so its
+    /// command is unchanged).
+    pub fn lock_command_for(&self, upgrade: bool) -> (&'static str, &'static str) {
+        match (self.ecosystem, upgrade) {
+            (Ecosystem::Python, true) => (
                 "uv lock --upgrade",
                 "Generating uv.lock (third-party ranges re-resolved)",
             ),
-            Ecosystem::Npm => (
+            (Ecosystem::Python, false) => (
+                "uv lock",
+                "Generating uv.lock (third-party ranges reused per the refresh policy)",
+            ),
+            (Ecosystem::Npm, _) => (
                 "npm install --package-lock-only --ignore-scripts",
-                "Generating package-lock.json (third-party ranges re-resolved)",
+                "Generating package-lock.json (third-party ranges per the refresh policy)",
             ),
         }
     }
