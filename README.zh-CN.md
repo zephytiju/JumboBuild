@@ -185,6 +185,20 @@ jumbo fingerprint --manifest projects/consumer/pyproject.toml
 
 **发布守卫：**只有流水线内干净提交上的构建才允许发布（promote）；脏工作区的本地构建绝不发布。`jumbo fingerprint --promote`（以及后续所有发布模式的操作）在工作区无法归因于 HEAD 提交时直接拒绝。jumbo 生成的产物豁免：`deps/` 下的全部内容、生成的锁文件、以及与 HEAD 的差异仅为 jumbo 记录注入改写的清单。被修改的源码文件或多余未跟踪文件会拒绝发布，并列出违规路径。
 
+## 部署固定（Deployment pinning）
+
+每条已发布的索引记录就是部署所固定的构建记录。`jumbo pin` 解析一条记录 —— 按 `--by-build-id`、按 `--by-commit`（该提交的最新记录）或 `--latest-of-major` —— 并输出 `jumbo.deployment-pin/v1` 清单：`buildId`（记录值；导入记录的空 `buildId` 使用文档化的 `bootstrap-…` 确定性派生）、`commit`、`version`、记录发布了镜像摘要时的精确摘要固定 `imageRef`、产物 URL + SHA-256、指纹，以及记录在索引中的位置。带 `--require-image` 时，无 `imageDigest` 的记录会明确报错，而不是固定一个没有镜像的构建。
+
+`jumbo build --pinned <buildId>`（别名 `jumbo reproduce <buildId>`）从记录复现历史构建 —— 记录即锁：重新计算 `sha256(提交 + 标准提取)`，指纹不匹配则在写盘前中止；按闭包中记录的精确版本物化每个内部依赖（经 github.com 专用拉取层强制校验 SHA-256），并在输出目录产出记录的产物摘要。
+
+参考 TypeScript 适配器（`pinning-adapter/`，按路径引用、绝不发布到 npm）把清单映射到既有 vangu Selection 与 PackageLock 字段 —— `buildId` 进入 selection 契约，镜像串经与 IaC 完全相同的正则校验。权威字段映射与错误分类见 [docs/pinning.md](./docs/pinning.md)（英文）。
+
+```bash
+jumbo pin consumer --by-build-id consumer-2.4.0-001 --require-image
+jumbo pin consumer --by-commit 84d0c0ffee...        # 该提交的最新记录
+jumbo build --pinned consumer-2.4.0-001 --artifact-dir cache/
+```
+
 ## Shell 自动补全
 
 安装脚本会为 zsh、Bash 或 fish 配置动态补全。也可以手动生成静态补全脚本：
@@ -201,5 +215,6 @@ jumbo completions fish > jumbo.fish
 
 - [开发指南（英文）](./DEVELOPMENT.md)
 - [自动生成的 CLI 参考（英文）](./docs/cli-reference.md)
+- [部署固定契约（英文）](./docs/pinning.md)
 - 如需完整且与当前版本一致的命令细节，请运行 `jumbo --help` 或 `jumbo <command> --help`。
 - [许可证](./LICENSE)

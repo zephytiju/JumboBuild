@@ -2,7 +2,9 @@ pub mod build;
 pub mod dedup;
 pub mod fingerprint;
 pub mod lock;
+pub mod pin;
 pub mod promote;
+pub mod reproduce;
 pub mod resolve;
 pub mod workspace;
 
@@ -44,6 +46,12 @@ pub enum Commands {
     /// Compute the auto-promotion version bump decision (publish-on-bump
     /// contract for executors)
     Promote(promote::PromoteArgs),
+    /// Emit a deployment pin manifest for one promoted build (by buildId,
+    /// commit, or latest of major)
+    Pin(pin::PinArgs),
+    /// Reproduce the pinned build a buildId refers to (alias: jumbo build
+    /// --pinned <BUILD_ID>)
+    Reproduce(reproduce::ReproduceArgs),
     /// Generate shell completion scripts
     Completions(CompletionsArgs),
 }

@@ -185,6 +185,12 @@ impl Index {
         self.packages.get(&package_slug(name))
     }
 
+    /// Every package's records, in file-sorted package order. Callers that
+    /// know only a build key (pinned reproduction) search the whole index.
+    pub fn iter(&self) -> impl Iterator<Item = &PackageRecords> {
+        self.packages.values()
+    }
+
     /// Distinct majors recorded for a package, ascending.
     pub fn majors(&self, name: &str) -> Vec<u64> {
         let mut majors: Vec<u64> = self

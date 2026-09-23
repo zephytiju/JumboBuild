@@ -185,6 +185,20 @@ Entries are sorted by (name, version, source, digest, path) and deduplicated; `s
 
 **Promotion guard:** promotion happens only on clean commits inside a pipeline; local builds on dirty working trees never promote. `jumbo fingerprint --promote` (and any future promotion-mode operation) refuses unless the working tree is attributable to exactly the HEAD commit. Jumbo-generated output is exempt: everything under `deps/`, the generated lock files, and a manifest whose only difference from HEAD is jumbo's recorded injection rewrite. A modified source file or a stray untracked file refuses promotion with the offending paths listed.
 
+## Deployment pinning
+
+Every promoted index record is the build record a deployment pins. `jumbo pin` resolves one record — by `--by-build-id`, by `--by-commit` (the newest record of that commit), or as `--latest-of-major` — and emits a `jumbo.deployment-pin/v1` manifest: `buildId` (recorded, or the documented `bootstrap-…` derivation for imported records), `commit`, `version`, the exact digest-pinned `imageRef` when the record published an image digest, the artifact URL + SHA-256, the fingerprint, and the record's index location. Bootstrap records with a null `buildId` get a deterministic derived id; a record without an `imageDigest` fails loudly under `--require-image` instead of pinning an imageless build.
+
+`jumbo build --pinned <buildId>` (alias `jumbo reproduce <buildId>`) reproduces a past build from its record — the record is the lock: it recomputes `sha256(commit + canonical extract)`, aborts on any fingerprint mismatch before touching disk, materializes every internal dependency of the recorded closure at its exact recorded version (SHA-256 enforced through the github.com-only fetch layer), and produces the recorded artifact digest in the output directory.
+
+The reference TypeScript adapter (`pinning-adapter/`, consumed by path, never published) maps the manifest onto the existing vangu Selection and PackageLock fields — `buildId` into the selection contract, the exact image string validated by the same regex the IaC applies. See [docs/pinning.md](./docs/pinning.md) for the authoritative field mapping and error taxonomy.
+
+```bash
+jumbo pin consumer --by-build-id consumer-2.4.0-001 --require-image
+jumbo pin consumer --by-commit 84d0c0ffee...        # newest record of the commit
+jumbo build --pinned consumer-2.4.0-001 --artifact-dir cache/
+```
+
 ## Shell completion
 
 The installer configures dynamic completion for zsh, Bash, or fish. You can also generate a static completion script:
@@ -201,5 +215,6 @@ Install the generated file in the location expected by your shell. See `jumbo co
 
 - [Development guide](./DEVELOPMENT.md)
 - [Generated CLI reference](./docs/cli-reference.md)
+- [Deployment pinning contract](./docs/pinning.md)
 - For complete, version-matched command details, run `jumbo --help` or `jumbo <command> --help`.
 - [License](./LICENSE)
