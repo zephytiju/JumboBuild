@@ -22,6 +22,8 @@ fn main() -> Result<()> {
         Some(Commands::Clean) => build::execute_clean()?,
         Some(Commands::Workspace(args)) => cli::workspace::execute(args)?,
         Some(Commands::Resolve(args)) => cli::resolve::execute(args)?,
+        Some(Commands::Lock(args)) => cli::lock::execute(args)?,
+        Some(Commands::Fingerprint(args)) => cli::fingerprint::execute(args)?,
         Some(Commands::Completions(args)) => {
             let mut cmd = Cli::command();
             generate(args.shell, &mut cmd, "jumbo", &mut std::io::stdout());

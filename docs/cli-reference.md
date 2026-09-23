@@ -25,6 +25,8 @@ This document contains the help content for the `jumbo` command-line program.
 * [`jumbo workspace watch`↴](#jumbo-workspace-watch)
 * [`jumbo workspace clean`↴](#jumbo-workspace-clean)
 * [`jumbo resolve`↴](#jumbo-resolve)
+* [`jumbo lock`↴](#jumbo-lock)
+* [`jumbo fingerprint`↴](#jumbo-fingerprint)
 * [`jumbo completions`↴](#jumbo-completions)
 
 ## `jumbo`
@@ -42,6 +44,8 @@ Juntai internal unified build tool
 * `clean` — Clean build artifacts (= build clean)
 * `workspace` — Manage Jumbo workspace
 * `resolve` — Resolve internal dependencies by declared major against the Jumbo index
+* `lock` — Generate the language lock with jumbo-injected internal sources
+* `fingerprint` — Compute sha256(own commit + canonical extract) of the generated lock
 * `completions` — Generate shell completion scripts
 
 
@@ -241,6 +245,35 @@ Resolve internal dependencies by declared major against the Jumbo index
 * `-m`, `--manifest <PATH>` — Manifest to validate and resolve (pyproject.toml or package.json)
 * `-i`, `--index <PATH_OR_URL>` — Jumbo index location: a local clone path or an https://github.com URL (default: JUMBO_INDEX_PATH, then JUMBO_INDEX_URL, then the JumboIndex repository)
 * `--check` — Validate declaration forms only; do not look up index records
+
+
+
+## `jumbo lock`
+
+Generate the language lock with jumbo-injected internal sources
+
+**Usage:** `jumbo lock [OPTIONS]`
+
+###### **Options:**
+
+* `-m`, `--manifest <PATH>` — Manifest to lock (pyproject.toml or package.json); default: pyproject.toml or package.json in the current directory
+* `-i`, `--index <PATH_OR_URL>` — Jumbo index location: a local clone path or an https://github.com URL (default: JUMBO_INDEX_PATH, then JUMBO_INDEX_URL, then the JumboIndex repository)
+* `--inject-only` — Materialize the injected sources and rewrite the manifest without running the language lock tool (uv/npm)
+
+
+
+## `jumbo fingerprint`
+
+Compute sha256(own commit + canonical extract) of the generated lock
+
+**Usage:** `jumbo fingerprint [OPTIONS]`
+
+###### **Options:**
+
+* `-m`, `--manifest <PATH>` — Manifest whose lock is generated and fingerprinted (pyproject.toml or package.json); default: the manifest in the current directory
+* `-l`, `--lock <PATH>` — Fingerprint an existing lock file (uv.lock or package-lock.json) instead of generating one; a pure-local query that never promotes
+* `-i`, `--index <PATH_OR_URL>` — Jumbo index location: a local clone path or an https://github.com URL (default: JUMBO_INDEX_PATH, then JUMBO_INDEX_URL, then the JumboIndex repository)
+* `--promote` — Promotion mode: refuse on a dirty working tree (pipelines only; pure-local queries never promote)
 
 
 

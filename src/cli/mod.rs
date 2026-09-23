@@ -1,4 +1,6 @@
 pub mod build;
+pub mod fingerprint;
+pub mod lock;
 pub mod resolve;
 pub mod workspace;
 
@@ -30,6 +32,10 @@ pub enum Commands {
     Workspace(workspace::WorkspaceArgs),
     /// Resolve internal dependencies by declared major against the Jumbo index
     Resolve(resolve::ResolveArgs),
+    /// Generate the language lock with jumbo-injected internal sources
+    Lock(lock::LockArgs),
+    /// Compute sha256(own commit + canonical extract) of the generated lock
+    Fingerprint(fingerprint::FingerprintArgs),
     /// Generate shell completion scripts
     Completions(CompletionsArgs),
 }

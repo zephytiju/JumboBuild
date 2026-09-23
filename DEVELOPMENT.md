@@ -51,6 +51,8 @@ src/
 │   ├── mod.rs              # clap command and argument model
 │   ├── build.rs            # Current-project build command dispatch
 │   ├── resolve.rs          # Dependency-resolution command dispatch
+│   ├── lock.rs             # Lock-generation command dispatch
+│   ├── fingerprint.rs      # Fingerprint command dispatch
 │   └── workspace.rs        # Workspace subcommand dispatch
 ├── resolver/
 │   ├── mod.rs              # Resolution orchestration: internal/external split, reports
@@ -58,6 +60,12 @@ src/
 │   ├── error.rs            # Typed resolver errors (absorption, not-major-only, forbidden references)
 │   ├── index.rs            # JumboIndex reader: local paths and gh-based GitHub fetch
 │   └── manifest.rs         # pyproject.toml / package.json loading and form validation
+├── fingerprint/
+│   ├── mod.rs              # Fingerprint orchestration and report model
+│   ├── extract.rs          # Canonical extract + uv.lock/package-lock.json parsers
+│   ├── lockgen.rs          # Lock generation: deps/<slug> injection, manifest rewrite, marker
+│   ├── gitguard.rs         # Own-commit discovery and the clean-tree promotion guard
+│   └── error.rs            # Typed fingerprint-engine errors
 ├── workspace/
 │   ├── mod.rs              # Workspace lifecycle and configuration reconciliation
 │   ├── detection.rs        # Upward search for the workspace root
@@ -132,6 +140,16 @@ The resolver (`src/resolver/`) implements the Jumbo Build & Versioning Standard'
 - Internal = packages with an index record, the `@juntai/*` and legacy `@zephytiju/*` npm scopes, or the jumbo `name@MAJOR` syntax. An internal dependency without any index record is an absorption error that names the package and the absorption step.
 - Resolution returns the newest record of the declared major by record order (last matching JSONL line), never by wall-clock timestamp; bootstrap records are valid targets.
 - The index is read from `--index`, `JUMBO_INDEX_PATH`, `JUMBO_INDEX_URL`, or the JumboIndex repository fetched read-only via `gh`. URL sources must be `https://github.com/<owner>/<repo>` exactly; no credentials are read, stored, or embedded — `gh` supplies authentication from its own environment.
+
+### Fingerprint engine contract
+
+The fingerprint engine (`src/fingerprint/`) implements the standard's duplicate-detection input: `sha256(own commit + canonical extract of the generated language lock)`. Dedup decisions against index history, artifact download, and version bumping are explicitly out of scope.
+
+- Lock generation injects every internal dependency as a minimal source project at the stable relative path `deps/<slug>/` (name and version from the resolved index record, commit recorded for provenance) and rewrites the manifest — Python `name[extras]==<version>` plus a `[tool.uv.sources]` path entry, npm `"file:deps/<slug>"` — before the normal tool runs (`uv lock --upgrade`, `npm install --package-lock-only --ignore-scripts`).
+- The rewrite lives in `deps/.jumbo-sources.json` (`jumbo-lock-injection/1`), restores before every re-resolution (the resolver never sees rewritten forms), and is idempotent: two generations produce identical files.
+- The canonical extract (`jumbo-canonical-extract/1`, matching the JumboIndex record schema) is a sorted, deduplicated, tool-independent view: entries of `name`, `version`, `source` (`index`/`pypi`/`npm`/`path`), `digest`, `path`. Lock formatting, key order, and entry order never affect it; injected coordinates are always `deps/<slug>`; absolute paths and Git URLs in a lock are hard errors.
+- The fingerprint preimage is byte-exact `<40-hex commit>\n<compact canonical JSON>`; changing it invalidates every recorded fingerprint.
+- Promotion mode (`--promote`) refuses dirty trees: only jumbo-generated output (under `deps/`, generated lock files, and the recorded manifest rewrite verified by un-injecting both sides against HEAD) is exempt; pure-local queries never inspect promotion state.
 
 ### Failure behavior
 
@@ -210,10 +228,17 @@ For CLI changes, also inspect generated help and verify both the shortcut and ex
 | CLI schema and help | `src/cli/mod.rs`, `src/cli/*.rs` | Commands, arguments, defaults, aliases, dispatch |
 | Current-project pipelines | `src/cli/build.rs` | Repository selection and language pipeline choice |
 | Resolver command | `src/cli/resolve.rs` | Declaration/manifest resolution dispatch |
+| Lock command | `src/cli/lock.rs` | Lock-generation dispatch (injection + language tool) |
+| Fingerprint command | `src/cli/fingerprint.rs` | Fingerprint report dispatch (generate or read a lock) |
 | Resolution semantics | `src/resolver/mod.rs` | Internal/external split, newest-of-major, absorption, reports |
 | Declarations | `src/resolver/declaration.rs` | Major-pinned syntax for pyproject/package.json, forbidden references |
 | Index reader | `src/resolver/index.rs` | JSONL records, local index paths, validated GitHub fetch via `gh` |
 | Manifest loading | `src/resolver/manifest.rs` | Read dependency lists from pyproject.toml and package.json |
+| Fingerprint orchestration | `src/fingerprint/mod.rs` | Report model, generate/read-and-fingerprint flows |
+| Canonical extract | `src/fingerprint/extract.rs` | jumbo-canonical-extract/1, uv/npm lock parsers, sha256 preimage |
+| Lock generation | `src/fingerprint/lockgen.rs` | deps/<slug> injection, manifest rewrite/restore, marker |
+| Promotion guard | `src/fingerprint/gitguard.rs` | Own-commit discovery, clean-tree enforcement with jumbo exemptions |
+| Fingerprint errors | `src/fingerprint/error.rs` | Typed, actionable fingerprint-engine errors |
 | Resolver errors | `src/resolver/error.rs` | Typed, actionable error messages for resolution failures |
 | Workspace lifecycle | `src/workspace/mod.rs` | Create, clone, import, remove, sync, watch, and clean |
 | Workspace discovery | `src/workspace/detection.rs` | Find and validate workspace context |
