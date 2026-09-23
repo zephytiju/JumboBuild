@@ -76,6 +76,9 @@ pub struct LockGeneration {
     pub lock_path: PathBuf,
     /// The injected internal sources, sorted by path.
     pub injected: Vec<InjectedSource>,
+    /// The resolved internal dependencies the injection was built from
+    /// (the resolver ran against the declared forms, before rewriting).
+    pub internal: Vec<ResolvedDependency>,
 }
 
 impl LockGeneration {
@@ -218,6 +221,7 @@ pub fn generate_lock_inputs(
         ecosystem,
         lock_path: project_dir.join(lock_name),
         injected,
+        internal: resolution.internal,
     })
 }
 
@@ -536,6 +540,11 @@ fn apply_npm_injection(
 /// Reverse a previous npm injection: restore the declared ranges and
 /// re-serialize. Value-level and idempotent, so the promotion guard can
 /// normalize both the working-tree and HEAD copies through it.
+///
+/// Both jumbo-written forms are restored: the injected source overlay
+/// (`file:deps/<slug>`) and a materialized record artifact
+/// (`file:deps/<slug>/<file>.tgz`) — anything under the package's overlay
+/// coordinate is jumbo-owned and reverts to the declared range.
 pub fn restore_npm_manifest(content: &str, sources: &[InjectedSource]) -> String {
     let Ok(mut doc) = serde_json::from_str::<serde_json::Value>(content) else {
         return content.to_string();
@@ -553,8 +562,12 @@ pub fn restore_npm_manifest(content: &str, sources: &[InjectedSource]) -> String
         };
         for (name, value) in map.iter_mut() {
             if let Some(source) = by_name.get(name.as_str()) {
-                if value.as_str() == Some(format!("file:{}", source.path).as_str()) {
-                    *value = serde_json::Value::String(source.declared.clone());
+                if let Some(current) = value.as_str() {
+                    let overlay_source = format!("file:{}", source.path);
+                    let overlay_under = format!("file:{}/", source.path.trim_end_matches('/'));
+                    if current == overlay_source || current.starts_with(&overlay_under) {
+                        *value = serde_json::Value::String(source.declared.clone());
+                    }
                 }
             }
         }
@@ -863,6 +876,23 @@ mod tests {
         let restored_doc: serde_json::Value = serde_json::from_str(&restored).unwrap();
         assert_eq!(
             restored_doc["dependencies"]["@juntai/demo-kit"]
+                .as_str()
+                .unwrap(),
+            "^1"
+        );
+
+        // A materialized record artifact (`file:deps/<slug>/<file>.tgz`,
+        // written by the dedup materializer) restores to the declared
+        // range as well — anything under the overlay coordinate is
+        // jumbo-owned.
+        let materialized = restored.replace(
+            r#""@juntai/demo-kit": "^1""#,
+            r#""@juntai/demo-kit": "file:deps/juntai-demo-kit/juntai-demo-kit-1.2.0.tgz""#,
+        );
+        let restored2 = restore_npm_manifest(&materialized, &generation.injected);
+        let restored2_doc: serde_json::Value = serde_json::from_str(&restored2).unwrap();
+        assert_eq!(
+            restored2_doc["dependencies"]["@juntai/demo-kit"]
                 .as_str()
                 .unwrap(),
             "^1"

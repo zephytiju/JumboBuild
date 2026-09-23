@@ -1,4 +1,5 @@
 pub mod build;
+pub mod dedup;
 pub mod fingerprint;
 pub mod lock;
 pub mod resolve;
@@ -36,6 +37,9 @@ pub enum Commands {
     Lock(lock::LockArgs),
     /// Compute sha256(own commit + canonical extract) of the generated lock
     Fingerprint(fingerprint::FingerprintArgs),
+    /// Decide build-or-reuse against the index by fingerprint; optionally
+    /// materialize recorded artifacts (pull, verify, ingest)
+    Dedup(dedup::DedupArgs),
     /// Generate shell completion scripts
     Completions(CompletionsArgs),
 }

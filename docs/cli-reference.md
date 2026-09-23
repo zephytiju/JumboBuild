@@ -27,6 +27,7 @@ This document contains the help content for the `jumbo` command-line program.
 * [`jumbo resolve`↴](#jumbo-resolve)
 * [`jumbo lock`↴](#jumbo-lock)
 * [`jumbo fingerprint`↴](#jumbo-fingerprint)
+* [`jumbo dedup`↴](#jumbo-dedup)
 * [`jumbo completions`↴](#jumbo-completions)
 
 ## `jumbo`
@@ -46,6 +47,7 @@ Juntai internal unified build tool
 * `resolve` — Resolve internal dependencies by declared major against the Jumbo index
 * `lock` — Generate the language lock with jumbo-injected internal sources
 * `fingerprint` — Compute sha256(own commit + canonical extract) of the generated lock
+* `dedup` — Decide build-or-reuse against the index by fingerprint; optionally materialize recorded artifacts (pull, verify, ingest)
 * `completions` — Generate shell completion scripts
 
 
@@ -274,6 +276,25 @@ Compute sha256(own commit + canonical extract) of the generated lock
 * `-l`, `--lock <PATH>` — Fingerprint an existing lock file (uv.lock or package-lock.json) instead of generating one; a pure-local query that never promotes
 * `-i`, `--index <PATH_OR_URL>` — Jumbo index location: a local clone path or an https://github.com URL (default: JUMBO_INDEX_PATH, then JUMBO_INDEX_URL, then the JumboIndex repository)
 * `--promote` — Promotion mode: refuse on a dirty working tree (pipelines only; pure-local queries never promote)
+
+
+
+## `jumbo dedup`
+
+Decide build-or-reuse against the index by fingerprint; optionally materialize recorded artifacts (pull, verify, ingest)
+
+**Usage:** `jumbo dedup [OPTIONS]`
+
+###### **Options:**
+
+* `-m`, `--manifest <PATH>` — Manifest of the project about to build (pyproject.toml or package.json). Its jumbo-generated lock (uv.lock / package-lock.json) is fingerprinted when present — refresh it with `jumbo lock`; one is generated only when absent
+* `-l`, `--lock <PATH>` — Fingerprint an existing lock file (uv.lock or package-lock.json) instead of using the manifest; a pure-local query that runs no tool
+* `-p`, `--package <NAME>` — Package name whose index history is searched (default: the manifest or lock root's own name)
+* `-i`, `--index <PATH_OR_URL>` — Jumbo index location: a local clone path or an https://github.com URL (default: JUMBO_INDEX_PATH, then JUMBO_INDEX_URL, then the JumboIndex repository)
+* `--materialize` — On a duplicate, pull the matched record's artifact (exact URL, SHA-256 verified) into the project's dist directory instead of leaving the rebuild to the pipeline
+* `--deps` — Materialize the recorded artifacts of the manifest's internal dependencies, replacing their source overlays (manifest: --manifest or pyproject.toml/package.json in the current directory)
+* `--dist-dir <DIR>` — Build-output directory for a pulled own-record artifact (default: dist)
+* `--artifact-dir <DIR>` — Resolve artifacts by exact file name from a local directory (a CI asset cache or offline fixture directory) instead of downloading; the recorded SHA-256 is still enforced (default: JUMBO_ARTIFACT_DIR when set, otherwise download)
 
 
 
