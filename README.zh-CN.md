@@ -105,6 +105,32 @@ jumbo clean    # 清理当前项目的生成文件
 
 `jumbo.toml` 记录工作空间成员、仓库路径、远程地址、包名与 IDE 设置。应将它视为工作空间元数据，并与工作空间配置一同提交。
 
+## 依赖解析（Jumbo 索引）
+
+内部依赖**只按主版本（major）声明**，并通过 [Jumbo 索引](https://github.com/zephytiju/JumboIndex)（所有已发布内部构建的只追加记录仓库）解析。解析返回声明主版本的最新索引记录（以记录顺序为准，而非时间戳）。第三方依赖原样透传，由常规语言工具链解析。
+
+接受的声明形式：
+
+| 清单文件 | 接受 | 拒绝 |
+| --- | --- | --- |
+| `pyproject.toml` | `juntai-fuse-api[http]@2`（jumbo 仅主版本形式）、`pkg==2.*`、`pkg~=2.0`、`pkg>=2,<3` | Git URL（`git+https://…`）、直接 wheel/tarball URL、精确锁定（`==2.1.3`）、跨越或未限定单一主版本的范围（`>=2`、`>=1,<3`） |
+| `package.json`（`@juntai/*`、旧版 `@zephytiju/*`） | `"1"`、`"1.x"`、`"^1"`、`"~1"`、`">=1,<2"` | Git/tarball URL、`user/repo` 简写、`file:` 路径、精确锁定（`"1.2.3"`）、`">=1"`、`">=1,<3"`、`"*"` |
+
+```bash
+# 解析单个声明
+jumbo resolve juntai-fuse-api[http]@2
+jumbo resolve '@juntai/demo-kit@^1'
+
+# 校验并解析清单中的全部依赖
+jumbo resolve --manifest projects/consumer/pyproject.toml
+jumbo resolve --manifest projects/console/package.json
+
+# 仅校验声明形式（不查索引记录）
+jumbo resolve --manifest pyproject.toml --check
+```
+
+索引位置依次取：`--index <路径或URL>`、`JUMBO_INDEX_PATH`（本地克隆，推荐）、`JUMBO_INDEX_URL`、默认 JumboIndex 仓库（通过 `gh` 只读获取；仅接受 `https://github.com` URL）。没有索引记录的内部依赖会以**吸收错误**（absorption error）失败，错误会指明缺失的包与吸收步骤：其仓库必须先纳入 jumbo 流水线才能被消费。
+
 ## Shell 自动补全
 
 安装脚本会为 zsh、Bash 或 fish 配置动态补全。也可以手动生成静态补全脚本：

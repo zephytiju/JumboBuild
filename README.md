@@ -105,6 +105,32 @@ Each Python project remains responsible for declaring its own dependencies in `p
 
 `jumbo.toml` records workspace membership, repository paths, remotes, package names, and IDE settings. Treat it as workspace metadata and commit it with the workspace configuration.
 
+## Dependency resolution (Jumbo index)
+
+Internal dependencies are declared **by major version only** and resolved against the [Jumbo index](https://github.com/zephytiju/JumboIndex) — the append-only record of every promoted internal build. Resolution returns the newest index record of the declared major (newest by record order, not timestamp). Third-party dependencies pass through untouched for the normal language tooling.
+
+Accepted declaration forms:
+
+| Manifest | Accepted | Rejected |
+| --- | --- | --- |
+| `pyproject.toml` | `juntai-fuse-api[http]@2` (jumbo major-only), `pkg==2.*`, `pkg~=2.0`, `pkg>=2,<3` | Git URLs (`git+https://…`), direct wheel/tarball URLs, exact pins (`==2.1.3`), ranges spanning or not bounding a single major (`>=2`, `>=1,<3`) |
+| `package.json` (`@juntai/*`, legacy `@zephytiju/*`) | `"1"`, `"1.x"`, `"^1"`, `"~1"`, `">=1,<2"` | Git/tarball URLs, `user/repo` shorthands, `file:` paths, exact pins (`"1.2.3"`), `">=1"`, `">=1,<3"`, `"*"` |
+
+```bash
+# Resolve one declaration
+jumbo resolve juntai-fuse-api[http]@2
+jumbo resolve '@juntai/demo-kit@^1'
+
+# Validate and resolve every dependency of a manifest
+jumbo resolve --manifest projects/consumer/pyproject.toml
+jumbo resolve --manifest projects/console/package.json
+
+# Validate declaration forms only (no record lookups)
+jumbo resolve --manifest pyproject.toml --check
+```
+
+The index location is `--index <path-or-url>`, then `JUMBO_INDEX_PATH` (local clone; recommended), then `JUMBO_INDEX_URL`, then the JumboIndex repository (fetched read-only via `gh`; only `https://github.com` URLs are accepted). An internal dependency with no index record fails with an **absorption error** naming the package and the absorption step: its repository must be covered by a jumbo pipeline before it can be consumed.
+
 ## Shell completion
 
 The installer configures dynamic completion for zsh, Bash, or fish. You can also generate a static completion script:

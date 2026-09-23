@@ -50,7 +50,14 @@ src/
 ├── cli/
 │   ├── mod.rs              # clap command and argument model
 │   ├── build.rs            # Current-project build command dispatch
+│   ├── resolve.rs          # Dependency-resolution command dispatch
 │   └── workspace.rs        # Workspace subcommand dispatch
+├── resolver/
+│   ├── mod.rs              # Resolution orchestration: internal/external split, reports
+│   ├── declaration.rs      # Major-pinned declaration parsing (Python + npm grammars)
+│   ├── error.rs            # Typed resolver errors (absorption, not-major-only, forbidden references)
+│   ├── index.rs            # JumboIndex reader: local paths and gh-based GitHub fetch
+│   └── manifest.rs         # pyproject.toml / package.json loading and form validation
 ├── workspace/
 │   ├── mod.rs              # Workspace lifecycle and configuration reconciliation
 │   ├── detection.rs        # Upward search for the workspace root
@@ -115,6 +122,16 @@ git_repo_scan_max_depth = 2
 ### Managed Python configuration
 
 The Python backend updates uv workspace membership and sources in one pass for all registered repositories. It records the package names it owns in `[tool.jumbo.workspace_sources]`, removes only previously managed source entries, and preserves everything else. Changes to this logic must remain idempotent: running `jumbo workspace sync` twice without filesystem changes should not change the generated files the second time.
+
+### Resolver core contract
+
+The resolver (`src/resolver/`) implements the Jumbo Build & Versioning Standard's resolution semantics and nothing more — fingerprinting, materialization, and version bumping are explicitly out of scope:
+
+- Declarations reduce to a major: Python accepts `name[extras]@MAJOR`, `==M.*`, `~=M.0`, and `>=M,<M+1`; npm accepts `M`, `M.x`, `^M`, `~M`, and `>=M,<M+1`. Exact pins, floors above `M.0`, unbounded ranges, and multi-major ranges are rejected for internal dependencies.
+- Git URLs, direct artifact URLs, and local path references are rejected for every declaration in every validated manifest section; third-party ranges pass through untouched.
+- Internal = packages with an index record, the `@juntai/*` and legacy `@zephytiju/*` npm scopes, or the jumbo `name@MAJOR` syntax. An internal dependency without any index record is an absorption error that names the package and the absorption step.
+- Resolution returns the newest record of the declared major by record order (last matching JSONL line), never by wall-clock timestamp; bootstrap records are valid targets.
+- The index is read from `--index`, `JUMBO_INDEX_PATH`, `JUMBO_INDEX_URL`, or the JumboIndex repository fetched read-only via `gh`. URL sources must be `https://github.com/<owner>/<repo>` exactly; no credentials are read, stored, or embedded — `gh` supplies authentication from its own environment.
 
 ### Failure behavior
 
@@ -192,6 +209,12 @@ For CLI changes, also inspect generated help and verify both the shortcut and ex
 | Shared crate root | `src/lib.rs` | Expose the CLI model to the binary and documentation generator |
 | CLI schema and help | `src/cli/mod.rs`, `src/cli/*.rs` | Commands, arguments, defaults, aliases, dispatch |
 | Current-project pipelines | `src/cli/build.rs` | Repository selection and language pipeline choice |
+| Resolver command | `src/cli/resolve.rs` | Declaration/manifest resolution dispatch |
+| Resolution semantics | `src/resolver/mod.rs` | Internal/external split, newest-of-major, absorption, reports |
+| Declarations | `src/resolver/declaration.rs` | Major-pinned syntax for pyproject/package.json, forbidden references |
+| Index reader | `src/resolver/index.rs` | JSONL records, local index paths, validated GitHub fetch via `gh` |
+| Manifest loading | `src/resolver/manifest.rs` | Read dependency lists from pyproject.toml and package.json |
+| Resolver errors | `src/resolver/error.rs` | Typed, actionable error messages for resolution failures |
 | Workspace lifecycle | `src/workspace/mod.rs` | Create, clone, import, remove, sync, watch, and clean |
 | Workspace discovery | `src/workspace/detection.rs` | Find and validate workspace context |
 | Metadata | `src/workspace/metadata.rs` | Parse and write `jumbo.toml` |
