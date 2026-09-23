@@ -106,11 +106,14 @@ pub fn fingerprint_lock_file(
 /// fingerprint must be attributable to exactly one commit before any
 /// pipeline consumes it for a publish decision. With `run_tool` false the
 /// caller generates the lock separately (`jumbo lock --inject-only`).
+/// `upgrade` is the third-party refresh gate passed to the lock command
+/// (see [`LockGeneration::lock_command_for`]).
 pub fn fingerprint_manifest(
     manifest: &Path,
     index: &crate::resolver::Index,
     promotion: bool,
     run_tool: bool,
+    upgrade: bool,
 ) -> Result<(LockGeneration, FingerprintReport), FingerprintError> {
     // Promotion mode refuses dirty trees before anything is generated.
     if promotion {
@@ -118,7 +121,7 @@ pub fn fingerprint_manifest(
     }
     let generation = generate_lock_inputs(manifest, index)?;
     if run_tool {
-        let (command, description) = generation.lock_command();
+        let (command, description) = generation.lock_command_for(upgrade);
         let working_dir = manifest
             .parent()
             .filter(|p| !p.as_os_str().is_empty())

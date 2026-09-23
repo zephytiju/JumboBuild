@@ -67,7 +67,7 @@ fn ecosystem_of(report: &FingerprintReport) -> Ecosystem {
 
 /// The own package name of a manifest: `[project].name` (PEP 503
 /// normalized for index lookup) or package.json `name`.
-fn manifest_package_name(manifest: &std::path::Path) -> Result<String> {
+pub(crate) fn manifest_package_name(manifest: &std::path::Path) -> Result<String> {
     let is_python = manifest
         .file_name()
         .and_then(|n| n.to_str())
@@ -235,12 +235,12 @@ pub fn execute(args: DedupArgs) -> Result<()> {
                     anyhow::anyhow!(e).context(format!("fingerprinting {}", existing.display()))
                 })?
             } else {
-                let (_generation, report) = fingerprint::fingerprint_manifest(
-                    &manifest, &index, false, true,
-                )
-                .map_err(|e| {
-                    anyhow::anyhow!(e).context(format!("fingerprinting {}", manifest.display()))
-                })?;
+                let (_generation, report) =
+                    fingerprint::fingerprint_manifest(&manifest, &index, false, true, true)
+                        .map_err(|e| {
+                            anyhow::anyhow!(e)
+                                .context(format!("fingerprinting {}", manifest.display()))
+                        })?;
                 report
             };
             (report, Some(manifest))

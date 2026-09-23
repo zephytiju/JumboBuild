@@ -2,6 +2,7 @@ pub mod build;
 pub mod dedup;
 pub mod fingerprint;
 pub mod lock;
+pub mod promote;
 pub mod resolve;
 pub mod workspace;
 
@@ -40,6 +41,9 @@ pub enum Commands {
     /// Decide build-or-reuse against the index by fingerprint; optionally
     /// materialize recorded artifacts (pull, verify, ingest)
     Dedup(dedup::DedupArgs),
+    /// Compute the auto-promotion version bump decision (publish-on-bump
+    /// contract for executors)
+    Promote(promote::PromoteArgs),
     /// Generate shell completion scripts
     Completions(CompletionsArgs),
 }
