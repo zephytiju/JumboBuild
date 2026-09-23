@@ -25,9 +25,36 @@ pub struct RepoInfo {
     pub path: String,
     #[serde(default)]
     pub remote: Option<String>,
-    /// Distribution name from the repository's Python project, when known.
+    /// Distribution or package name from the repository's project manifest,
+    /// when known (`project.name` in pyproject.toml or `name` in package.json).
     #[serde(default)]
     pub package: Option<String>,
+    /// Ecosystem of the recorded `package` name: [`ECOSYSTEM_PYTHON`] or
+    /// [`ECOSYSTEM_NODE`]. Legacy metadata without the field defaults to
+    /// Python, which is the only ecosystem older versions recorded.
+    #[serde(default)]
+    pub ecosystem: Option<String>,
+}
+
+/// The Python ecosystem identifier in `jumbo.toml` repository entries.
+pub const ECOSYSTEM_PYTHON: &str = "python";
+/// The Node ecosystem identifier in `jumbo.toml` repository entries.
+pub const ECOSYSTEM_NODE: &str = "node";
+
+impl RepoInfo {
+    /// Whether the recorded `package` name is a Python distribution name.
+    /// Legacy entries without an ecosystem are Python by construction.
+    pub fn is_python_package(&self) -> bool {
+        self.ecosystem
+            .as_deref()
+            .is_none_or(|ecosystem| ecosystem == ECOSYSTEM_PYTHON)
+    }
+
+    /// Whether the recorded `package` name is an npm package name.
+    #[allow(dead_code)]
+    pub fn is_node_package(&self) -> bool {
+        self.ecosystem.as_deref() == Some(ECOSYSTEM_NODE)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -64,8 +91,8 @@ impl JumboToml {
     /// Save metadata to jumbo.toml at the given root path.
     pub fn save(&self, workspace_root: &Path) -> Result<()> {
         let file_path = workspace_root.join(METADATA_FILENAME);
-        let content = toml::to_string_pretty(self)
-            .context("Failed to serialize workspace metadata")?;
+        let content =
+            toml::to_string_pretty(self).context("Failed to serialize workspace metadata")?;
         std::fs::write(&file_path, content)
             .with_context(|| format!("Failed to write {}", file_path.display()))?;
         Ok(())
@@ -86,6 +113,9 @@ impl JumboToml {
     /// Find a mutable repository by name.
     #[allow(dead_code)]
     pub fn find_repo_mut(&mut self, name: &str) -> Option<&mut RepoInfo> {
-        self.workspace.repositories.iter_mut().find(|r| r.name == name)
+        self.workspace
+            .repositories
+            .iter_mut()
+            .find(|r| r.name == name)
     }
 }

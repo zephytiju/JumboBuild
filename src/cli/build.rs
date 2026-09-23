@@ -33,9 +33,7 @@ pub enum BuildAction {
 /// registered repository path. Returns the matching `RepoInfo` on success.
 fn detect_current_repo(workspace_root: &Path, metadata: &JumboToml) -> Result<RepoInfo> {
     let cwd = std::env::current_dir()?;
-    let cwd_canonical = cwd
-        .canonicalize()
-        .unwrap_or_else(|_| cwd.clone());
+    let cwd_canonical = cwd.canonicalize().unwrap_or_else(|_| cwd.clone());
 
     for repo in &metadata.workspace.repositories {
         let repo_path = workspace_root.join(&repo.path);
@@ -69,10 +67,7 @@ pub fn execute(action: Option<BuildAction>) -> Result<()> {
     let repo_path: PathBuf = workspace_root.join(&repo.path);
 
     let lang = detect_language(&registry, &repo_path).ok_or_else(|| {
-        anyhow::anyhow!(
-            "No language support detected for project '{}'",
-            repo.name
-        )
+        anyhow::anyhow!("No language support detected for project '{}'", repo.name)
     })?;
 
     println!(
@@ -84,7 +79,7 @@ pub fn execute(action: Option<BuildAction>) -> Result<()> {
 
     let result = match &action {
         Some(BuildAction::Clean) => lang.clean(&repo_path),
-        None | Some(BuildAction::Test) if matches!(action, None) => {
+        None | Some(BuildAction::Test) if action.is_none() => {
             lang.build(&workspace_root, &repo_path)
         }
         Some(BuildAction::Test) => lang.test(&workspace_root, &repo_path),

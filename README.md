@@ -8,11 +8,11 @@ Jumbo Build is Juntai's unified command-line interface for building projects and
 
 - **One project workflow:** use the same commands across every supported language.
 - **Multi-repository workspaces:** clone, import, remove, synchronize, and watch repositories under one workspace.
-- **Local dependency wiring:** keep checked-out Python packages connected as uv workspace members and fall back to recorded Git remotes when a package is absent locally.
+- **Local dependency wiring:** keep checked-out Python packages connected as uv workspace members and fall back to recorded Git remotes when a package is absent locally; Node projects register with their npm identity alongside them.
 - **Native CLI:** ship a single Rust binary for macOS and Linux.
 - **Extensible language support:** add another ecosystem by implementing `LanguageSupport` and registering it.
 
-Jumbo Build currently supports Python projects identified by a `pyproject.toml` file.
+Jumbo Build currently supports Python projects identified by a `pyproject.toml` file and Node.js / TypeScript projects identified by a `package.json` file.
 
 ## Requirements
 
@@ -20,6 +20,7 @@ Jumbo Build currently supports Python projects identified by a `pyproject.toml` 
 - Git
 - Rust stable and Cargo (the installer builds Jumbo Build from source)
 - For Python projects: [uv](https://docs.astral.sh/uv/); project tools such as pytest and Ruff should be declared in the project's dependency groups
+- For Node projects: Node.js ≥ 18 and npm ≥ 9 on the PATH (npm ≥ 7 is the hard floor for lockfileVersion 2/3)
 
 ## Install
 
@@ -65,13 +66,13 @@ jumbo clean    # remove this project's generated artifacts
 
 ### Project commands
 
-| Command | Python pipeline |
-| --- | --- |
-| `jumbo` or `jumbo build` | `uv lock --upgrade` → `uv sync` → `uv build` |
-| `jumbo test` | build pipeline → `uv run pytest -v` |
-| `jumbo format` | build pipeline → `ruff format .` → `ruff check --fix .` |
-| `jumbo release` | build pipeline → `uv run pytest -v` → `ruff check .` |
-| `jumbo clean` | Remove caches, coverage output, and build artifacts for the current project |
+| Command | Python pipeline | Node pipeline |
+| --- | --- | --- |
+| `jumbo` or `jumbo build` | `uv lock --upgrade` → `uv sync` → `uv build` | `npm install --package-lock-only --ignore-scripts` → `npm ci` → `npm run build` (when a `build` script is configured) |
+| `jumbo test` | build pipeline → `uv run pytest -v` | build pipeline → `npm test` (when configured; npm's "no test specified" placeholder counts as absent) or `node --test` (when Node test files exist) |
+| `jumbo format` | build pipeline → `ruff format .` → `ruff check --fix .` | build pipeline → `npm run format` (when configured) or `npx --no-install prettier --write .` (when Prettier is configured) |
+| `jumbo release` | build pipeline → `uv run pytest -v` → `ruff check .` | build pipeline → test step → `npm run format:check` (when configured) or `npx --no-install prettier --check .` |
+| `jumbo clean` | Remove caches, coverage output, and build artifacts for the current project | Remove `node_modules/`, build output (`dist`, `build`, `out`), coverage, `.eslintcache`, and `*.tsbuildinfo` |
 
 The explicit forms `jumbo build test`, `jumbo build format`, `jumbo build release`, and `jumbo build clean` are equivalent to the top-level shortcuts.
 
@@ -104,6 +105,23 @@ Each Python project remains responsible for declaring its own dependencies in `p
 - only source entries listed in `[tool.jumbo.workspace_sources]` are managed, so unrelated root configuration is preserved.
 
 `jumbo.toml` records workspace membership, repository paths, remotes, package names, and IDE settings. Treat it as workspace metadata and commit it with the workspace configuration.
+
+## Node.js project behavior
+
+Node.js / TypeScript projects are detected by a `package.json` file. When a repository carries both a `pyproject.toml` and a `package.json`, it builds as Python — the registry checks Python first so existing Python projects can add a `package.json` for tooling without changing identity.
+
+The pipeline selects its steps from the project's own configuration:
+
+- **Lock and install:** every pipeline refreshes `package-lock.json` with `npm install --package-lock-only --ignore-scripts` — the exact command the fingerprint engine's `jumbo lock` uses, so workspace builds and lock generation produce the same file — and then installs with `npm ci`. Lifecycle scripts never run during the lock-only step; they run during `npm ci`, which is the real install. Because installing always follows a fresh lock step, the pipeline is agnostic to which npm wrote the lock (lockfileVersion 2/3 on npm ≥ 7; legacy v1 locks are re-resolved and upgraded by the same step before anything installs from them).
+- **Build:** the project's `build` script runs when configured; packages without one get an install-only build.
+- **Tests:** `npm test` runs when a real `test` script is configured; otherwise `node --test` runs when the project carries Node test files (`*.test.js` and friends); otherwise the step is skipped with a note.
+- **Formatting:** the project's `format` / `format:check` scripts run when configured; otherwise Prettier runs directly when it is configured (a `prettier` dependency, a `prettier` key in package.json, or a Prettier config file). `npx --no-install` uses the locally installed binary and never downloads anything.
+- **Engines:** `engines.node` is enforced before any step runs — an unsatisfied range fails the pipeline immediately with both versions named. Ranges jumbo cannot evaluate statically are deferred to npm's own check.
+- **Release:** `jumbo release` is the strict variant: build pipeline → tests → strict format check. It never publishes; artifact publication is the executor's job under the publication contract.
+
+npm is the supported package manager; `packageManager` fields selecting other tools are not honored yet. Internal dependencies use the `@juntai/*` scope (legacy `@zephytiju/*` is accepted) and are injected at `file:deps/<slug>` coordinates by `jumbo lock` and the materializer — the workspace pipeline itself runs the plain toolchain.
+
+Node repositories register with their npm package identity in `jumbo.toml` (`package = "@juntai/kit"`, `ecosystem = "node"`) and are excluded from the uv workspace, so mixed Python + Node workspaces work unchanged: no root npm workspace is generated, because npm workspaces would centralize `node_modules` at the root and change per-project install semantics that jumbo's file-protocol ingestion model relies on.
 
 ## Dependency resolution (Jumbo index)
 
