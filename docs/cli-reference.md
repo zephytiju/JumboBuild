@@ -24,6 +24,7 @@ This document contains the help content for the `jumbo` command-line program.
 * [`jumbo workspace sync`↴](#jumbo-workspace-sync)
 * [`jumbo workspace watch`↴](#jumbo-workspace-watch)
 * [`jumbo workspace clean`↴](#jumbo-workspace-clean)
+* [`jumbo resolve`↴](#jumbo-resolve)
 * [`jumbo completions`↴](#jumbo-completions)
 
 ## `jumbo`
@@ -40,6 +41,7 @@ Juntai internal unified build tool
 * `release` — Run release pipeline (= build release)
 * `clean` — Clean build artifacts (= build clean)
 * `workspace` — Manage Jumbo workspace
+* `resolve` — Resolve internal dependencies by declared major against the Jumbo index
 * `completions` — Generate shell completion scripts
 
 
@@ -221,6 +223,24 @@ Watch workspace and periodically sync
 Clean build artifacts for all repositories
 
 **Usage:** `jumbo workspace clean`
+
+
+
+## `jumbo resolve`
+
+Resolve internal dependencies by declared major against the Jumbo index
+
+**Usage:** `jumbo resolve [OPTIONS] [DECLARATION]`
+
+###### **Arguments:**
+
+* `<DECLARATION>` — Declaration to resolve, e.g. `juntai-fuse-api[http]@2` or `@juntai/pkg@^1`
+
+###### **Options:**
+
+* `-m`, `--manifest <PATH>` — Manifest to validate and resolve (pyproject.toml or package.json)
+* `-i`, `--index <PATH_OR_URL>` — Jumbo index location: a local clone path or an https://github.com URL (default: JUMBO_INDEX_PATH, then JUMBO_INDEX_URL, then the JumboIndex repository)
+* `--check` — Validate declaration forms only; do not look up index records
 
 
 

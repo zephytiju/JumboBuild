@@ -21,6 +21,7 @@ fn main() -> Result<()> {
         Some(Commands::Release) => build::execute_release()?,
         Some(Commands::Clean) => build::execute_clean()?,
         Some(Commands::Workspace(args)) => cli::workspace::execute(args)?,
+        Some(Commands::Resolve(args)) => cli::resolve::execute(args)?,
         Some(Commands::Completions(args)) => {
             let mut cmd = Cli::command();
             generate(args.shell, &mut cmd, "jumbo", &mut std::io::stdout());

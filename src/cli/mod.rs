@@ -1,4 +1,5 @@
 pub mod build;
+pub mod resolve;
 pub mod workspace;
 
 use clap::{Parser, Subcommand};
@@ -27,6 +28,8 @@ pub enum Commands {
     /// Manage Jumbo workspace
     #[command(alias = "ws")]
     Workspace(workspace::WorkspaceArgs),
+    /// Resolve internal dependencies by declared major against the Jumbo index
+    Resolve(resolve::ResolveArgs),
     /// Generate shell completion scripts
     Completions(CompletionsArgs),
 }
