@@ -1,0 +1,454 @@
+# Reusable jumbo publication workflow (Jumbo Build & Versioning Standard, §3.5
+# "Executors and the Publication Contract").
+#
+# Jumbo publication is executor-agnostic: this workflow runs the SAME jumbo
+# commands the CircleCI umbrella pipelines run — lock → fingerprint → dedup →
+# promote — and a public repository releases to jumbo by calling it with NO
+# per-repo workflow logic. On a promotion (publish-on-bump) it builds the
+# artifacts at the jumbo-computed version, publishes them as a GitHub Release
+# on the CALLER repository, appends the JumboIndex record per that
+# repository's docs/APPEND-PROTOCOL.md, and (opt-in, default off) republishes
+# to the public registry so external consumers keep being served — driven by
+# the jumbo-computed version. A fingerprint hit (dedup) skips the build in
+# this executor exactly as in CircleCI: the recorded artifact is pulled,
+# SHA-256 verified, and the run ends without publishing.
+#
+# Caller usage (see docs/jumbo-publish.md for the full contract):
+#
+#   jobs:
+#     jumbo-publish:
+#       uses: zephytiju/JumboBuild/.github/workflows/jumbo-publish.yml@<ref>
+#       secrets: inherit
+#       permissions:
+#         contents: write
+#
+# Required secrets (org-level, passed with `secrets: inherit`):
+#   JUNTAI_GITHUB_ARTIFACT_TOKEN - reads the private JumboBuild checkout and
+#     clones the private JumboIndex repository (the caller's default
+#     GITHUB_TOKEN cannot cross repository boundaries).
+#   JUNTAI_INDEX_TOKEN           - pushes the index append to JumboIndex (a
+#     GitHub App or user token with contents:write on zephytiju/JumboIndex).
+#   PYPI_TOKEN / NPM_TOKEN       - only when publish-to-public-registry is
+#     enabled; never referenced in this file as a literal, only via secrets.
+#
+# Credentials enter exclusively through secrets/env. No credential literals
+# appear in this workflow, and outbound traffic goes to github.com plus the
+# language registries (pypi.org / registry.npmjs.org) the standard build
+# tools and the opt-in public publish use.
+name: jumbo publish
+
+on:
+  workflow_call:
+    inputs:
+      commit:
+        description: "Commit SHA of the caller repository to release (default: the triggering commit)"
+        type: string
+        default: ""
+      ecosystem:
+        description: "python | npm | auto (detected from the package manifest)"
+        type: string
+        default: "auto"
+      publish-to-public-registry:
+        description: "Also publish to PyPI/npm for external consumers, driven by the jumbo-computed version"
+        type: boolean
+        default: false
+      index-repository:
+        description: "JumboIndex repository (owner/name)"
+        type: string
+        default: "zephytiju/JumboIndex"
+    outputs:
+      package:
+        description: "Package the decision was computed for"
+        value: ${{ jobs.publish.outputs.package }}
+      version:
+        description: "Promoted version (or the reused version on a dedup hit)"
+        value: ${{ jobs.publish.outputs.version }}
+      bump:
+        description: "none | minor | patch | bootstrap"
+        value: ${{ jobs.publish.outputs.bump }}
+      published:
+        description: "'true' when artifacts were published and the index appended"
+        value: ${{ jobs.publish.outputs.published }}
+      reused:
+        description: "'true' when a fingerprint hit skipped the build"
+        value: ${{ jobs.publish.outputs.reused }}
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: "Commit SHA of the caller repository to release (default: the triggering commit)"
+        type: string
+        default: ""
+      ecosystem:
+        description: "python | npm | auto (detected from the package manifest)"
+        type: string
+        default: "auto"
+      publish-to-public-registry:
+        description: "Also publish to PyPI/npm for external consumers, driven by the jumbo-computed version"
+        type: boolean
+        default: false
+      index-repository:
+        description: "JumboIndex repository (owner/name)"
+        type: string
+        default: "zephytiju/JumboIndex"
+
+# The GitHub Release carrying the artifacts is created on the caller
+# repository; reusable workflows cannot elevate permissions, so the caller
+# must grant contents: write on the calling job.
+permissions:
+  contents: write
+
+# Publication runs queue per ref (never cancelled mid-flight); the index
+# append protocol makes concurrent runs converge idempotently regardless.
+concurrency:
+  group: jumbo-publish-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  # Executor identity recorded in every index record this workflow appends
+  # (JumboIndex schema/record.schema.json: known executor values).
+  JUMBO_EXECUTOR: jumbo-publish-github-actions
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    outputs:
+      package: ${{ steps.identity.outputs.package }}
+      version: ${{ steps.identity.outputs.version }}
+      bump: ${{ steps.identity.outputs.bump }}
+      published: ${{ steps.release.outputs.published }}
+      reused: ${{ steps.dedup.outputs.duplicate }}
+    steps:
+      - name: Resolve the release commit and the JumboBuild coordinates
+        id: coords
+        env:
+          INPUT_COMMIT: ${{ inputs.commit }}
+        run: |
+          set -euo pipefail
+          commit="${INPUT_COMMIT:-${GITHUB_SHA}}"
+          # GITHUB_WORKFLOW_REF points at THIS workflow file
+          # (owner/repo/.github/workflows/jumbo-publish.yml@ref) — the
+          # JumboBuild commit/ref the caller pinned, from which jumbo is
+          # built. The workflow never releases with a jumbo it does not
+          # live at.
+          workflow_ref="${GITHUB_WORKFLOW_REF:?GITHUB_WORKFLOW_REF is required}"
+          repo_and_path="${workflow_ref%@*}"
+          build_ref="${workflow_ref##*@}"
+          build_repo="${repo_and_path%%/.github/*}"
+          if [[ -z "$build_ref" || "$build_repo" != */* || "$build_repo" == "$repo_and_path" ]]; then
+            echo "cannot parse GITHUB_WORKFLOW_REF: ${workflow_ref}" >&2
+            exit 1
+          fi
+          {
+            echo "commit=${commit}"
+            echo "build-repo=${build_repo}"
+            echo "build-ref=${build_ref}"
+          } >> "$GITHUB_OUTPUT"
+          # jumbo command outputs live OUTSIDE the caller checkout: the
+          # promotion clean-tree guard refuses a tree dirtied by anything
+          # except jumbo's own generated lock and deps/ overlays.
+          jumbo_state="${RUNNER_TEMP}/jumbo-state"
+          mkdir -p "$jumbo_state"
+          echo "JUMBO_OUT=${jumbo_state}" >> "$GITHUB_ENV"
+          echo "Releasing ${GITHUB_REPOSITORY}@${commit} with jumbo from ${build_repo}@${build_ref}"
+
+      # 1. The caller repository at the triggering commit. Promotion only
+      #    happens on a clean attributable tree: checkout gives exactly the
+      #    release commit, and persist-credentials keeps no token in the
+      #    local git config (later git/gh calls pass their own tokens).
+      - name: Check out the caller repository at the release commit
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ steps.coords.outputs.commit }}
+          persist-credentials: false
+
+      # 2. JumboBuild at the commit this workflow lives at (private: the
+      #    artifact token or any token with read access is required).
+      - name: Check out JumboBuild at the workflow's own commit
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ steps.coords.outputs.build-repo }}
+          ref: ${{ steps.coords.outputs.build-ref }}
+          path: jumbobuild
+          persist-credentials: false
+          token: ${{ secrets.JUNTAI_GITHUB_ARTIFACT_TOKEN || github.token }}
+
+      - name: Install the Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache the cargo build of jumbo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: jumbobuild
+
+      - name: Build jumbo from the pinned JumboBuild commit
+        run: cargo build --release --locked
+        working-directory: jumbobuild
+
+      - name: Put jumbo on PATH
+        run: echo "${GITHUB_WORKSPACE}/jumbobuild/target/release" >> "$GITHUB_PATH"
+
+      # uv runs the Python side of the standard build (lock, build,
+      # publish). Unconditional so ecosystem detection stays jumbo's job.
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+
+      # 3. The Jumbo index (private: the caller repository must have access
+      #    through JUNTAI_GITHUB_ARTIFACT_TOKEN; the default GITHUB_TOKEN
+      #    works only if it can read the index repository).
+      - name: Fetch the Jumbo index
+        env:
+          GH_TOKEN: ${{ secrets.JUNTAI_GITHUB_ARTIFACT_TOKEN || github.token }}
+          INDEX_REPOSITORY: ${{ inputs.index-repository }}
+        run: |
+          set -euo pipefail
+          : "${INDEX_REPOSITORY:?input index-repository is required}"
+          index_dir="${RUNNER_TEMP}/jumbo-index"
+          gh repo clone "$INDEX_REPOSITORY" "$index_dir"
+          echo "JUMBO_INDEX_PATH=${index_dir}" >> "$GITHUB_ENV"
+          echo "JUMBO_INDEX_REPOSITORY=${INDEX_REPOSITORY}" >> "$GITHUB_ENV"
+
+      # 4. The standard jumbo release steps — identical commands to the
+      #    CircleCI executor, identical outputs. jumbo prefixes its stdout
+      #    with progress lines; `sed -n '/^{/,$p'` keeps the JSON document
+      #    (pipefail still surfaces a jumbo failure).
+      - name: jumbo lock (resolve and generate the language lock)
+        run: |
+          set -euo pipefail
+          jumbo lock | sed -n '/^{/,$p' > "$JUMBO_OUT/lock.json"
+          jq -e '.lock' "$JUMBO_OUT/lock.json" > /dev/null
+          cat "$JUMBO_OUT/lock.json"
+
+      - name: jumbo fingerprint (input fingerprint of this build)
+        run: |
+          set -euo pipefail
+          jumbo fingerprint | sed -n '/^{/,$p' > "$JUMBO_OUT/fingerprint.json"
+          jq -e '.fingerprint' "$JUMBO_OUT/fingerprint.json" > /dev/null
+          cat "$JUMBO_OUT/fingerprint.json"
+
+      - name: jumbo dedup (build-or-reuse decision)
+        id: dedup
+        run: |
+          set -euo pipefail
+          jumbo dedup | sed -n '/^{/,$p' > "$JUMBO_OUT/dedup.json"
+          cat "$JUMBO_OUT/dedup.json"
+          {
+            echo "duplicate=$(jq -r '.duplicate' "$JUMBO_OUT/dedup.json")"
+            echo "action=$(jq -r '.action' "$JUMBO_OUT/dedup.json")"
+            echo "reuse_version=$(jq -r '.matchedRecord.record.version // ""' "$JUMBO_OUT/dedup.json")"
+          } >> "$GITHUB_OUTPUT"
+
+      # 5. Fingerprint hit: pull the recorded artifact (exact URL,
+      #    SHA-256 verified) into dist/ and stop — no build, no publish,
+      #    no index append. This is the skip-build path either executor
+      #    takes.
+      - name: Pull the recorded artifact (fingerprint hit - build skipped)
+        if: steps.dedup.outputs.duplicate == 'true'
+        run: |
+          set -euo pipefail
+          jumbo dedup --materialize --dist-dir dist | sed -n '/^{/,$p' > "$JUMBO_OUT/dedup-materialized.json"
+          cat "$JUMBO_OUT/dedup-materialized.json"
+          echo "::notice title=jumbo dedup::identical inputs already recorded as v${{ steps.dedup.outputs.reuse_version }} - artifact pulled, build skipped"
+
+      - name: jumbo promote (auto-promotion decision; refuses a dirty tree)
+        id: promote
+        if: steps.dedup.outputs.duplicate != 'true'
+        run: |
+          set -euo pipefail
+          jumbo promote | sed -n '/^{/,$p' > "$JUMBO_OUT/promote.json"
+          cat "$JUMBO_OUT/promote.json"
+          {
+            echo "package=$(jq -r '.package' "$JUMBO_OUT/promote.json")"
+            echo "version=$(jq -r '.nextVersion' "$JUMBO_OUT/promote.json")"
+            echo "bump=$(jq -r '.bump' "$JUMBO_OUT/promote.json")"
+            echo "publish_required=$(jq -r '.publishRequired' "$JUMBO_OUT/promote.json")"
+            echo "ecosystem=$(jq -r '.ecosystem' "$JUMBO_OUT/promote.json")"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Record the release identity
+        id: identity
+        if: steps.dedup.outputs.duplicate != 'true'
+        run: |
+          set -euo pipefail
+          ecosystem="${{ inputs.ecosystem }}"
+          if [[ "$ecosystem" == "auto" ]]; then
+            ecosystem="${{ steps.promote.outputs.ecosystem }}"
+          fi
+          case "$ecosystem" in
+            python|npm) ;;
+            *) echo "unsupported ecosystem: ${ecosystem}" >&2; exit 1 ;;
+          esac
+          {
+            echo "ecosystem=${ecosystem}"
+            echo "package=${{ steps.promote.outputs.package }}"
+            echo "version=${{ steps.promote.outputs.version }}"
+            echo "bump=${{ steps.promote.outputs.bump }}"
+          } >> "$GITHUB_OUTPUT"
+
+      # 6. Publish on bump: build the artifacts at the jumbo-computed
+      #    version (the manifest's own version declares only the major;
+      #    minor/patch are pipeline-owned, so the version for this build is
+      #    set from the promotion decision before building).
+      - name: Build the artifacts at the jumbo-computed version
+        id: build
+        if: steps.promote.outputs.publish_required == 'true'
+        env:
+          JUMBO_VERSION: ${{ steps.promote.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          case "${{ steps.identity.outputs.ecosystem }}" in
+            python)
+              uv version "$JUMBO_VERSION"
+              uv build --out-dir dist
+              ;;
+            npm)
+              npm version "$JUMBO_VERSION" --no-git-tag-version --allow-same-version
+              npm pack --pack-destination dist
+              ;;
+            *) echo "unsupported ecosystem: ${{ steps.identity.outputs.ecosystem }}" >&2; exit 1 ;;
+          esac
+          ls -l dist
+
+      - name: Compute SHA-256 checksums of the artifacts
+        id: checksums
+        if: steps.promote.outputs.publish_required == 'true'
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum ./* > SHA256SUMS
+          cat SHA256SUMS
+          case "${{ steps.identity.outputs.ecosystem }}" in
+            python) primary="$(ls -1 ./*.whl | head -n 1)" ;;
+            npm)   primary="$(ls -1 ./*.tgz | head -n 1)" ;;
+          esac
+          primary="${primary#./}"
+          {
+            echo "asset-name=${primary}"
+            echo "asset-sha256=$(sha256sum "$primary" | cut -d' ' -f1)"
+          } >> "$GITHUB_OUTPUT"
+
+      # 7. The GitHub Release on the CALLER repository (the artifact
+      #    storage of the standard: language artifacts are release assets
+      #    on the package repository).
+      - name: Publish the GitHub Release on the caller repository
+        id: release
+        if: steps.promote.outputs.publish_required == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          JUMBO_PACKAGE: ${{ steps.identity.outputs.package }}
+          JUMBO_VERSION: ${{ steps.identity.outputs.version }}
+          JUMBO_BUMP: ${{ steps.identity.outputs.bump }}
+          JUMBO_COMMIT: ${{ steps.coords.outputs.commit }}
+        run: |
+          set -euo pipefail
+          : "${GH_TOKEN:?the caller GITHUB_TOKEN (contents: write) is required for the release}"
+          tag="v${JUMBO_VERSION}"
+          asset="${{ steps.checksums.outputs.asset-name }}"
+          notes="$(jq -n \
+            --arg package "$JUMBO_PACKAGE" \
+            --arg version "$JUMBO_VERSION" \
+            --arg bump "$JUMBO_BUMP" \
+            --arg commit "$JUMBO_COMMIT" \
+            --arg fingerprint "$(jq -r '.publish.fingerprint' "$JUMBO_OUT/promote.json")" \
+            --arg executor "$JUMBO_EXECUTOR" \
+            --arg run "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            '("jumbo release of **" + $package + "**\n\n- version: " + $version + " (bump: " + $bump + ")\n- commit: `" + $commit + "`\n- fingerprint: `" + $fingerprint + "`\n- executor: " + $executor + "\n- promoted by: " + $run + "\n\nChecksums in `SHA256SUMS`. The JumboIndex record for this build resolves dependencies and pins deployments.")')"
+          gh release create "$tag" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$JUMBO_COMMIT" \
+            --title "${JUMBO_PACKAGE} ${JUMBO_VERSION}" \
+            --notes "$notes"
+          {
+            echo "published=true"
+            echo "tag=${tag}"
+            echo "asset-url=https://github.com/${GITHUB_REPOSITORY}/releases/download/${tag}/${asset}"
+          } >> "$GITHUB_OUTPUT"
+
+      # 8. Append the index record per JumboIndex docs/APPEND-PROTOCOL.md:
+      #    serialized fast-forward append, fetch-and-retry on non-FF,
+      #    validator-gated, no history rewrites ever.
+      - name: Append the index record to JumboIndex
+        if: steps.release.outputs.published == 'true'
+        env:
+          JUMBO_INDEX_TOKEN: ${{ secrets.JUNTAI_INDEX_TOKEN }}
+        run: |
+          set -euo pipefail
+          build_id="${{ steps.identity.outputs.package }}-${{ steps.identity.outputs.version }}-gha${GITHUB_RUN_ID}"
+          jq \
+            --arg package "${{ steps.identity.outputs.package }}" \
+            --arg version "${{ steps.identity.outputs.version }}" \
+            --arg artifactUrl "${{ steps.release.outputs.asset-url }}" \
+            --arg artifactSha256 "${{ steps.checksums.outputs.asset-sha256 }}" \
+            --arg buildId "$build_id" \
+            --arg pipelineRun "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            --arg timestamp "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            '.publish as $p | {
+              package: $package,
+              major: $p.major,
+              version: $version,
+              commit: $p.commit,
+              fingerprint: $p.fingerprint,
+              canonicalExtract: $p.canonicalExtract,
+              artifactUrl: $artifactUrl,
+              artifactSha256: $artifactSha256,
+              imageDigest: null,
+              buildId: $buildId,
+              pipelineRun: $pipelineRun,
+              executor: "jumbo-publish-github-actions",
+              timestamp: $timestamp
+            }' "$JUMBO_OUT/promote.json" > "$JUMBO_OUT/record.json"
+          cat "$JUMBO_OUT/record.json"
+          python3 jumbobuild/scripts/jumbo_index_append.py \
+            --index-dir "$JUMBO_INDEX_PATH" \
+            --record-file "$JUMBO_OUT/record.json" \
+            --push \
+            --token-env JUMBO_INDEX_TOKEN
+
+      # 9. Opt-in public registry publication — public packages keep
+      #    serving external consumers, always driven by the jumbo-computed
+      #    version (set in the build step above). Credentials come only
+      #    from caller secrets; nothing is published when the gate is off.
+      - name: Publish to PyPI (opt-in)
+        if: inputs.publish-to-public-registry == true && steps.identity.outputs.ecosystem == 'python' && steps.promote.outputs.publish_required == 'true'
+        env:
+          UV_PUBLISH_TOKEN: ${{ secrets.PYPI_TOKEN }}
+        run: |
+          set -euo pipefail
+          : "${UV_PUBLISH_TOKEN:?secret PYPI_TOKEN is required when publish-to-public-registry is enabled}"
+          uv publish --dist-dir dist
+
+      - name: Set up node for the npm registry (opt-in)
+        if: inputs.publish-to-public-registry == true && steps.identity.outputs.ecosystem == 'npm' && steps.promote.outputs.publish_required == 'true'
+        uses: actions/setup-node@v5
+        with:
+          registry-url: https://registry.npmjs.org
+
+      - name: Publish to npm (opt-in)
+        if: inputs.publish-to-public-registry == true && steps.identity.outputs.ecosystem == 'npm' && steps.promote.outputs.publish_required == 'true'
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          : "${NODE_AUTH_TOKEN:?secret NPM_TOKEN is required when publish-to-public-registry is enabled}"
+          npm publish "dist/${{ steps.checksums.outputs.asset-name }}" --access public
+
+      - name: Release summary
+        if: always()
+        run: |
+          set -euo pipefail
+          {
+            echo "## jumbo publish"
+            echo
+            if [[ "${{ steps.dedup.outputs.duplicate }}" == "true" ]]; then
+              echo "- fingerprint hit: build skipped, recorded artifact reused (v${{ steps.dedup.outputs.reuse_version }})"
+            else
+              echo "- package: \`${{ steps.identity.outputs.package }}\`"
+              echo "- version: \`${{ steps.identity.outputs.version }}\` (bump: ${{ steps.identity.outputs.bump }})"
+              echo "- published: ${{ steps.release.outputs.published == 'true' }}"
+              echo "- public registry: ${{ inputs.publish-to-public-registry }}"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
