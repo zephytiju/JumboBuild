@@ -131,6 +131,42 @@ jumbo resolve --manifest pyproject.toml --check
 
 索引位置依次取：`--index <路径或URL>`、`JUMBO_INDEX_PATH`（本地克隆，推荐）、`JUMBO_INDEX_URL`、默认 JumboIndex 仓库（通过 `gh` 只读获取；仅接受 `https://github.com` URL）。没有索引记录的内部依赖会以**吸收错误**（absorption error）失败，错误会指明缺失的包与吸收步骤：其仓库必须先纳入 jumbo 流水线才能被消费。
 
+## 锁文件生成与指纹
+
+`jumbo lock` 为清单生成语言锁文件，并将内部依赖从索引注入：每个内部包物化为一个位于**稳定相对路径**（`deps/<包名 slug>/`）的最小源码工程，携带索引记录的名称与版本；清单被改写为指向注入源（Python：`name[extras]==<version>` 加 `[tool.uv.sources]` 路径条目；npm：`"file:deps/<slug>"`），随后由常规语言工具产出锁文件 —— `uv.lock` 用 `uv lock --upgrade`，`package-lock.json` 用 `npm install --package-lock-only --ignore-scripts`。第三方范围每次运行都重新解析。改写记录在 `deps/.jumbo-sources.json`，完全可逆且幂等：连续运行两次产物逐字节一致。
+
+```bash
+jumbo lock --manifest projects/consumer/pyproject.toml
+jumbo lock --manifest projects/console/package.json
+jumbo lock --manifest pyproject.toml --inject-only   # 只注入，不运行 uv/npm
+```
+
+`jumbo fingerprint` 计算构建输入指纹 **sha256(自身提交 + 生成锁文件的标准提取)**。绝不哈希锁文件原始字节：标准提取（canonical extract）是构建物化内容的有序、与工具无关视图，因此仅格式变化的锁文件改动（不同的 uv/npm 版本、键序、条目顺序）产生相同提取、不触发重建；任何真实的解析变化都会改变指纹。`--lock` 对既有锁文件做纯本地查询；不带该参数则先生成锁文件再计算指纹。
+
+```bash
+# 对既有锁文件的纯本地查询
+jumbo fingerprint --lock projects/consumer/uv.lock
+
+# 生成锁文件后计算指纹
+jumbo fingerprint --manifest projects/consumer/pyproject.toml
+```
+
+报告为 JSON：`commit`、`ecosystem`、`lock`、`canonicalExtract`（即索引记录存储的内容）与 `fingerprint`，并附工作区状态。标准提取格式为 `jumbo-canonical-extract/1`：
+
+```json
+{
+  "format": "jumbo-canonical-extract/1",
+  "entries": [
+    { "name": "demo-alpha", "version": "2.4.0", "source": "index", "digest": null, "path": "deps/demo-alpha" },
+    { "name": "numpy", "version": "1.26.4", "source": "pypi", "digest": "sha256:…", "path": null }
+  ]
+}
+```
+
+条目按 (name, version, source, digest, path) 排序并去重；`source` 为 `index`（jumbo 注入的内部包，以稳定的 `deps/<slug>` 坐标标识）、`pypi`/`npm`（带完整性摘要的第三方仓库条目）或 `path`（其他本地源）。自身工程被排除 —— 它由自身提交表示。指纹前置输入逐字节为 `<40 位十六进制提交>\n<标准 JSON>`（紧凑、结构体字段序）。
+
+**发布守卫：**只有流水线内干净提交上的构建才允许发布（promote）；脏工作区的本地构建绝不发布。`jumbo fingerprint --promote`（以及后续所有发布模式的操作）在工作区无法归因于 HEAD 提交时直接拒绝。jumbo 生成的产物豁免：`deps/` 下的全部内容、生成的锁文件、以及与 HEAD 的差异仅为 jumbo 记录注入改写的清单。被修改的源码文件或多余未跟踪文件会拒绝发布，并列出违规路径。
+
 ## Shell 自动补全
 
 安装脚本会为 zsh、Bash 或 fish 配置动态补全。也可以手动生成静态补全脚本：
