@@ -125,11 +125,8 @@ fn load_python_manifest(path: &Path) -> Result<Manifest, ResolverError> {
     }
 
     if let Some(groups) = doc.get("dependency-groups").and_then(|d| d.as_table()) {
-        for (group, list) in groups {
-            let list = list
-                .as_array()
-                .ok_or_else(|| type_error(path, &format!("[dependency-groups].{group}")))?;
-            for entry in list {
+        for group in groups.keys() {
+            for entry in expand_group(groups, group, &mut Vec::new(), path)? {
                 let req = entry
                     .as_str()
                     .ok_or_else(|| type_error(path, &format!("[dependency-groups].{group}")))?;
@@ -146,6 +143,59 @@ fn load_python_manifest(path: &Path) -> Result<Manifest, ResolverError> {
         ecosystem: Ecosystem::Python,
         declarations,
     })
+}
+
+/// Expand a PEP 735 dependency group into its entry list, resolving
+/// `{ include-group = "name" }` inline-table references recursively.
+///
+/// Included groups are substituted in place, so `[dependency-groups].dev`
+/// with `[{ include-group = "test" }, { include-group = "lint" }, "build>=1"]`
+/// yields test's and lint's entries followed by `build>=1` — the same
+/// materialization `uv` performs. Cycles are an error; an inline table that
+/// is not exactly one `include-group` string key is an error (PEP 735 allows
+/// no other keys).
+fn expand_group<'a>(
+    groups: &'a toml::map::Map<String, toml::Value>,
+    group: &str,
+    stack: &mut Vec<String>,
+    path: &Path,
+) -> Result<Vec<&'a toml::Value>, ResolverError> {
+    if stack.iter().any(|seen| seen == group) {
+        let chain = stack.join(" -> ");
+        return Err(ResolverError::InvalidManifest {
+            path: path.display().to_string(),
+            reason: format!(
+                "[dependency-groups].{group} participates in an include-group cycle ({chain} -> {group})"
+            ),
+        });
+    }
+    let list = groups
+        .get(group)
+        .and_then(|value| value.as_array())
+        .ok_or_else(|| type_error(path, &format!("[dependency-groups].{group}")))?;
+    let mut entries: Vec<&toml::Value> = Vec::new();
+    stack.push(group.to_string());
+    for entry in list {
+        if let Some(table) = entry.as_table() {
+            let included = match (table.len(), table.get("include-group")) {
+                (1, Some(value)) => value.as_str(),
+                _ => None,
+            };
+            let Some(included) = included else {
+                return Err(ResolverError::InvalidManifest {
+                    path: path.display().to_string(),
+                    reason: format!(
+                        "[dependency-groups].{group}: inline tables must be exactly `{{ include-group = \"name\" }}` (PEP 735)"
+                    ),
+                });
+            };
+            entries.extend(expand_group(groups, included, stack, path)?);
+        } else {
+            entries.push(entry);
+        }
+    }
+    stack.pop();
+    Ok(entries)
 }
 
 fn type_error(path: &Path, section: &str) -> ResolverError {
@@ -248,6 +298,115 @@ dev = ["pytest>=8"]
         assert_eq!(manifest.declarations[0].spec, Spec::Major(2));
         assert!(manifest.declarations[1].spec.major().is_none()); // third-party
         assert_eq!(manifest.declarations[2].spec.major(), Some(2));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+
+    #[test]
+    fn python_dependency_groups_expand_include_group() {
+        let dir = temp_dir("include-group");
+        let path = dir.join("pyproject.toml");
+        std::fs::write(
+            &path,
+            r#"
+[project]
+name = "consumer"
+dependencies = ["juntai-iam==2.*"]
+
+[dependency-groups]
+test = ["pytest>=8", "httpx>=0.28"]
+lint = ["ruff==0.15.2"]
+dev = [
+  { include-group = "test" },
+  { include-group = "lint" },
+  "build>=1.3.0",
+]
+"#,
+        )
+        .expect("write manifest");
+
+        let manifest = load_manifest(&path).expect("load with include-group");
+        // The loader reads every group; `dev`'s include-group entries are
+        // substituted in place, so the declaration SET is the union of every
+        // group's expanded entries (duplicates across groups are harmless:
+        // the same declaration parsed twice resolves identically).
+        let mut names: Vec<&str> = manifest
+            .declarations
+            .iter()
+            .map(|d| d.name.as_str())
+            .collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(
+            names,
+            vec!["build", "httpx", "juntai-iam", "pytest", "ruff"]
+        );
+        // And the raw (unsorted) declaration list contains every group's
+        // entries with dev fully expanded — 8 = 1 project + (2 test + 1 lint)
+        // + (2 test + 1 lint + 1 build via dev's expansion).
+        assert_eq!(manifest.declarations.len(), 8);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn python_dependency_groups_reject_cycles() {
+        let dir = temp_dir("cycle");
+        let path = dir.join("pyproject.toml");
+        std::fs::write(
+            &path,
+            r#"
+[dependency-groups]
+a = [{ include-group = "b" }]
+b = [{ include-group = "a" }]
+"#,
+        )
+        .expect("write manifest");
+        let err = load_manifest(&path).unwrap_err();
+        assert!(
+            err.to_string().contains("include-group cycle"),
+            "expected cycle error, got: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn python_dependency_groups_reject_foreign_inline_tables() {
+        let dir = temp_dir("foreign-inline");
+        let path = dir.join("pyproject.toml");
+        std::fs::write(
+            &path,
+            r#"
+[dependency-groups]
+dev = [{ include-group = "test", platform = "linux" }]
+test = ["pytest>=8"]
+"#,
+        )
+        .expect("write manifest");
+        let err = load_manifest(&path).unwrap_err();
+        assert!(
+            err.to_string().contains("inline tables must be exactly"),
+            "expected inline-table shape error, got: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn python_dependency_groups_reject_unknown_include_target() {
+        let dir = temp_dir("unknown-include");
+        let path = dir.join("pyproject.toml");
+        std::fs::write(
+            &path,
+            r#"
+[dependency-groups]
+dev = [{ include-group = "missing" }]
+"#,
+        )
+        .expect("write manifest");
+        let err = load_manifest(&path).unwrap_err();
+        assert!(
+            err.to_string().contains("[dependency-groups].missing"),
+            "expected missing-group error naming the target, got: {err}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
