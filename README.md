@@ -185,6 +185,17 @@ Entries are sorted by (name, version, source, digest, path) and deduplicated; `s
 
 **Promotion guard:** promotion happens only on clean commits inside a pipeline; local builds on dirty working trees never promote. `jumbo fingerprint --promote` (and any future promotion-mode operation) refuses unless the working tree is attributable to exactly the HEAD commit. Jumbo-generated output is exempt: everything under `deps/`, the generated lock files, and a manifest whose only difference from HEAD is jumbo's recorded injection rewrite. A modified source file or a stray untracked file refuses promotion with the offending paths listed.
 
+## Dependency materialization (dedup)
+
+`jumbo dedup` decides build-or-reuse against the index by input fingerprint and, with `--materialize` / `--deps`, pulls the recorded artifacts through the validated github.com-only fetch layer (exact URL, recorded SHA-256 enforced — never a registry protocol):
+
+- a **hit** pulls the matched record's own artifact into the project's `dist/` directory, so the repeated run consumes the recorded bytes with zero source rebuilds;
+- `--deps` replaces each internal dependency's `deps/<slug>/` source overlay with its recorded release asset — Python wheels as direct uv wheel sources, Node tarballs via `file:` sources.
+
+**Source fallback for dead artifacts:** on the dependency path, a record whose artifact cannot be used — the download answered a definitive 404/410 (the release asset no longer exists at the recorded URL, e.g. a deleted GitHub release asset), or the record has no `artifactSha256` (the bytes would be unverifiable) — falls back to source materialization instead of failing the build: the dependency keeps the `deps/<slug>/` source overlay at the recorded commit that `jumbo lock` materialized, exactly like a record that published no artifact. A stale previously pulled artifact for that dependency is removed, so the overlay is its single materialization. The decision is recorded in the dedup JSON: `dependencies.materialized` entries carry `"mode": "artifact"` or `"source"` plus, for source, the `reason`, and `dependencies.keptSourceOverlays` lists every dependency whose overlay stands.
+
+Transient failures (5xx, network errors) and integrity failures (digest mismatch, malformed digest) do **not** fall back — they abort the build so real outages and tampering stay visible. The own-record artifact (`--materialize` on a hit) and pinned reproduction never fall back either: a reuse or reproduction that cannot produce the recorded bytes is a failure, not a degradation.
+
 ## Deployment pinning
 
 Every promoted index record is the build record a deployment pins. `jumbo pin` resolves one record — by `--by-build-id`, by `--by-commit` (the newest record of that commit), or as `--latest-of-major` — and emits a `jumbo.deployment-pin/v1` manifest: `buildId` (recorded, or the documented `bootstrap-…` derivation for imported records), `commit`, `version`, the exact digest-pinned `imageRef` when the record published an image digest, the artifact URL + SHA-256, the fingerprint, and the record's index location. Bootstrap records with a null `buildId` get a deterministic derived id; a record without an `imageDigest` fails loudly under `--require-image` instead of pinning an imageless build.

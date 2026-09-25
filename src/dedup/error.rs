@@ -30,6 +30,15 @@ pub enum MaterializeError {
     ArtifactDownload { url: String, reason: String },
 
     #[error(
+        "artifact download failed for {url}: HTTP {status}: the recorded artifact no longer \
+         exists at this URL.\n  \
+         Only the dependency ingestion path may fall back to the source overlay on this error \
+         (a release asset that is definitively gone); everywhere else it aborts like any other \
+         download failure."
+    )]
+    ArtifactGone { url: String, status: u16 },
+
+    #[error(
         "unverifiable artifact for {package} {version} ({url}): the record has no \
          artifactSha256.\n  \
          Jumbo rule: never proceed on unverifiable bytes — a digest-less artifact is \

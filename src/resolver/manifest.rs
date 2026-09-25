@@ -301,7 +301,6 @@ dev = ["pytest>=8"]
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-
     #[test]
     fn python_dependency_groups_expand_include_group() {
         let dir = temp_dir("include-group");

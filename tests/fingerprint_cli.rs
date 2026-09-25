@@ -222,9 +222,9 @@ fn formatting_only_uv_lock_change_produces_no_fingerprint_change() {
     assert!(entries.iter().any(|e| e["name"] == "demo-alpha"
         && e["source"] == "index"
         && e["path"] == "deps/demo-alpha"));
-    assert!(entries.iter().any(|e| e["name"] == "numpy"
-        && e["source"] == "pypi"
-        && e["digest"] == "aaaa1111aaaa"));
+    assert!(entries
+        .iter()
+        .any(|e| e["name"] == "numpy" && e["source"] == "pypi" && e["digest"] == "aaaa1111aaaa"));
 
     // A real resolution change (numpy 1.26.4 → 1.27.0) DOES change the
     // fingerprint for the same commit.

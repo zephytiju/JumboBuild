@@ -157,6 +157,15 @@ The fingerprint engine (`src/fingerprint/`) implements the standard's duplicate-
 - The fingerprint preimage is byte-exact `<40-hex commit>\n<compact canonical JSON>`; changing it invalidates every recorded fingerprint.
 - Promotion mode (`--promote`) refuses dirty trees: only jumbo-generated output (under `deps/`, generated lock files, and the recorded manifest rewrite verified by un-injecting both sides against HEAD) is exempt; pure-local queries never inspect promotion state.
 
+### Dedup decision and materialization contract
+
+The dedup decision (`src/dedup/`) compares the input fingerprint against the index history of the same package name: a hit reuses the matched record's artifact, a miss builds from source. Materialization pulls release assets by exact URL through the github.com-only fetch layer (`src/dedup/fetch.rs`: https only, github.com plus GitHub's release-asset CDN hosts, redirects re-validated hop by hop, credentials from the environment or `gh` handed to curl via a mode-0600 config — never on the command line) and verifies the recorded SHA-256 before anything on disk is mutated: every artifact stages first, the manifest/overlay rewrite happens only afterwards.
+
+- The own-record artifact lands in `dist/`; dependency artifacts replace the J3 `deps/<slug>/` source overlays (wheels as direct uv sources, tarballs as `file:` sources) and are recorded in `deps/.jumbo-artifacts.json` (`jumbo-artifact-materialization/1`).
+- **Dependency source fallback**: a 404/410 download (`MaterializeError::ArtifactGone` — the recorded asset is definitively gone) or a null `artifactSha256` (bytes would be unverifiable) degrades that dependency to its source overlay — the J3 lock path at the recorded commit — instead of failing the build. Entries carry `mode` (`artifact`/`source`) and a `reason`; `keptSourceOverlays` reports every standing overlay; a previously pulled artifact for a fallen-back dependency is removed so the overlay is its single materialization.
+- 5xx and network errors, digest mismatches, malformed digests, and egress-policy violations abort (no fallback), and the own-record artifact plus pinned reproduction never fall back: a reuse or reproduction that cannot produce the recorded bytes is a failure.
+- Offline tests inject the transport: the fetch layer drives `curl` from `PATH`, so a PATH shim answering fixture statuses and bytes (200/404/410/500) exercises the whole classification with no network and no credentials — see `tests/dedup_cli.rs`.
+
 ### Failure behavior
 
 External commands run sequentially and stop the pipeline on the first non-zero exit status. A project pipeline exits the process after printing its final success or failure banner. Workspace operations return structured `anyhow::Result` errors to `main`.

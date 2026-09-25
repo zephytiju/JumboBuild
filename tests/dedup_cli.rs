@@ -983,3 +983,497 @@ fn dedup_argument_validation() {
     );
     let _ = (fs::remove_dir_all(&repo), fs::remove_dir_all(&anonymous));
 }
+
+// ---------------------------------------------------------------------------
+// Dependency source fallback (dead artifact URLs) — offline via a PATH
+// shim over `curl`, the transport the validated github.com-only fetch
+// layer drives. No network access, no credentials.
+// ---------------------------------------------------------------------------
+
+/// A PATH shim over `curl`: answers jumbo's artifact-download hops
+/// (`--url`, `--dump-header`, `--output`) from fixture data. The two
+/// `FAKE_CURL_OK_URL_*` slots answer 200 serving the bytes at
+/// `FAKE_CURL_OK_BODY_*`; every other URL answers `FAKE_CURL_STATUS`
+/// (404, 410, 500, ...). Never touches the network.
+fn write_curl_shim(root: &Path) -> PathBuf {
+    let shim_dir = root.join("curl-shim");
+    fs::create_dir_all(&shim_dir).expect("shim dir");
+    let script = shim_dir.join("curl");
+    fs::write(
+        &script,
+        r#"#!/bin/sh
+# jumbo offline test transport: answers jumbo's curl invocations from
+# fixture data; never touches the network.
+url=""
+headers=""
+output=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --url) url="$2"; shift 2 ;;
+    --dump-header) headers="$2"; shift 2 ;;
+    --output) output="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+respond () {
+  status="$1"
+  body_file="$2"
+  printf 'HTTP/1.1 %s x\r\ncontent-length: 0\r\n\r\n' "$status" > "$headers"
+  if [ -n "$body_file" ]; then
+    cat "$body_file" > "$output"
+  elif [ -n "$output" ]; then
+    : > "$output"
+  fi
+  echo "$status"
+  exit 0
+}
+if [ -n "$FAKE_CURL_OK_URL_A" ] && [ "$url" = "$FAKE_CURL_OK_URL_A" ]; then
+  respond 200 "$FAKE_CURL_OK_BODY_A"
+fi
+if [ -n "$FAKE_CURL_OK_URL_B" ] && [ "$url" = "$FAKE_CURL_OK_URL_B" ]; then
+  respond 200 "$FAKE_CURL_OK_BODY_B"
+fi
+respond "${FAKE_CURL_STATUS:-404}" ""
+"#,
+    )
+    .expect("write curl shim");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755));
+    }
+    shim_dir
+}
+
+/// Run the jumbo binary with the shim directory prepended to PATH (the
+/// injectable transport) plus extra environment variables.
+fn run_jumbo_with_transport(
+    args: &[&str],
+    cwd: &Path,
+    transport: &Path,
+    envs: &[(&str, Option<&str>)],
+) -> Output {
+    let mut cmd = Command::new(jumbo_bin());
+    cmd.args(args)
+        .current_dir(cwd)
+        .env_remove("JUMBO_INDEX_PATH")
+        .env_remove("JUMBO_INDEX_URL")
+        .env_remove("JUMBO_ARTIFACT_DIR")
+        .env_remove("GITHUB_TOKEN")
+        .env_remove("GH_TOKEN")
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                transport.display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        );
+    for (key, value) in envs {
+        match value {
+            Some(value) => {
+                cmd.env(key, value);
+            }
+            None => {
+                cmd.env_remove(key);
+            }
+        }
+    }
+    cmd.output().expect("run jumbo")
+}
+
+const DEMO_GAMMA_WHEEL_URL: &str =
+    "https://github.com/acme/demo-gamma/releases/download/v1.0.0/demo_gamma-1.0.0-py3-none-any.whl";
+const DEMO_GAMMA_WHEEL: &[u8] = b"demo-gamma 1.0.0 wheel bytes (fixture artifact)\n";
+const DEMO_GAMMA_WHEEL_SHA: &str =
+    "f996b9da3f648c52f96fca584e95b5ee8bfc75f9da6e4cffef4705f9fb8e7984";
+const DEMO_GAMMA_COMMIT: &str = "f00dcafe0123456789abcdef0123456789abcdef0";
+const DEMO_DELTA_WHEEL_URL: &str =
+    "https://github.com/acme/demo-delta/releases/download/v1.2.0/demo_delta-1.2.0-py3-none-any.whl";
+
+/// The consumer declares three internal dependencies: `demo-alpha` (live
+/// artifact), `demo-gamma` (artifact URL the transport answers
+/// 404/410 for), and `demo-delta` (artifact URL with a null sha256).
+const PYPROJECT_FALLBACK: &str = "[project]\nname = \"consumer\"\ndependencies = [\n    \"demo-alpha@2\",\n    \"demo-gamma@1\",\n    \"demo-delta@1\",\n    \"numpy>=1.26\",\n]\n";
+
+const UV_LOCK_FALLBACK: &str = r#"version = 1
+requires-python = ">=3.12"
+
+[[package]]
+name = "consumer"
+version = "0.1.0"
+source = { editable = "." }
+
+[[package]]
+name = "demo-alpha"
+version = "2.4.0"
+source = { directory = "deps/demo-alpha" }
+
+[[package]]
+name = "demo-gamma"
+version = "1.0.0"
+source = { directory = "deps/demo-gamma" }
+
+[[package]]
+name = "demo-delta"
+version = "1.2.0"
+source = { directory = "deps/demo-delta" }
+
+[[package]]
+name = "numpy"
+version = "1.26.4"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/numpy-1.26.4.tar.gz", hash = "sha256:aaaa1111aaaa", size = 1 }
+"#;
+
+/// An index where `demo-gamma`'s record carries a dead artifact URL (the
+/// transport answers 404/410) and `demo-delta`'s record has a URL but no
+/// `artifactSha256`.
+fn fallback_index(root: &Path) -> PathBuf {
+    let index_dir = root.join("index");
+    fs::create_dir_all(&index_dir).expect("index dir");
+    let write = |slug: &str, line: String| {
+        fs::write(index_dir.join(format!("{slug}.jsonl")), line + "\n").expect("write jsonl");
+    };
+    write(
+        "demo-alpha",
+        record_json(
+            "demo-alpha",
+            "2.4.0",
+            Some(&"e".repeat(64)),
+            Some(DEMO_ALPHA_WHEEL_URL),
+            Some(DEMO_ALPHA_WHEEL_SHA),
+        ),
+    );
+    write(
+        "demo-gamma",
+        serde_json::json!({
+            "package": "demo-gamma",
+            "major": 1,
+            "version": "1.0.0",
+            "commit": DEMO_GAMMA_COMMIT,
+            "fingerprint": Some("e".repeat(64)),
+            "canonicalExtract": null,
+            "artifactUrl": DEMO_GAMMA_WHEEL_URL,
+            "artifactSha256": DEMO_GAMMA_WHEEL_SHA,
+            "imageDigest": null,
+            "buildId": "demo-gamma-1.0.0-001",
+            "pipelineRun": Some("circleci/run-52"),
+            "executor": "circleci",
+            "timestamp": "2026-09-20T00:00:00Z",
+        })
+        .to_string(),
+    );
+    write(
+        "demo-delta",
+        serde_json::json!({
+            "package": "demo-delta",
+            "major": 1,
+            "version": "1.2.0",
+            "commit": "0123456789abcdef0123456789abcdef01234567",
+            "fingerprint": Some("e".repeat(64)),
+            "canonicalExtract": null,
+            "artifactUrl": DEMO_DELTA_WHEEL_URL,
+            "artifactSha256": null,
+            "imageDigest": null,
+            "buildId": "demo-delta-1.2.0-001",
+            "pipelineRun": Some("circleci/run-52"),
+            "executor": "circleci",
+            "timestamp": "2026-09-20T00:00:00Z",
+        })
+        .to_string(),
+    );
+    index_dir
+}
+
+/// A committed fixture project declaring all three fallback deps.
+fn fallback_project(tag: &str) -> PathBuf {
+    committed_repo(
+        tag,
+        &[
+            ("pyproject.toml", PYPROJECT_FALLBACK),
+            ("uv.lock", UV_LOCK_FALLBACK),
+        ],
+    )
+}
+
+#[test]
+fn dead_dependency_artifacts_fall_back_to_source_overlays() {
+    for gone_status in ["404", "410"] {
+        let root = temp_workspace("fallback");
+        let index_dir = fallback_index(&root);
+        let alpha_body = root.join("alpha.whl");
+        fs::write(&alpha_body, DEMO_ALPHA_WHEEL).expect("alpha bytes");
+        let alpha_body = alpha_body.display().to_string();
+        let shim = write_curl_shim(&root);
+        let project = fallback_project("fallback");
+        let index_arg = index_dir.display().to_string();
+
+        let out = run_jumbo_with_transport(
+            &[
+                "dedup",
+                "--manifest",
+                "pyproject.toml",
+                "--index",
+                &index_arg,
+                "--deps",
+            ],
+            &project,
+            &shim,
+            &[
+                ("FAKE_CURL_OK_URL_A", Some(DEMO_ALPHA_WHEEL_URL)),
+                ("FAKE_CURL_OK_BODY_A", Some(alpha_body.as_str())),
+                ("FAKE_CURL_OK_URL_B", None),
+                ("FAKE_CURL_STATUS", Some(gone_status)),
+            ],
+        );
+        assert!(
+            out.status.success(),
+            "HTTP {gone_status} must fall back, stderr: {}",
+            stderr_of(&out)
+        );
+        let json = stdout_json(&out);
+        let deps = &json["dependencies"];
+        let materialized = deps["materialized"].as_array().expect("materialized");
+        assert_eq!(materialized.len(), 3, "{materialized:?}");
+
+        let by_package = |name: &str| {
+            materialized
+                .iter()
+                .find(|m| m["package"] == name)
+                .unwrap_or_else(|| panic!("no entry for {name}: {materialized:?}"))
+                .clone()
+        };
+        // The live artifact materialized as an artifact.
+        let alpha = by_package("demo-alpha");
+        assert_eq!(alpha["mode"], "artifact");
+        assert_eq!(alpha["url"], DEMO_ALPHA_WHEEL_URL);
+        assert_eq!(alpha["sha256"], DEMO_ALPHA_WHEEL_SHA);
+        assert_eq!(
+            alpha["path"],
+            "deps/demo-alpha/demo_alpha-2.4.0-py3-none-any.whl"
+        );
+        // The dead artifact fell back to the source overlay at the
+        // recorded commit, with the reason recorded.
+        let gamma = by_package("demo-gamma");
+        assert_eq!(gamma["mode"], "source");
+        assert_eq!(gamma["url"], serde_json::Value::Null);
+        assert_eq!(gamma["sha256"], serde_json::Value::Null);
+        assert_eq!(gamma["path"], "deps/demo-gamma");
+        assert_eq!(gamma["commit"], DEMO_GAMMA_COMMIT);
+        let reason = gamma["reason"].as_str().expect("reason");
+        assert!(reason.contains(&format!("HTTP {gone_status}")), "{reason}");
+        assert!(reason.contains(DEMO_GAMMA_WHEEL_URL), "{reason}");
+        assert!(reason.contains("source overlay"), "{reason}");
+        // The digest-less record fell back too.
+        let delta = by_package("demo-delta");
+        assert_eq!(delta["mode"], "source");
+        assert!(delta["reason"].as_str().unwrap().contains("artifactSha256"));
+        // Both fallback deps report standing source overlays.
+        assert_eq!(
+            deps["keptSourceOverlays"],
+            serde_json::json!(["demo-delta", "demo-gamma"])
+        );
+
+        // On disk: the artifact replaced alpha's overlay; gamma and delta
+        // keep the J3 lock source overlays carrying the recorded commit.
+        assert!(project
+            .join("deps/demo-alpha/demo_alpha-2.4.0-py3-none-any.whl")
+            .is_file());
+        assert!(!project.join("deps/demo-alpha/pyproject.toml").exists());
+        for (name, version, commit) in [
+            ("demo-gamma", "1.0.0", DEMO_GAMMA_COMMIT),
+            (
+                "demo-delta",
+                "1.2.0",
+                "0123456789abcdef0123456789abcdef01234567",
+            ),
+        ] {
+            let overlay = fs::read_to_string(project.join(format!("deps/{name}/pyproject.toml")))
+                .expect("source overlay");
+            assert!(overlay.contains(&format!("name = \"{name}\"")), "{overlay}");
+            assert!(
+                overlay.contains(&format!("version = \"{version}\"")),
+                "{overlay}"
+            );
+            assert!(overlay.contains(commit), "commit provenance: {overlay}");
+        }
+
+        // The manifest: alpha points at the wheel; the fallbacks keep the
+        // lock injection's overlay-directory references.
+        let manifest = fs::read_to_string(project.join("pyproject.toml")).unwrap();
+        let doc: toml::Table = manifest.parse().expect("parse manifest");
+        assert_eq!(
+            doc["tool"]["uv"]["sources"]["demo-alpha"]["path"]
+                .as_str()
+                .unwrap(),
+            "deps/demo-alpha/demo_alpha-2.4.0-py3-none-any.whl"
+        );
+        assert_eq!(
+            doc["tool"]["uv"]["sources"]["demo-gamma"]["path"]
+                .as_str()
+                .unwrap(),
+            "deps/demo-gamma"
+        );
+        assert_eq!(
+            doc["tool"]["uv"]["sources"]["demo-delta"]["path"]
+                .as_str()
+                .unwrap(),
+            "deps/demo-delta"
+        );
+
+        // The marker records every decision with its mode.
+        let marker: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(project.join("deps/.jumbo-artifacts.json")).unwrap(),
+        )
+        .unwrap();
+        let gamma_entry = marker["artifacts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["package"] == "demo-gamma")
+            .expect("gamma marker entry");
+        assert_eq!(gamma_entry["mode"], "source");
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&project);
+    }
+}
+
+#[test]
+fn artifact_to_source_transition_removes_the_stale_artifact() {
+    let root = temp_workspace("transition");
+    let index_dir = fallback_index(&root);
+    let alpha_body = root.join("alpha.whl");
+    fs::write(&alpha_body, DEMO_ALPHA_WHEEL).expect("alpha bytes");
+    let alpha_body = alpha_body.display().to_string();
+    let gamma_body_path = root.join("gamma.whl");
+    fs::write(&gamma_body_path, DEMO_GAMMA_WHEEL).expect("gamma bytes");
+    let gamma_body = gamma_body_path.display().to_string();
+    let shim = write_curl_shim(&root);
+    let project = fallback_project("transition");
+    let index_arg = index_dir.display().to_string();
+    let run = |gamma_served: bool| {
+        let mut envs: Vec<(&str, Option<&str>)> = vec![
+            ("FAKE_CURL_OK_URL_A", Some(DEMO_ALPHA_WHEEL_URL)),
+            ("FAKE_CURL_OK_BODY_A", Some(alpha_body.as_str())),
+            ("FAKE_CURL_STATUS", Some("404")),
+        ];
+        if gamma_served {
+            envs.push(("FAKE_CURL_OK_URL_B", Some(DEMO_GAMMA_WHEEL_URL)));
+            envs.push(("FAKE_CURL_OK_BODY_B", Some(gamma_body.as_str())));
+        } else {
+            envs.push(("FAKE_CURL_OK_URL_B", None));
+        }
+        run_jumbo_with_transport(
+            &[
+                "dedup",
+                "--manifest",
+                "pyproject.toml",
+                "--index",
+                &index_arg,
+                "--deps",
+            ],
+            &project,
+            &shim,
+            &envs,
+        )
+    };
+
+    // Run 1: both artifacts live — gamma materializes as an artifact.
+    let out = run(true);
+    assert!(out.status.success(), "stderr: {}", stderr_of(&out));
+    let gamma_wheel = project.join("deps/demo-gamma/demo_gamma-1.0.0-py3-none-any.whl");
+    assert!(gamma_wheel.is_file());
+    assert!(!project.join("deps/demo-gamma/pyproject.toml").exists());
+
+    // Run 2: gamma's release asset is gone — the build must proceed on
+    // the source overlay, and the stale artifact must not linger.
+    let out = run(false);
+    assert!(out.status.success(), "stderr: {}", stderr_of(&out));
+    let json = stdout_json(&out);
+    let gamma = json["dependencies"]["materialized"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["package"] == "demo-gamma")
+        .unwrap()
+        .clone();
+    assert_eq!(gamma["mode"], "source");
+    assert!(gamma["reason"].as_str().unwrap().contains("HTTP 404"));
+    assert_eq!(
+        json["dependencies"]["keptSourceOverlays"],
+        serde_json::json!(["demo-delta", "demo-gamma"])
+    );
+    assert!(!gamma_wheel.exists(), "the stale artifact must be removed");
+    let overlay =
+        fs::read_to_string(project.join("deps/demo-gamma/pyproject.toml")).expect("overlay");
+    assert!(overlay.contains(DEMO_GAMMA_COMMIT), "{overlay}");
+    let doc: toml::Table = fs::read_to_string(project.join("pyproject.toml"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(
+        doc["tool"]["uv"]["sources"]["demo-gamma"]["path"]
+            .as_str()
+            .unwrap(),
+        "deps/demo-gamma"
+    );
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&project);
+}
+
+#[test]
+fn server_errors_do_not_fall_back() {
+    let root = temp_workspace("fivexx");
+    let index_dir = fallback_index(&root);
+    let shim = write_curl_shim(&root);
+    let project = fallback_project("fivexx");
+    let index_arg = index_dir.display().to_string();
+
+    let out = run_jumbo_with_transport(
+        &[
+            "dedup",
+            "--manifest",
+            "pyproject.toml",
+            "--index",
+            &index_arg,
+            "--deps",
+        ],
+        &project,
+        &shim,
+        &[
+            ("FAKE_CURL_OK_URL_A", None),
+            ("FAKE_CURL_OK_URL_B", None),
+            ("FAKE_CURL_STATUS", Some("500")),
+        ],
+    );
+    assert!(
+        !out.status.success(),
+        "a 5xx is a real outage and must abort, not fall back"
+    );
+    let stderr = stderr_of(&out);
+    assert!(stderr.contains("HTTP 500"), "stderr: {stderr}");
+    // Nothing was mutated by the materializer: the manifest keeps the
+    // lock injection's source-overlay reference, no artifact was placed,
+    // no marker was written.
+    let manifest = fs::read_to_string(project.join("pyproject.toml")).unwrap();
+    assert!(
+        !manifest.contains("demo_alpha-2.4.0-py3-none-any.whl"),
+        "manifest must not reference an artifact that could not be fetched: {manifest}"
+    );
+    let doc: toml::Table = manifest.parse().expect("parse manifest");
+    assert_eq!(
+        doc["tool"]["uv"]["sources"]["demo-alpha"]["path"]
+            .as_str()
+            .unwrap(),
+        "deps/demo-alpha",
+        "the source overlay reference must be untouched"
+    );
+    assert!(!project
+        .join("deps/demo-alpha/demo_alpha-2.4.0-py3-none-any.whl")
+        .exists());
+    assert!(!project.join("deps/.jumbo-artifacts.json").exists());
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&project);
+}

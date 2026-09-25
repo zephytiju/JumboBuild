@@ -18,11 +18,32 @@
 //!   standard build output location — so the repeated run consumes the
 //!   recorded bytes and performs zero source rebuilds.
 //!
-//! Unverifiable bytes never proceed: a missing or malformed
-//! `artifactSha256`, or any digest mismatch, aborts with a typed error
-//! before anything on disk is mutated. All artifacts of a run are fetched
-//! and verified first (staging), and the manifest/overlay rewrite happens
-//! only afterwards, so a failure leaves the tree in its prior state.
+//! Unverifiable bytes never proceed: a malformed `artifactSha256`, or any
+//! digest mismatch, aborts with a typed error before anything on disk is
+//! mutated. All artifacts of a run are fetched and verified first
+//! (staging), and the manifest/overlay rewrite happens only afterwards,
+//! so a failure leaves the tree in its prior state.
+//!
+//! # Dependency source fallback
+//!
+//! The dependency ingestion path (`materialize_dependency_artifacts`, the
+//! `--deps` half of `jumbo dedup --materialize`) degrades to **source
+//! materialization** instead of failing the build when a dependency's
+//! *recorded artifact cannot be used*: the download answered a definitive
+//! 404/410 (the release asset is gone — [`MaterializeError::ArtifactGone`]),
+//! or the record carries no `artifactSha256` (the bytes would be
+//! unverifiable). The dependency then keeps the J3 lock path — the
+//! `deps/<slug>/` source overlay at the recorded commit (name, version,
+//! and `record.commit` provenance) that the lock generation materialized —
+//! and downstream builds consume that coordinate identically to a
+//! null-artifact record.
+//!
+//! Transient failures (5xx, network errors, curl failures) and integrity
+//! failures (digest mismatch, malformed digest) **do not** fall back: they
+//! abort so real outages and tampering stay visible. The own-record
+//! artifact and pinned reproduction never fall back either — a reuse or
+//! reproduction that cannot produce the recorded bytes is a failure, not a
+//! degradation.
 
 use std::path::{Path, PathBuf};
 
@@ -70,7 +91,30 @@ impl ArtifactKind {
     }
 }
 
-/// One materialized (pulled, verified, ingested) artifact.
+/// How a dependency (or the own record) was materialized.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MaterializationMode {
+    /// The recorded release asset was pulled by exact URL and
+    /// sha256-verified.
+    Artifact,
+    /// The dependency's `deps/<slug>/` source overlay at the recorded
+    /// commit stands (the J3 lock path), because the recorded artifact
+    /// could not be used — see [`super::ingest`] for the fallback rules.
+    Source,
+}
+
+impl Default for MaterializationMode {
+    /// Markers written before the field existed only ever recorded pulled
+    /// artifacts.
+    fn default() -> Self {
+        Self::Artifact
+    }
+}
+
+/// One materialized dependency: either a pulled, verified, ingested
+/// artifact ([`MaterializationMode::Artifact`]) or a fallback to the
+/// dependency's source overlay ([`MaterializationMode::Source`]).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MaterializedArtifact {
@@ -83,19 +127,30 @@ pub struct MaterializedArtifact {
     /// Record buildId, when present.
     #[serde(default)]
     pub build_id: Option<String>,
-    /// Exact URL the artifact came from.
-    pub url: String,
-    /// Verified sha256 (64 hex).
-    pub sha256: String,
-    /// Stable relative path the artifact was ingested at
-    /// (`deps/<slug>/<file>` or `dist/<file>`).
+    /// How the dependency was materialized. Defaults to `artifact` when
+    /// deserializing markers written before the field existed.
+    #[serde(default)]
+    pub mode: MaterializationMode,
+    /// Why the source fallback was taken (`mode == "source"` only).
+    #[serde(default)]
+    pub reason: Option<String>,
+    /// Exact URL the artifact came from (null on the source fallback).
+    #[serde(default)]
+    pub url: Option<String>,
+    /// Verified sha256 (64 hex; null on the source fallback).
+    #[serde(default)]
+    pub sha256: Option<String>,
+    /// Stable relative path the dependency materialized at
+    /// (`deps/<slug>/<file>` for an artifact, `deps/<slug>` for a source
+    /// overlay, or `dist/<file>` for the own record).
     pub path: String,
     /// The source-overlay path this artifact replaced (`deps/<slug>`),
     /// when it replaced one.
     #[serde(default)]
     pub source_overlay_path: Option<String>,
     /// The manifest value written for this artifact (npm `file:` value or
-    /// the python `uv.sources` path).
+    /// the python `uv.sources` path). Null on the source fallback — the
+    /// lock generation's overlay reference stands untouched.
     #[serde(default)]
     pub rewritten: Option<String>,
 }
@@ -259,8 +314,10 @@ pub fn materialize_self_artifact(
         version: record.version.clone(),
         commit: record.commit.clone(),
         build_id: record.build_id.clone(),
-        url: url.url.clone(),
-        sha256,
+        mode: MaterializationMode::Artifact,
+        reason: None,
+        url: Some(url.url.clone()),
+        sha256: Some(sha256),
         path: format!("{}/{}", dist_dir, url.file_name),
         source_overlay_path: None,
         rewritten: None,
@@ -293,6 +350,34 @@ pub fn load_artifacts_marker(
     Ok(Some(marker))
 }
 
+/// Whether a dependency-artifact staging failure is a definitive "the
+/// recorded artifact cannot be used" — the signal to fall back to the
+/// dependency's source overlay instead of failing the build — and the
+/// human-readable reason to record for it.
+///
+/// Falls back only on:
+/// - [`MaterializeError::ArtifactGone`] (the download answered 404/410:
+///   the release asset no longer exists at the recorded URL);
+/// - [`MaterializeError::MissingSha256`] (the record carries no digest,
+///   so the artifact bytes would be unverifiable).
+///
+/// Everything else — 5xx and network errors, digest mismatches, malformed
+/// digests, disallowed or unsupported artifact URLs — returns `None` and
+/// must abort: real outages and integrity violations have to stay visible.
+pub fn source_fallback_reason(err: &MaterializeError) -> Option<String> {
+    match err {
+        MaterializeError::ArtifactGone { url, status } => Some(format!(
+            "artifact download for {url} answered HTTP {status}: the recorded artifact no longer \
+             exists at this URL; the source overlay at the recorded commit is used instead"
+        )),
+        MaterializeError::MissingSha256 { package, .. } => Some(format!(
+            "the record for {package} has no artifactSha256: the artifact bytes would be \
+             unverifiable; the source overlay at the recorded commit is used instead"
+        )),
+        _ => None,
+    }
+}
+
 /// Ingest the recorded artifacts of a manifest's internal dependencies,
 /// replacing each dependency's source overlay with the pulled artifact.
 ///
@@ -301,6 +386,15 @@ pub fn load_artifacts_marker(
 /// source overlays (reported as `skipped`). The rewrite reuses J3's
 /// `deps/<slug>` convention: the artifact lands at `deps/<slug>/<file>`
 /// and the manifest reference for that dependency points at the artifact.
+///
+/// A dependency whose recorded artifact **cannot be used** — the download
+/// answered a definitive 404/410, or the record has no `artifactSha256`
+/// (see [`source_fallback_reason`]) — falls back to source materialization
+/// exactly like a null-artifact record: the `deps/<slug>/` source overlay
+/// at the recorded commit (written by the lock generation that precedes
+/// `--deps` materialization) stands, the manifest keeps pointing at it,
+/// and the returned entry carries `mode: "source"` plus the reason.
+/// Transient and integrity failures still abort with nothing mutated.
 pub fn materialize_dependency_artifacts(
     manifest: &Path,
     resolution: &[ResolvedDependency],
@@ -316,18 +410,33 @@ pub fn materialize_dependency_artifacts(
 
     // Phase 1: stage and verify every candidate. Nothing is mutated on
     // failure, so an unverifiable artifact aborts the whole run with the
-    // tree untouched.
+    // tree untouched. Definitive absence degrades to the source overlay.
     let mut candidates: Vec<(&ResolvedDependency, ArtifactUrl, String, PathBuf)> = Vec::new();
+    let mut fallbacks: Vec<(&ResolvedDependency, String)> = Vec::new();
     let mut skipped: Vec<&ResolvedDependency> = Vec::new();
     for dep in resolution {
         if dep.record.artifact_url.is_none() {
             skipped.push(dep);
             continue;
         }
-        let (url, sha256, staged) = stage_and_verify(&dep.record, provider, staging_dir)?;
-        ArtifactKind::of(&url, ecosystem)?;
-        candidates.push((dep, url, sha256, staged));
+        match stage_and_verify(&dep.record, provider, staging_dir) {
+            Ok((url, sha256, staged)) => {
+                ArtifactKind::of(&url, ecosystem)?;
+                candidates.push((dep, url, sha256, staged));
+            }
+            Err(err) => match source_fallback_reason(&err) {
+                Some(reason) => fallbacks.push((dep, reason)),
+                None => return Err(err),
+            },
+        }
     }
+
+    // The previous materialization marker drives the fallback cleanup:
+    // a dependency that switches from a pulled artifact to its source
+    // overlay must not leave the stale artifact file behind.
+    let previous: Vec<MaterializedArtifact> = load_artifacts_marker(&project_dir)
+        .map(|m| m.map(|m| m.artifacts).unwrap_or_default())
+        .unwrap_or_default();
 
     // Phase 2: ingest — replace each source overlay with its artifact and
     // rewrite the manifest reference.
@@ -367,19 +476,52 @@ pub fn materialize_dependency_artifacts(
             version: dep.record.version.clone(),
             commit: dep.record.commit.clone(),
             build_id: dep.record.build_id.clone(),
-            url: url.url.clone(),
-            sha256,
+            mode: MaterializationMode::Artifact,
+            reason: None,
+            url: Some(url.url.clone()),
+            sha256: Some(sha256),
             path: relative,
             source_overlay_path: Some(format!("{INJECTED_DIR}/{slug}")),
             rewritten: Some(rewritten),
         });
     }
 
+    // Phase 2b: source fallback — the `deps/<slug>/` source overlay the
+    // lock generation wrote stands as this dependency's materialization.
+    // A previously pulled artifact for the same package is removed (the
+    // marker below replaces its entry), and the manifest reference the
+    // lock generation wrote (`deps/<slug>` / `file:deps/<slug>`) is left
+    // exactly as `jumbo lock` produces it.
+    for (dep, reason) in fallbacks {
+        let slug = crate::resolver::index::package_slug(&dep.name);
+        let overlay = format!("{INJECTED_DIR}/{slug}");
+        for prior in previous.iter().filter(|a| a.package == dep.name) {
+            if prior.mode == MaterializationMode::Artifact {
+                let stale = project_dir.join(&prior.path);
+                // Best-effort: the manifest already points at the overlay
+                // directory, so a leftover file is inert even if it cannot
+                // be removed.
+                let _ = std::fs::remove_file(&stale);
+            }
+        }
+        materialized.push(MaterializedArtifact {
+            package: dep.name.clone(),
+            version: dep.record.version.clone(),
+            commit: dep.record.commit.clone(),
+            build_id: dep.record.build_id.clone(),
+            mode: MaterializationMode::Source,
+            reason: Some(reason),
+            url: None,
+            sha256: None,
+            path: overlay.clone(),
+            source_overlay_path: Some(overlay),
+            rewritten: None,
+        });
+    }
+
     // Preserve the skipped-dependency overlays in the marker so the next
     // run (and humans) can see the full picture.
-    let mut artifacts = load_artifacts_marker(&project_dir)
-        .map(|m| m.map(|m| m.artifacts).unwrap_or_default())
-        .unwrap_or_default();
+    let mut artifacts = previous;
     artifacts.retain(|a| !materialized.iter().any(|m| m.package == a.package));
     artifacts.extend(materialized.iter().cloned());
     artifacts.sort_by(|a, b| a.path.cmp(&b.path));
@@ -635,6 +777,125 @@ mod tests {
         .unwrap_err();
         assert!(err.to_string().contains("no artifactUrl"), "got: {err}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn only_definitive_absence_falls_back_to_source() {
+        use super::MaterializeError as E;
+        // 404 and 410: the recorded asset is gone -> source fallback.
+        for status in [404u16, 410] {
+            let reason = source_fallback_reason(&E::ArtifactGone {
+                url: URL.to_string(),
+                status,
+            })
+            .unwrap_or_else(|| panic!("HTTP {status} must fall back"));
+            assert!(reason.contains(&format!("HTTP {status}")), "{reason}");
+            assert!(reason.contains("no longer exists at this URL"), "{reason}");
+            assert!(reason.contains("source overlay"), "{reason}");
+        }
+        // A record without a digest cannot be verified -> source fallback.
+        let reason = source_fallback_reason(&E::MissingSha256 {
+            package: "demo-alpha".into(),
+            version: "2.4.0".into(),
+            url: URL.into(),
+        })
+        .expect("null artifactSha256 must fall back");
+        assert!(reason.contains("no artifactSha256"), "{reason}");
+        assert!(reason.contains("unverifiable"), "{reason}");
+
+        // Everything else aborts: 5xx, network errors, auth, digest
+        // mismatches, malformed digests, egress-policy violations.
+        for no_fallback in [
+            E::ArtifactDownload {
+                url: URL.into(),
+                reason: "HTTP 500".into(),
+            },
+            E::ArtifactDownload {
+                url: URL.into(),
+                reason: "failed to run curl".into(),
+            },
+            E::ArtifactDownload {
+                url: URL.into(),
+                reason: "HTTP 403: authentication required or insufficient".into(),
+            },
+            E::DigestMismatch {
+                url: URL.into(),
+                expected: "0".repeat(64),
+                actual: "1".repeat(64),
+            },
+            E::InvalidSha256 {
+                package: "demo-alpha".into(),
+                url: URL.into(),
+                expected: "zz".into(),
+            },
+            E::UnsupportedArtifactUrl {
+                url: URL.into(),
+                reason: "host is not github.com".into(),
+            },
+            E::NoArtifact {
+                package: "demo-alpha".into(),
+                version: "2.4.0".into(),
+            },
+        ] {
+            assert!(
+                source_fallback_reason(&no_fallback).is_none(),
+                "must abort, not fall back: {no_fallback}"
+            );
+        }
+    }
+
+    #[test]
+    fn artifact_gone_reports_the_live_404_wording() {
+        let err = MaterializeError::ArtifactGone {
+            url: URL.to_string(),
+            status: 404,
+        };
+        assert!(
+            err.to_string()
+                .contains("HTTP 404: the recorded artifact no longer exists at this URL"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn pre_fallback_markers_deserialize_as_artifact_mode() {
+        // A marker written before the `mode` field existed (a pulled
+        // artifact) must round-trip as an artifact-mode entry.
+        let legacy = r#"{
+  "format": "jumbo-artifact-materialization/1",
+  "artifacts": [
+    {
+      "package": "demo-alpha",
+      "version": "2.4.0",
+      "commit": "0123456789abcdef0123456789abcdef01234567",
+      "buildId": "demo-2.4.0-001",
+      "url": "https://github.com/acme/pkg/releases/download/v2.4.0/demo_alpha-2.4.0-py3-none-any.whl",
+      "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "path": "deps/demo-alpha/demo_alpha-2.4.0-py3-none-any.whl",
+      "sourceOverlayPath": "deps/demo-alpha",
+      "rewritten": "deps/demo-alpha/demo_alpha-2.4.0-py3-none-any.whl"
+    }
+  ]
+}"#;
+        let marker: ArtifactsMarker = serde_json::from_str(legacy).expect("parse legacy marker");
+        assert_eq!(marker.artifacts.len(), 1);
+        assert_eq!(marker.artifacts[0].mode, MaterializationMode::Artifact);
+        assert_eq!(marker.artifacts[0].reason, None);
+        assert_eq!(
+            marker.artifacts[0].url.as_deref(),
+            Some("https://github.com/acme/pkg/releases/download/v2.4.0/demo_alpha-2.4.0-py3-none-any.whl")
+        );
+        // Source-mode entries serialize with null url/sha256 and a reason.
+        let mut source_entry = marker.artifacts[0].clone();
+        source_entry.mode = MaterializationMode::Source;
+        source_entry.reason = Some("artifact download answered HTTP 404".into());
+        source_entry.url = None;
+        source_entry.sha256 = None;
+        let value = serde_json::to_value(&source_entry).expect("serialize");
+        assert_eq!(value["mode"], "source");
+        assert_eq!(value["url"], serde_json::Value::Null);
+        assert_eq!(value["sha256"], serde_json::Value::Null);
+        assert!(value["reason"].as_str().unwrap().contains("404"));
     }
 
     #[test]
