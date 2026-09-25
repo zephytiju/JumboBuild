@@ -68,6 +68,7 @@ fn run_jumbo(args: &[&str], cwd: &Path) -> Output {
         .env_remove("JUMBO_INDEX_PATH")
         .env_remove("JUMBO_INDEX_URL")
         .env_remove("JUMBO_ARTIFACT_DIR")
+        .env_remove("JUMBO_REPO_MAP")
         .env_remove("GITHUB_TOKEN")
         .env_remove("GH_TOKEN")
         .output()
@@ -582,6 +583,19 @@ fn python_dependency_artifact_replaces_the_source_overlay() {
         DEMO_ALPHA_WHEEL,
     )
     .expect("wheel fixture");
+    // demo-beta published no artifact: the fallback fetches its real tree
+    // (repo-mapped) from the cache, keyed by the record's commit.
+    write_tarball_fixture(
+        &cache.join("0123456789abcdef0123456789abcdef01234567"),
+        "demo-beta-01234567",
+        &real_python_project("demo-beta", "1.4.2"),
+    );
+    let repo_map = root.join("repo-map.json");
+    fs::write(
+        &repo_map,
+        "{\n  \"demo-beta\": \"https://github.com/acme/demo-beta\"\n}\n",
+    )
+    .expect("write repo map");
     let project = committed_repo(
         "pydeps",
         &[
@@ -601,6 +615,8 @@ fn python_dependency_artifact_replaces_the_source_overlay() {
                 "--deps",
                 "--artifact-dir",
                 &cache.display().to_string(),
+                "--repo-map",
+                &repo_map.display().to_string(),
             ],
             &project,
         )
@@ -610,14 +626,16 @@ fn python_dependency_artifact_replaces_the_source_overlay() {
     let json = stdout_json(&out);
     let deps = &json["dependencies"];
     let materialized = deps["materialized"].as_array().expect("materialized");
-    assert_eq!(materialized.len(), 1);
+    assert_eq!(materialized.len(), 2, "{materialized:?}");
     assert_eq!(materialized[0]["package"], "demo-alpha");
     assert_eq!(
         materialized[0]["path"],
         "deps/demo-alpha/demo_alpha-2.4.0-py3-none-any.whl"
     );
     assert_eq!(materialized[0]["sha256"], DEMO_ALPHA_WHEEL_SHA);
-    // demo-beta published no artifact: its source overlay is kept.
+    // demo-beta published no artifact: its real source materialized.
+    assert_eq!(materialized[1]["package"], "demo-beta");
+    assert_eq!(materialized[1]["mode"], "source");
     assert_eq!(deps["keptSourceOverlays"], serde_json::json!(["demo-beta"]));
 
     // The wheel replaced the synthetic source-overlay project, at J3's
@@ -625,7 +643,13 @@ fn python_dependency_artifact_replaces_the_source_overlay() {
     let wheel = project.join("deps/demo-alpha/demo_alpha-2.4.0-py3-none-any.whl");
     assert_eq!(fs::read(&wheel).expect("wheel"), DEMO_ALPHA_WHEEL);
     assert!(!project.join("deps/demo-alpha/pyproject.toml").exists());
-    assert!(project.join("deps/demo-beta/pyproject.toml").exists());
+    let beta_manifest =
+        fs::read_to_string(project.join("deps/demo-beta/pyproject.toml")).expect("real source");
+    assert!(
+        beta_manifest.contains("name = \"demo-beta\""),
+        "{beta_manifest}"
+    );
+    assert!(!beta_manifest.contains("jumbo-injected internal source"));
     let manifest = fs::read_to_string(project.join("pyproject.toml")).unwrap();
     let doc: toml::Table = manifest.parse().expect("parse manifest");
     assert_eq!(
@@ -643,13 +667,19 @@ fn python_dependency_artifact_replaces_the_source_overlay() {
     assert!(dep_strings.contains(&"demo-alpha==2.4.0".to_string()));
     assert!(dep_strings.contains(&"demo-beta==1.0.0".to_string()));
 
-    // The materialization marker records the pull.
+    // The materialization marker records both decisions.
     let marker: serde_json::Value = serde_json::from_str(
         &fs::read_to_string(project.join("deps/.jumbo-artifacts.json")).unwrap(),
     )
     .unwrap();
     assert_eq!(marker["format"], "jumbo-artifact-materialization/1");
     assert_eq!(marker["artifacts"][0]["package"], "demo-alpha");
+    assert_eq!(marker["artifacts"][1]["package"], "demo-beta");
+    assert_eq!(marker["artifacts"][1]["mode"], "source");
+    assert_eq!(
+        marker["artifacts"][1]["url"],
+        "https://codeload.github.com/acme/demo-beta/tar.gz/0123456789abcdef0123456789abcdef01234567"
+    );
 
     // Idempotent: a second run produces the same manifest bytes.
     let once = manifest;
@@ -991,10 +1021,10 @@ fn dedup_argument_validation() {
 // ---------------------------------------------------------------------------
 
 /// A PATH shim over `curl`: answers jumbo's artifact-download hops
-/// (`--url`, `--dump-header`, `--output`) from fixture data. The two
-/// `FAKE_CURL_OK_URL_*` slots answer 200 serving the bytes at
-/// `FAKE_CURL_OK_BODY_*`; every other URL answers `FAKE_CURL_STATUS`
-/// (404, 410, 500, ...). Never touches the network.
+/// (`--url`, `--dump-header`, `--output`) from fixture data. The four
+/// `FAKE_CURL_OK_URL_<SLOT>` slots (A–D) answer 200 serving the bytes at
+/// the matching `FAKE_CURL_OK_BODY_<SLOT>`; every other URL answers
+/// `FAKE_CURL_STATUS` (404, 410, 500, ...). Never touches the network.
 fn write_curl_shim(root: &Path) -> PathBuf {
     let shim_dir = root.join("curl-shim");
     fs::create_dir_all(&shim_dir).expect("shim dir");
@@ -1027,11 +1057,15 @@ respond () {
   echo "$status"
   exit 0
 }
-if [ -n "$FAKE_CURL_OK_URL_A" ] && [ "$url" = "$FAKE_CURL_OK_URL_A" ]; then
-  respond 200 "$FAKE_CURL_OK_BODY_A"
-fi
-if [ -n "$FAKE_CURL_OK_URL_B" ] && [ "$url" = "$FAKE_CURL_OK_URL_B" ]; then
-  respond 200 "$FAKE_CURL_OK_BODY_B"
+for slot in A B C D; do
+  eval "ok_url=\$FAKE_CURL_OK_URL_$slot"
+  eval "ok_body=\$FAKE_CURL_OK_BODY_$slot"
+  if [ -n "$ok_url" ] && [ "$url" = "$ok_url" ]; then
+    respond 200 "$ok_body"
+  fi
+done
+if [ -n "$FAKE_CURL_STATUS_URL" ] && [ "$url" = "$FAKE_CURL_STATUS_URL" ]; then
+  respond "${FAKE_CURL_STATUS_CODE:-404}" ""
 fi
 respond "${FAKE_CURL_STATUS:-404}" ""
 "#,
@@ -1059,6 +1093,7 @@ fn run_jumbo_with_transport(
         .env_remove("JUMBO_INDEX_PATH")
         .env_remove("JUMBO_INDEX_URL")
         .env_remove("JUMBO_ARTIFACT_DIR")
+        .env_remove("JUMBO_REPO_MAP")
         .env_remove("GITHUB_TOKEN")
         .env_remove("GH_TOKEN")
         .env(
@@ -1082,14 +1117,62 @@ fn run_jumbo_with_transport(
     cmd.output().expect("run jumbo")
 }
 
+/// Build a gzipped tarball fixture shaped like a codeload GitHub tarball:
+/// one leading `<root>/` directory wrapping the given files. The same
+/// codecs the unpack path uses, so the fixture is representative.
+fn write_tarball_fixture(path: &Path, root: &str, files: &[(String, String)]) {
+    let file = fs::File::create(path).expect("create tarball fixture");
+    let enc = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+    let mut builder = tar::Builder::new(enc);
+    for (name, content) in files {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(content.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, format!("{root}/{name}"), content.as_bytes())
+            .unwrap_or_else(|e| panic!("append {name}: {e}"));
+    }
+    builder
+        .into_inner()
+        .expect("finish tar")
+        .finish()
+        .expect("flush gz");
+}
+
+/// A real (buildable) python project fixture for a package, deliberately
+/// at a version that differs from the index record's — the record's
+/// version semantics hold, the tree's own version stands.
+fn real_python_project(package: &str, version: &str) -> Vec<(String, String)> {
+    let module: String = package.replace(['-', '_', '.'], "");
+    vec![
+        (
+            "pyproject.toml".to_string(),
+            format!(
+                "[build-system]\nrequires = [\"hatchling\"]\nbuild-backend = \"hatchling.build\"\n\n[project]\nname = \"{package}\"\nversion = \"{version}\"\n",
+            ),
+        ),
+        (
+            format!("src/{module}/__init__.py"),
+            format!("\"\"\"{package} — real repository source.\"\"\"\n__version__ = \"{version}\"\n"),
+        ),
+    ]
+}
+
 const DEMO_GAMMA_WHEEL_URL: &str =
     "https://github.com/acme/demo-gamma/releases/download/v1.0.0/demo_gamma-1.0.0-py3-none-any.whl";
 const DEMO_GAMMA_WHEEL: &[u8] = b"demo-gamma 1.0.0 wheel bytes (fixture artifact)\n";
 const DEMO_GAMMA_WHEEL_SHA: &str =
     "f996b9da3f648c52f96fca584e95b5ee8bfc75f9da6e4cffef4705f9fb8e7984";
-const DEMO_GAMMA_COMMIT: &str = "f00dcafe0123456789abcdef0123456789abcdef0";
+const DEMO_GAMMA_COMMIT: &str = "f00dcafe0123456789abcdef0123456789abcdef";
+/// The codeload tarball URL of demo-gamma's real repository tree at the
+/// recorded commit — the coordinate parsed from its (dead) artifactUrl.
+const DEMO_GAMMA_CODELOAD_URL: &str =
+    "https://codeload.github.com/acme/demo-gamma/tar.gz/f00dcafe0123456789abcdef0123456789abcdef";
 const DEMO_DELTA_WHEEL_URL: &str =
     "https://github.com/acme/demo-delta/releases/download/v1.2.0/demo_delta-1.2.0-py3-none-any.whl";
+const DEMO_DELTA_CODELOAD_URL: &str =
+    "https://codeload.github.com/acme/demo-delta/tar.gz/0123456789abcdef0123456789abcdef01234567";
 
 /// The consumer declares three internal dependencies: `demo-alpha` (live
 /// artifact), `demo-gamma` (artifact URL the transport answers
@@ -1198,13 +1281,32 @@ fn fallback_project(tag: &str) -> PathBuf {
 }
 
 #[test]
-fn dead_dependency_artifacts_fall_back_to_source_overlays() {
+fn dead_dependency_artifacts_fall_back_to_real_source() {
     for gone_status in ["404", "410"] {
         let root = temp_workspace("fallback");
         let index_dir = fallback_index(&root);
         let alpha_body = root.join("alpha.whl");
         fs::write(&alpha_body, DEMO_ALPHA_WHEEL).expect("alpha bytes");
         let alpha_body = alpha_body.display().to_string();
+        // Codeload tarball fixtures: demo-gamma's real tree at the recorded
+        // commit (version 1.0.1 — the record's version semantics hold, the
+        // tree's own version stands) and demo-delta's (version 2.0.0).
+        let gamma_tarball = root.join("demo-gamma-tree.tar.gz");
+        write_tarball_fixture(
+            &gamma_tarball,
+            "demo-gamma-f00dcafe",
+            &real_python_project("demo-gamma", "1.0.1"),
+        );
+        let delta_tarball = root.join("demo-delta-tree.tar.gz");
+        write_tarball_fixture(
+            &delta_tarball,
+            "demo-delta-01234567",
+            &real_python_project("demo-delta", "2.0.0"),
+        );
+        let (gamma_tarball, delta_tarball) = (
+            gamma_tarball.display().to_string(),
+            delta_tarball.display().to_string(),
+        );
         let shim = write_curl_shim(&root);
         let project = fallback_project("fallback");
         let index_arg = index_dir.display().to_string();
@@ -1223,7 +1325,10 @@ fn dead_dependency_artifacts_fall_back_to_source_overlays() {
             &[
                 ("FAKE_CURL_OK_URL_A", Some(DEMO_ALPHA_WHEEL_URL)),
                 ("FAKE_CURL_OK_BODY_A", Some(alpha_body.as_str())),
-                ("FAKE_CURL_OK_URL_B", None),
+                ("FAKE_CURL_OK_URL_B", Some(DEMO_GAMMA_CODELOAD_URL)),
+                ("FAKE_CURL_OK_BODY_B", Some(gamma_tarball.as_str())),
+                ("FAKE_CURL_OK_URL_C", Some(DEMO_DELTA_CODELOAD_URL)),
+                ("FAKE_CURL_OK_BODY_C", Some(delta_tarball.as_str())),
                 ("FAKE_CURL_STATUS", Some(gone_status)),
             ],
         );
@@ -1253,54 +1358,66 @@ fn dead_dependency_artifacts_fall_back_to_source_overlays() {
             alpha["path"],
             "deps/demo-alpha/demo_alpha-2.4.0-py3-none-any.whl"
         );
-        // The dead artifact fell back to the source overlay at the
-        // recorded commit, with the reason recorded.
+        // The dead artifact fell back to the real repository source at the
+        // recorded commit, with the reason and the tarball provenance URL.
         let gamma = by_package("demo-gamma");
         assert_eq!(gamma["mode"], "source");
-        assert_eq!(gamma["url"], serde_json::Value::Null);
+        assert_eq!(gamma["url"], DEMO_GAMMA_CODELOAD_URL);
         assert_eq!(gamma["sha256"], serde_json::Value::Null);
         assert_eq!(gamma["path"], "deps/demo-gamma");
         assert_eq!(gamma["commit"], DEMO_GAMMA_COMMIT);
         let reason = gamma["reason"].as_str().expect("reason");
         assert!(reason.contains(&format!("HTTP {gone_status}")), "{reason}");
         assert!(reason.contains(DEMO_GAMMA_WHEEL_URL), "{reason}");
-        assert!(reason.contains("source overlay"), "{reason}");
+        assert!(reason.contains("real repository source"), "{reason}");
         // The digest-less record fell back too.
         let delta = by_package("demo-delta");
         assert_eq!(delta["mode"], "source");
+        assert_eq!(delta["url"], DEMO_DELTA_CODELOAD_URL);
         assert!(delta["reason"].as_str().unwrap().contains("artifactSha256"));
-        // Both fallback deps report standing source overlays.
+        // Both fallback deps report standing source materializations.
         assert_eq!(
             deps["keptSourceOverlays"],
             serde_json::json!(["demo-delta", "demo-gamma"])
         );
 
         // On disk: the artifact replaced alpha's overlay; gamma and delta
-        // keep the J3 lock source overlays carrying the recorded commit.
+        // hold the REAL repository trees — the minimal lock stubs (which
+        // are never buildable) were replaced.
         assert!(project
             .join("deps/demo-alpha/demo_alpha-2.4.0-py3-none-any.whl")
             .is_file());
         assert!(!project.join("deps/demo-alpha/pyproject.toml").exists());
-        for (name, version, commit) in [
-            ("demo-gamma", "1.0.0", DEMO_GAMMA_COMMIT),
-            (
-                "demo-delta",
-                "1.2.0",
-                "0123456789abcdef0123456789abcdef01234567",
-            ),
+        for (name, version, module) in [
+            ("demo-gamma", "1.0.1", "demogamma"),
+            ("demo-delta", "2.0.0", "demodelta"),
         ] {
             let overlay = fs::read_to_string(project.join(format!("deps/{name}/pyproject.toml")))
-                .expect("source overlay");
+                .expect("real source manifest");
             assert!(overlay.contains(&format!("name = \"{name}\"")), "{overlay}");
             assert!(
                 overlay.contains(&format!("version = \"{version}\"")),
-                "{overlay}"
+                "the tree's own version stands: {overlay}"
             );
-            assert!(overlay.contains(commit), "commit provenance: {overlay}");
+            assert!(
+                overlay.contains("hatchling.build"),
+                "a real build-backend, not the minimal stub: {overlay}"
+            );
+            assert!(
+                !overlay.contains("jumbo-injected internal source"),
+                "the minimal stub must be gone: {overlay}"
+            );
+            assert!(
+                project
+                    .join(format!("deps/{name}/src/{module}/__init__.py"))
+                    .is_file(),
+                "the real tree's files are unpacked"
+            );
         }
 
         // The manifest: alpha points at the wheel; the fallbacks keep the
-        // lock injection's overlay-directory references.
+        // lock injection's overlay-directory references — now backed by
+        // real, buildable projects.
         let manifest = fs::read_to_string(project.join("pyproject.toml")).unwrap();
         let doc: toml::Table = manifest.parse().expect("parse manifest");
         assert_eq!(
@@ -1322,7 +1439,7 @@ fn dead_dependency_artifacts_fall_back_to_source_overlays() {
             "deps/demo-delta"
         );
 
-        // The marker records every decision with its mode.
+        // The marker records every decision with its mode and provenance.
         let marker: serde_json::Value = serde_json::from_str(
             &fs::read_to_string(project.join("deps/.jumbo-artifacts.json")).unwrap(),
         )
@@ -1334,6 +1451,8 @@ fn dead_dependency_artifacts_fall_back_to_source_overlays() {
             .find(|a| a["package"] == "demo-gamma")
             .expect("gamma marker entry");
         assert_eq!(gamma_entry["mode"], "source");
+        assert_eq!(gamma_entry["url"], DEMO_GAMMA_CODELOAD_URL);
+        assert_eq!(gamma_entry["sha256"], serde_json::Value::Null);
 
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&project);
@@ -1350,6 +1469,20 @@ fn artifact_to_source_transition_removes_the_stale_artifact() {
     let gamma_body_path = root.join("gamma.whl");
     fs::write(&gamma_body_path, DEMO_GAMMA_WHEEL).expect("gamma bytes");
     let gamma_body = gamma_body_path.display().to_string();
+    let gamma_tarball = root.join("demo-gamma-tree.tar.gz");
+    write_tarball_fixture(
+        &gamma_tarball,
+        "demo-gamma-f00dcafe",
+        &real_python_project("demo-gamma", "1.0.1"),
+    );
+    let gamma_tarball = gamma_tarball.display().to_string();
+    let delta_tarball = root.join("demo-delta-tree.tar.gz");
+    write_tarball_fixture(
+        &delta_tarball,
+        "demo-delta-01234567",
+        &real_python_project("demo-delta", "2.0.0"),
+    );
+    let delta_tarball = delta_tarball.display().to_string();
     let shim = write_curl_shim(&root);
     let project = fallback_project("transition");
     let index_arg = index_dir.display().to_string();
@@ -1357,6 +1490,10 @@ fn artifact_to_source_transition_removes_the_stale_artifact() {
         let mut envs: Vec<(&str, Option<&str>)> = vec![
             ("FAKE_CURL_OK_URL_A", Some(DEMO_ALPHA_WHEEL_URL)),
             ("FAKE_CURL_OK_BODY_A", Some(alpha_body.as_str())),
+            ("FAKE_CURL_OK_URL_C", Some(DEMO_GAMMA_CODELOAD_URL)),
+            ("FAKE_CURL_OK_BODY_C", Some(gamma_tarball.as_str())),
+            ("FAKE_CURL_OK_URL_D", Some(DEMO_DELTA_CODELOAD_URL)),
+            ("FAKE_CURL_OK_BODY_D", Some(delta_tarball.as_str())),
             ("FAKE_CURL_STATUS", Some("404")),
         ];
         if gamma_served {
@@ -1387,8 +1524,9 @@ fn artifact_to_source_transition_removes_the_stale_artifact() {
     assert!(gamma_wheel.is_file());
     assert!(!project.join("deps/demo-gamma/pyproject.toml").exists());
 
-    // Run 2: gamma's release asset is gone — the build must proceed on
-    // the source overlay, and the stale artifact must not linger.
+    // Run 2: gamma's release asset is gone — the build proceeds on the
+    // real repository source at the recorded commit, and the stale
+    // artifact must not linger.
     let out = run(false);
     assert!(out.status.success(), "stderr: {}", stderr_of(&out));
     let json = stdout_json(&out);
@@ -1401,6 +1539,7 @@ fn artifact_to_source_transition_removes_the_stale_artifact() {
         .clone();
     assert_eq!(gamma["mode"], "source");
     assert!(gamma["reason"].as_str().unwrap().contains("HTTP 404"));
+    assert_eq!(gamma["url"], DEMO_GAMMA_CODELOAD_URL);
     assert_eq!(
         json["dependencies"]["keptSourceOverlays"],
         serde_json::json!(["demo-delta", "demo-gamma"])
@@ -1408,7 +1547,14 @@ fn artifact_to_source_transition_removes_the_stale_artifact() {
     assert!(!gamma_wheel.exists(), "the stale artifact must be removed");
     let overlay =
         fs::read_to_string(project.join("deps/demo-gamma/pyproject.toml")).expect("overlay");
-    assert!(overlay.contains(DEMO_GAMMA_COMMIT), "{overlay}");
+    assert!(overlay.contains("name = \"demo-gamma\""), "{overlay}");
+    assert!(
+        !overlay.contains("jumbo-injected internal source"),
+        "{overlay}"
+    );
+    assert!(project
+        .join("deps/demo-gamma/src/demogamma/__init__.py")
+        .is_file());
     let doc: toml::Table = fs::read_to_string(project.join("pyproject.toml"))
         .unwrap()
         .parse()
@@ -1418,6 +1564,108 @@ fn artifact_to_source_transition_removes_the_stale_artifact() {
             .as_str()
             .unwrap(),
         "deps/demo-gamma"
+    );
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&project);
+}
+
+/// Re-runs are idempotent: once the real source materialization stands at
+/// the recorded commit with the recorded provenance, the fetch is skipped
+/// — proven by a second run whose transport would answer any codeload
+/// request with 404 (which would abort).
+#[test]
+fn standing_source_materialization_skips_the_refetch() {
+    let root = temp_workspace("idem");
+    let index_dir = fallback_index(&root);
+    let gamma_tarball = root.join("demo-gamma-tree.tar.gz");
+    write_tarball_fixture(
+        &gamma_tarball,
+        "demo-gamma-f00dcafe",
+        &real_python_project("demo-gamma", "1.0.1"),
+    );
+    let gamma_tarball = gamma_tarball.display().to_string();
+    let delta_tarball = root.join("demo-delta-tree.tar.gz");
+    write_tarball_fixture(
+        &delta_tarball,
+        "demo-delta-01234567",
+        &real_python_project("demo-delta", "2.0.0"),
+    );
+    let delta_tarball = delta_tarball.display().to_string();
+    let shim = write_curl_shim(&root);
+    let project = fallback_project("idem");
+    let index_arg = index_dir.display().to_string();
+
+    // Run 1: alpha's artifact and both codeload tarballs are served;
+    // gamma and delta fall back and their real trees materialize.
+    let alpha_body = root.join("alpha.whl");
+    fs::write(&alpha_body, DEMO_ALPHA_WHEEL).expect("alpha bytes");
+    let alpha_body = alpha_body.display().to_string();
+    let out = run_jumbo_with_transport(
+        &[
+            "dedup",
+            "--manifest",
+            "pyproject.toml",
+            "--index",
+            &index_arg,
+            "--deps",
+        ],
+        &project,
+        &shim,
+        &[
+            ("FAKE_CURL_OK_URL_A", Some(DEMO_ALPHA_WHEEL_URL)),
+            ("FAKE_CURL_OK_BODY_A", Some(alpha_body.as_str())),
+            ("FAKE_CURL_OK_URL_B", Some(DEMO_GAMMA_CODELOAD_URL)),
+            ("FAKE_CURL_OK_BODY_B", Some(gamma_tarball.as_str())),
+            ("FAKE_CURL_OK_URL_C", Some(DEMO_DELTA_CODELOAD_URL)),
+            ("FAKE_CURL_OK_BODY_C", Some(delta_tarball.as_str())),
+            ("FAKE_CURL_STATUS", Some("404")),
+        ],
+    );
+    assert!(out.status.success(), "stderr: {}", stderr_of(&out));
+    let manifest_once = fs::read_to_string(project.join("pyproject.toml")).unwrap();
+    let gamma_once = fs::read_to_string(project.join("deps/demo-gamma/pyproject.toml")).unwrap();
+    let marker_once = fs::read_to_string(project.join("deps/.jumbo-artifacts.json")).unwrap();
+
+    // Run 2: no OK slot serves a codeload URL anymore — any codeload fetch
+    // would answer 404 and abort. Success proves the fetch was skipped.
+    let out = run_jumbo_with_transport(
+        &[
+            "dedup",
+            "--manifest",
+            "pyproject.toml",
+            "--index",
+            &index_arg,
+            "--deps",
+        ],
+        &project,
+        &shim,
+        &[
+            ("FAKE_CURL_OK_URL_A", Some(DEMO_ALPHA_WHEEL_URL)),
+            ("FAKE_CURL_OK_BODY_A", Some(alpha_body.as_str())),
+            ("FAKE_CURL_OK_URL_B", None),
+            ("FAKE_CURL_OK_URL_C", None),
+            ("FAKE_CURL_STATUS", Some("404")),
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "a standing source materialization must skip the refetch, stderr: {}",
+        stderr_of(&out)
+    );
+    assert_eq!(
+        fs::read_to_string(project.join("pyproject.toml")).unwrap(),
+        manifest_once,
+        "second materialization must be byte-identical"
+    );
+    assert_eq!(
+        fs::read_to_string(project.join("deps/demo-gamma/pyproject.toml")).unwrap(),
+        gamma_once,
+        "the standing real source must be untouched"
+    );
+    assert_eq!(
+        fs::read_to_string(project.join("deps/.jumbo-artifacts.json")).unwrap(),
+        marker_once,
+        "the marker must be stable"
     );
     let _ = fs::remove_dir_all(&root);
     let _ = fs::remove_dir_all(&project);
@@ -1476,4 +1724,270 @@ fn server_errors_do_not_fall_back() {
     assert!(!project.join("deps/.jumbo-artifacts.json").exists());
     let _ = fs::remove_dir_all(&root);
     let _ = fs::remove_dir_all(&project);
+}
+
+/// A 5xx on the codeload tarball fetch aborts too: the fallback fetch is
+/// part of the build, and leaving the unbuildable stub standing would
+/// just move the failure into uv/npm.
+#[test]
+fn codeload_server_errors_abort_the_fallback() {
+    let root = temp_workspace("codeload5xx");
+    let index_dir = fallback_index(&root);
+    let shim = write_curl_shim(&root);
+    let project = fallback_project("codeload5xx");
+    let index_arg = index_dir.display().to_string();
+    let alpha_body = root.join("alpha.whl");
+    fs::write(&alpha_body, DEMO_ALPHA_WHEEL).expect("alpha bytes");
+    let alpha_body = alpha_body.display().to_string();
+
+    // Alpha's artifact is served; gamma's dead asset answers a definitive
+    // 404 (falling back), and the codeload tarball fetch then answers 500.
+    let out = run_jumbo_with_transport(
+        &[
+            "dedup",
+            "--manifest",
+            "pyproject.toml",
+            "--index",
+            &index_arg,
+            "--deps",
+        ],
+        &project,
+        &shim,
+        &[
+            ("FAKE_CURL_OK_URL_A", Some(DEMO_ALPHA_WHEEL_URL)),
+            ("FAKE_CURL_OK_BODY_A", Some(alpha_body.as_str())),
+            ("FAKE_CURL_STATUS_URL", Some(DEMO_GAMMA_WHEEL_URL)),
+            ("FAKE_CURL_STATUS_CODE", Some("404")),
+            ("FAKE_CURL_STATUS", Some("500")),
+        ],
+    );
+    assert!(
+        !out.status.success(),
+        "a 5xx on the source fallback fetch must abort"
+    );
+    let stderr = stderr_of(&out);
+    assert!(stderr.contains("HTTP 500"), "stderr: {stderr}");
+    assert!(stderr.contains("real source"), "stderr: {stderr}");
+    // The stub was not replaced and no marker was written.
+    let overlay = fs::read_to_string(project.join("deps/demo-gamma/pyproject.toml")).expect("stub");
+    assert!(
+        overlay.contains("jumbo-injected internal source"),
+        "{overlay}"
+    );
+    assert!(!project.join("deps/.jumbo-artifacts.json").exists());
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&project);
+}
+
+/// A fetched tree whose manifest name does not match the record aborts
+/// the fallback: the coordinate or the repository is wrong.
+#[test]
+fn source_name_mismatch_aborts_the_fallback() {
+    let root = temp_workspace("namemismatch");
+    let index_dir = fallback_index(&root);
+    let alpha_body = root.join("alpha.whl");
+    fs::write(&alpha_body, DEMO_ALPHA_WHEEL).expect("alpha bytes");
+    let alpha_body = alpha_body.display().to_string();
+    let wrong_tree = root.join("wrong-tree.tar.gz");
+    write_tarball_fixture(
+        &wrong_tree,
+        "demo-gamma-f00dcafe",
+        &real_python_project("other-package", "1.0.0"),
+    );
+    let wrong_tree = wrong_tree.display().to_string();
+    let delta_tarball = root.join("demo-delta-tree.tar.gz");
+    write_tarball_fixture(
+        &delta_tarball,
+        "demo-delta-01234567",
+        &real_python_project("demo-delta", "2.0.0"),
+    );
+    let delta_tarball = delta_tarball.display().to_string();
+    let shim = write_curl_shim(&root);
+    let project = fallback_project("namemismatch");
+    let index_arg = index_dir.display().to_string();
+
+    let out = run_jumbo_with_transport(
+        &[
+            "dedup",
+            "--manifest",
+            "pyproject.toml",
+            "--index",
+            &index_arg,
+            "--deps",
+        ],
+        &project,
+        &shim,
+        &[
+            ("FAKE_CURL_OK_URL_A", Some(DEMO_ALPHA_WHEEL_URL)),
+            ("FAKE_CURL_OK_BODY_A", Some(alpha_body.as_str())),
+            ("FAKE_CURL_OK_URL_B", Some(DEMO_GAMMA_CODELOAD_URL)),
+            ("FAKE_CURL_OK_BODY_B", Some(wrong_tree.as_str())),
+            ("FAKE_CURL_OK_URL_C", Some(DEMO_DELTA_CODELOAD_URL)),
+            ("FAKE_CURL_OK_BODY_C", Some(delta_tarball.as_str())),
+            ("FAKE_CURL_STATUS", Some("404")),
+        ],
+    );
+    assert!(
+        !out.status.success(),
+        "a name mismatch must abort, not materialize a wrong tree"
+    );
+    let stderr = stderr_of(&out);
+    assert!(stderr.contains("does not match"), "stderr: {stderr}");
+    assert!(stderr.contains("other-package"), "stderr: {stderr}");
+    assert!(stderr.contains("demo-gamma"), "stderr: {stderr}");
+    // The stub was not replaced and no marker was written.
+    let overlay = fs::read_to_string(project.join("deps/demo-gamma/pyproject.toml")).expect("stub");
+    assert!(
+        overlay.contains("jumbo-injected internal source"),
+        "{overlay}"
+    );
+    assert!(!project.join("deps/.jumbo-artifacts.json").exists());
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&project);
+}
+
+/// A dependency whose repository cannot be resolved (no github.com
+/// artifactUrl, no repo map) aborts with a typed error naming the package
+/// and both resolution options.
+#[test]
+fn unresolvable_repository_is_a_typed_error() {
+    let root = temp_workspace("unresolvable");
+    let index_dir = fixture_index(&root, None); // demo-beta: no artifactUrl
+    let alpha_body = root.join("alpha.whl");
+    fs::write(&alpha_body, DEMO_ALPHA_WHEEL).expect("alpha bytes");
+    let alpha_body = alpha_body.display().to_string();
+    let shim = write_curl_shim(&root);
+    let project = committed_repo(
+        "unresolvable",
+        &[
+            ("pyproject.toml", PYPROJECT_WITH_BETA),
+            ("uv.lock", UV_LOCK_WITH_BETA),
+        ],
+    );
+
+    let out = run_jumbo_with_transport(
+        &[
+            "dedup",
+            "--manifest",
+            "pyproject.toml",
+            "--index",
+            &index_dir.display().to_string(),
+            "--deps",
+        ],
+        &project,
+        &shim,
+        &[
+            ("FAKE_CURL_OK_URL_A", Some(DEMO_ALPHA_WHEEL_URL)),
+            ("FAKE_CURL_OK_BODY_A", Some(alpha_body.as_str())),
+            ("FAKE_CURL_STATUS", Some("404")),
+        ],
+    );
+    assert!(
+        !out.status.success(),
+        "an unresolvable repository must abort, not keep an unbuildable stub"
+    );
+    let stderr = stderr_of(&out);
+    assert!(stderr.contains("cannot resolve the repository"), "{stderr}");
+    assert!(stderr.contains("demo-beta"), "{stderr}");
+    assert!(stderr.contains("--repo-map"), "{stderr}");
+    assert!(stderr.contains("JUMBO_REPO_MAP"), "{stderr}");
+    assert!(stderr.contains("artifactUrl"), "{stderr}");
+    // Nothing was mutated.
+    assert!(!project.join("deps/.jumbo-artifacts.json").exists());
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// A repo map resolves dependencies whose records carry no github.com
+/// artifactUrl — here demo-beta (a null-artifact bootstrap-style record),
+/// with the tarball served from the artifact cache (the offline
+/// transport) under the commit-keyed codeload file name.
+#[test]
+fn repo_map_resolves_dependencies_without_github_urls() {
+    let root = temp_workspace("repomap");
+    let index_dir = fixture_index(&root, None);
+    let cache = root.join("cache");
+    fs::create_dir_all(&cache).expect("cache dir");
+    fs::write(
+        cache.join("demo_alpha-2.4.0-py3-none-any.whl"),
+        DEMO_ALPHA_WHEEL,
+    )
+    .expect("wheel fixture");
+    // The demo-beta record's commit keys the codeload tarball in the cache.
+    let beta_commit = "0123456789abcdef0123456789abcdef01234567";
+    write_tarball_fixture(
+        &cache.join(beta_commit),
+        "demo-beta-01234567",
+        &real_python_project("demo-beta", "1.4.2"),
+    );
+    let repo_map = root.join("repo-map.json");
+    fs::write(
+        &repo_map,
+        "{\n  \"demo-beta\": \"https://github.com/acme/demo-beta\"\n}\n",
+    )
+    .expect("write repo map");
+    let project = committed_repo(
+        "repomap",
+        &[
+            ("pyproject.toml", PYPROJECT_WITH_BETA),
+            ("uv.lock", UV_LOCK_WITH_BETA),
+        ],
+    );
+
+    let out = Command::new(jumbo_bin())
+        .args([
+            "dedup",
+            "--manifest",
+            "pyproject.toml",
+            "--index",
+            &index_dir.display().to_string(),
+            "--deps",
+            "--artifact-dir",
+            &cache.display().to_string(),
+        ])
+        .current_dir(&project)
+        .env("JUMBO_REPO_MAP", &repo_map) // the env form of --repo-map
+        .env_remove("JUMBO_INDEX_PATH")
+        .env_remove("JUMBO_INDEX_URL")
+        .env_remove("JUMBO_ARTIFACT_DIR")
+        .env_remove("GITHUB_TOKEN")
+        .env_remove("GH_TOKEN")
+        .output()
+        .expect("run jumbo");
+    assert!(out.status.success(), "stderr: {}", stderr_of(&out));
+    let json = stdout_json(&out);
+    let deps = &json["dependencies"];
+    let materialized = deps["materialized"].as_array().expect("materialized");
+    assert_eq!(materialized.len(), 2, "{materialized:?}");
+    let beta = materialized
+        .iter()
+        .find(|m| m["package"] == "demo-beta")
+        .expect("beta entry");
+    assert_eq!(beta["mode"], "source");
+    assert_eq!(
+        beta["url"],
+        format!("https://codeload.github.com/acme/demo-beta/tar.gz/{beta_commit}")
+    );
+    assert!(beta["reason"]
+        .as_str()
+        .expect("reason")
+        .contains("no artifactUrl"));
+    assert_eq!(deps["keptSourceOverlays"], serde_json::json!(["demo-beta"]));
+
+    // The real tree stands at the overlay coordinate; the stub is gone.
+    let overlay =
+        fs::read_to_string(project.join("deps/demo-beta/pyproject.toml")).expect("real source");
+    assert!(overlay.contains("name = \"demo-beta\""), "{overlay}");
+    assert!(overlay.contains("version = \"1.4.2\""), "{overlay}");
+    assert!(
+        !overlay.contains("jumbo-injected internal source"),
+        "{overlay}"
+    );
+    assert!(project
+        .join("deps/demo-beta/src/demobeta/__init__.py")
+        .is_file());
+    // alpha still materialized as an artifact.
+    assert!(project
+        .join("deps/demo-alpha/demo_alpha-2.4.0-py3-none-any.whl")
+        .is_file());
+    let _ = fs::remove_dir_all(&root);
 }

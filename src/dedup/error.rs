@@ -99,4 +99,48 @@ pub enum MaterializeError {
 
     #[error("invalid artifact materialization marker `{path}`: {reason}")]
     InvalidMarker { path: String, reason: String },
+
+    #[error(
+        "cannot resolve the repository of {package} {version}: {reason}\n  \
+         The source fallback fetches the dependency's real repository tree at the recorded \
+         commit, so it needs a repository coordinate. Either (a) the record's artifactUrl is \
+         an https github.com URL — the owner/repo is parsed from it, which works even when \
+         the asset itself is gone — or (b) pass a repo map mapping the package name to its \
+         https github.com clone URL (--repo-map <PATH> or the JUMBO_REPO_MAP environment \
+         variable, a JSON object of package name to clone URL)."
+    )]
+    UnresolvableRepository {
+        package: String,
+        version: String,
+        reason: String,
+    },
+
+    #[error(
+        "invalid repo map `{path}`: {reason}\n  \
+         A repo map is a JSON object mapping package names to https github.com clone URLs."
+    )]
+    InvalidRepoMap { path: String, reason: String },
+
+    #[error(
+        "fetching the real source of {package} failed for {url}: {reason}\n  \
+         The minimal lock stub is never buildable, so a source fallback that cannot fetch \
+         the recorded tree aborts instead of leaving a broken materialization behind."
+    )]
+    SourceTarball {
+        package: String,
+        url: String,
+        reason: String,
+    },
+
+    #[error(
+        "the fetched source at {path} does not match the record for {package}: {reason}\n  \
+         Jumbo rule: the repository tree fetched at the recorded commit must carry the \
+         recorded package's manifest name (the version may differ — the record's version \
+         semantics hold); a mismatch means the coordinate or the repository is wrong."
+    )]
+    SourceNameMismatch {
+        package: String,
+        path: String,
+        reason: String,
+    },
 }

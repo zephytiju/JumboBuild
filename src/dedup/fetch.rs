@@ -7,11 +7,13 @@
 //! an internal package. The layer is deliberately narrow:
 //!
 //! - `https` only, and the host must be one of `github.com` (where release
-//!   asset URLs live) or GitHub's release-asset CDN hosts
+//!   asset URLs live), GitHub's release-asset CDN hosts
 //!   (`objects.githubusercontent.com`, `release-assets.githubusercontent.com`,
-//!   to where a download redirects). Everything else — other hosts,
-//!   localhost, loopback/private/reserved addresses, IP literals, userinfo,
-//!   and non-default ports — is rejected before any bytes move.
+//!   to where a download redirects), or `codeload.github.com` (GitHub's
+//!   tarball host, from where the source fallback fetches repository trees
+//!   at a recorded commit). Everything else — other hosts, localhost,
+//!   loopback/private/reserved addresses, IP literals, userinfo, and
+//!   non-default ports — is rejected before any bytes move.
 //! - Redirects are followed manually, one hop at a time through this same
 //!   validation, so a redirect can never widen the egress surface.
 //! - Credentials come only from the environment (`GITHUB_TOKEN`,
@@ -27,10 +29,13 @@ use std::path::{Path, PathBuf};
 use super::error::MaterializeError;
 
 /// Hosts an artifact URL (and every redirect hop) may point at.
-pub const ALLOWED_ARTIFACT_HOSTS: [&str; 3] = [
+pub const ALLOWED_ARTIFACT_HOSTS: [&str; 4] = [
     "github.com",
     "objects.githubusercontent.com",
     "release-assets.githubusercontent.com",
+    // GitHub's tarball host: the source fallback fetches repository trees
+    // at a recorded commit from here.
+    "codeload.github.com",
 ];
 
 /// Environment variables a GitHub token is accepted from, in order.
@@ -154,7 +159,8 @@ pub fn validate_artifact_url(raw: &str) -> Result<ArtifactUrl, MaterializeError>
     }
     if !ALLOWED_ARTIFACT_HOSTS.contains(&host_lower.as_str()) {
         return reject_owned(format!(
-            "host is not github.com or a GitHub release-asset host (allowed: {})",
+            "host is not github.com, a GitHub release-asset host, or codeload.github.com \
+             (allowed: {})",
             ALLOWED_ARTIFACT_HOSTS.join(", ")
         ));
     }
@@ -170,6 +176,83 @@ pub fn validate_artifact_url(raw: &str) -> Result<ArtifactUrl, MaterializeError>
         host: host_lower,
         file_name: file_name.to_string(),
     })
+}
+
+/// A `github.com/<owner>/<repo>` coordinate, the source of the tarball the
+/// fallback fetches from `codeload.github.com`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoCoordinate {
+    pub owner: String,
+    pub repo: String,
+}
+
+/// Whether a path segment is a safe GitHub owner/repo name: the GitHub
+/// charset, and never `.`/`..` (which could smuggle path traversal into the
+/// codeload URL).
+fn is_safe_repo_segment(segment: &str) -> bool {
+    !segment.is_empty()
+        && segment != "."
+        && segment != ".."
+        && segment
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
+}
+
+/// Parse a `github.com` URL into an owner/repo coordinate.
+///
+/// Accepts both artifact URLs (`https://github.com/<owner>/<repo>/releases/...`
+/// — the owner/repo are the first two path segments, so a dead asset URL
+/// still carries the coordinate) and clone URLs
+/// (`https://github.com/<owner>/<repo>` with an optional `.git` suffix and
+/// trailing slash). https only, the host must be exactly `github.com`, no
+/// userinfo, no port, no IP literal — the same egress shape the artifact
+/// validation enforces. Returns `None` for anything else.
+pub fn parse_github_repo(raw: &str) -> Option<RepoCoordinate> {
+    let rest = raw.strip_prefix("https://")?;
+    let authority_end = rest.find('/').unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    if authority.contains('@') || authority.contains(':') {
+        return None;
+    }
+    if !authority.eq_ignore_ascii_case("github.com") || is_ip_literal(authority) {
+        return None;
+    }
+    let mut segments = rest[authority_end..].split('/').filter(|s| !s.is_empty());
+    let owner = segments.next()?;
+    let mut repo = segments.next()?.to_string();
+    if let Some(stripped) = repo.strip_suffix(".git") {
+        repo = stripped.to_string();
+    }
+    if !is_safe_repo_segment(owner) || !is_safe_repo_segment(&repo) {
+        return None;
+    }
+    Some(RepoCoordinate {
+        owner: owner.to_string(),
+        repo,
+    })
+}
+
+/// Whether a record commit is a full 40-hex git sha — the only form safe
+/// (and meaningful) to interpolate into a codeload tarball path.
+pub fn is_full_commit_sha(commit: &str) -> bool {
+    commit.len() == 40
+        && commit
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// The codeload tarball URL of a repository tree at a commit, validated
+/// against the same egress policy as artifact URLs (codeload.github.com is
+/// GitHub's tarball host and is on the allowlist).
+pub fn codeload_tarball_url(
+    coordinate: &RepoCoordinate,
+    commit: &str,
+) -> Result<ArtifactUrl, MaterializeError> {
+    let raw = format!(
+        "https://codeload.github.com/{}/{}/tar.gz/{}",
+        coordinate.owner, coordinate.repo, commit
+    );
+    validate_artifact_url(&raw)
 }
 
 /// Extract the next hop from a `Location` header block.
@@ -449,5 +532,83 @@ mod tests {
             Some("https://github.com/acme/y")
         );
         assert_eq!(location_from_headers("HTTP/2 200\r\n\r\n"), None);
+    }
+
+    #[test]
+    fn codeload_tarball_urls_pass_validation() {
+        let coordinate = RepoCoordinate {
+            owner: "acme".into(),
+            repo: "demo-gamma".into(),
+        };
+        let url = codeload_tarball_url(&coordinate, "f00dcafe0123456789abcdef0123456789abcdef0")
+            .expect("valid codeload URL");
+        assert_eq!(
+            url.url,
+            "https://codeload.github.com/acme/demo-gamma/tar.gz/f00dcafe0123456789abcdef0123456789abcdef0"
+        );
+        assert_eq!(url.host, "codeload.github.com");
+        // The commit is the final path segment: the staged file name a
+        // cache provider resolves the tarball by.
+        assert_eq!(url.file_name, "f00dcafe0123456789abcdef0123456789abcdef0");
+    }
+
+    #[test]
+    fn repo_coordinates_parse_from_artifact_and_clone_urls() {
+        // A release-asset URL (even a dead one) carries owner/repo as its
+        // first two path segments.
+        assert_eq!(
+            parse_github_repo(
+                "https://github.com/acme/demo-gamma/releases/download/v1.0.0/demo_gamma-1.0.0.whl"
+            ),
+            Some(RepoCoordinate {
+                owner: "acme".into(),
+                repo: "demo-gamma".into()
+            })
+        );
+        // Clone URL forms: bare, .git suffix, trailing slash, mixed case host.
+        for raw in [
+            "https://github.com/acme/demo-gamma",
+            "https://github.com/acme/demo-gamma.git",
+            "https://github.com/acme/demo-gamma/",
+            "https://GITHUB.COM/acme/demo-gamma",
+        ] {
+            assert_eq!(
+                parse_github_repo(raw),
+                Some(RepoCoordinate {
+                    owner: "acme".into(),
+                    repo: "demo-gamma".into()
+                }),
+                "{raw}"
+            );
+        }
+        // Anything else is not a coordinate.
+        for raw in [
+            "https://evil.com/acme/pkg",
+            "https://github.com.evil.io/acme/pkg",
+            "http://github.com/acme/pkg",
+            "https://user@github.com/acme/pkg",
+            "https://github.com:8443/acme/pkg",
+            "https://github.com",
+            "https://github.com/acme",
+            "https://github.com/acme/../etc",
+            "ssh://git@github.com/acme/pkg",
+            "git@github.com:acme/pkg.git",
+        ] {
+            assert_eq!(parse_github_repo(raw), None, "{raw}");
+        }
+    }
+
+    #[test]
+    fn commit_validation_only_accepts_full_shas() {
+        assert!(is_full_commit_sha(
+            "f00dcafe0123456789abcdef0123456789abcdef"
+        ));
+        assert!(is_full_commit_sha(&"a".repeat(40)));
+        assert!(!is_full_commit_sha("f00dcafe"));
+        assert!(!is_full_commit_sha("v1.0.0"));
+        assert!(!is_full_commit_sha("HEAD"));
+        assert!(!is_full_commit_sha("../escape"));
+        assert!(!is_full_commit_sha(&"a".repeat(41)));
+        assert!(!is_full_commit_sha(&"g".repeat(40)));
     }
 }

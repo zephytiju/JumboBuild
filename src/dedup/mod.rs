@@ -17,10 +17,13 @@
 //! `deps/<slug>/`, Node tarballs via `file:` sources — never a registry
 //! protocol. Null fingerprints (bootstrap records) never match. A
 //! dependency whose recorded artifact is definitively unusable — the
-//! download answered 404/410, or the record has no `artifactSha256` —
-//! falls back to its `deps/<slug>/` source overlay at the recorded commit
-//! instead of failing the build; transient (5xx, network) and integrity
-//! (digest mismatch) failures still abort.
+//! download answered 404/410, the record has no `artifactUrl`, or it has
+//! no `artifactSha256` — falls back to fetching the dependency's **real
+//! repository source at the recorded commit** (codeload tarball through
+//! the validated https layer; coordinate from the artifactUrl or a repo
+//! map) into `deps/<slug>/`, replacing the minimal lock stub, instead of
+//! failing the build; transient (5xx, network) and integrity (digest
+//! mismatch) failures still abort.
 //!
 //! Boundary: the decision and the pull only — no version bumping, no
 //! publication, no index writes, no rebuild orchestration.
@@ -37,5 +40,5 @@ pub use ingest::{
     load_artifacts_marker, materialize_dependency_artifacts, materialize_self_artifact,
     recorded_sha256, sha256_of_file, source_fallback_reason, stage_and_verify, verify_sha256,
     ArtifactKind, ArtifactProvider, ArtifactsMarker, MaterializationMode, MaterializedArtifact,
-    ARTIFACTS_MARKER_FORMAT, DEFAULT_DIST_DIR,
+    RepoMap, ARTIFACTS_MARKER_FORMAT, DEFAULT_DIST_DIR,
 };
