@@ -31,27 +31,52 @@
 //! materialization** instead of failing the build when a dependency's
 //! *recorded artifact cannot be used*: the download answered a definitive
 //! 404/410 (the release asset is gone — [`MaterializeError::ArtifactGone`]),
-//! or the record carries no `artifactSha256` (the bytes would be
-//! unverifiable). The dependency then keeps the J3 lock path — the
-//! `deps/<slug>/` source overlay at the recorded commit (name, version,
-//! and `record.commit` provenance) that the lock generation materialized —
-//! and downstream builds consume that coordinate identically to a
-//! null-artifact record.
+//! the record carries no `artifactUrl`, or it has no `artifactSha256` (the
+//! bytes would be unverifiable).
+//!
+//! Source materialization fetches the dependency's **real repository tree
+//! at the recorded commit** — never the minimal lock stub, which exists for
+//! resolution only and is not buildable — from GitHub's tarball host
+//! (`https://codeload.github.com/<owner>/<repo>/tar.gz/<commit>`, through
+//! the same validated https layer). The tree unpacks into `deps/<slug>/`
+//! (leading directory stripped), replacing any standing minimal stub so
+//! exactly one materialization exists, and the downstream uv/npm build
+//! consumes it as the ordinary workspace member / `file:` source. The
+//! repository coordinate is resolved by (a) parsing owner/repo from the
+//! record's `artifactUrl` when it is a github.com URL (dead asset URLs
+//! still carry it), else (b) a repo map (`--repo-map` / `JUMBO_REPO_MAP`,
+//! package name to https clone URL); without either, a typed error names
+//! the package and both options.
+//!
+//! The unpacked project must carry the record's package name (normalized;
+//! the version may differ — the record's version semantics hold), or the
+//! run aborts with a typed error. Tarballs have no recorded sha256, so the
+//! materialization marker and the dedup JSON record the provenance
+//! (tarball URL + commit) instead. Re-runs are idempotent: when
+//! `deps/<slug>/` already holds the source materialization of the same
+//! commit and provenance, the fetch is skipped.
 //!
 //! Transient failures (5xx, network errors, curl failures) and integrity
 //! failures (digest mismatch, malformed digest) **do not** fall back: they
-//! abort so real outages and tampering stay visible. The own-record
-//! artifact and pinned reproduction never fall back either — a reuse or
-//! reproduction that cannot produce the recorded bytes is a failure, not a
-//! degradation.
+//! abort so real outages and tampering stay visible — and a fallback fetch
+//! that itself fails (unresolvable repository, dead tarball URL, name
+//! mismatch) aborts too, because leaving the unbuildable stub standing
+//! would just move the failure into the build. The own-record artifact and
+//! pinned reproduction never fall back either — a reuse or reproduction
+//! that cannot produce the recorded bytes is a failure, not a degradation.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::error::MaterializeError;
-use super::fetch::{download_artifact, validate_artifact_url, ArtifactUrl};
+use super::fetch::{
+    codeload_tarball_url, download_artifact, is_full_commit_sha, parse_github_repo,
+    validate_artifact_url, ArtifactUrl, RepoCoordinate,
+};
+use crate::fingerprint::lockgen::manifest_is_stub;
 use crate::resolver::index::IndexRecord;
 use crate::resolver::manifest::Ecosystem;
 use crate::resolver::ResolvedDependency;
@@ -98,9 +123,10 @@ pub enum MaterializationMode {
     /// The recorded release asset was pulled by exact URL and
     /// sha256-verified.
     Artifact,
-    /// The dependency's `deps/<slug>/` source overlay at the recorded
-    /// commit stands (the J3 lock path), because the recorded artifact
-    /// could not be used — see [`super::ingest`] for the fallback rules.
+    /// The dependency's real repository tree at the recorded commit was
+    /// fetched (codeload tarball, provenance URL recorded) into
+    /// `deps/<slug>/`, because the recorded artifact could not be used —
+    /// see [`super::ingest`] for the fallback rules.
     Source,
 }
 
@@ -134,7 +160,10 @@ pub struct MaterializedArtifact {
     /// Why the source fallback was taken (`mode == "source"` only).
     #[serde(default)]
     pub reason: Option<String>,
-    /// Exact URL the artifact came from (null on the source fallback).
+    /// Exact URL the artifact came from; on the source fallback, the
+    /// provenance codeload tarball URL of the fetched repository tree
+    /// (tarballs carry no recorded sha256, so url+commit are the
+    /// provenance). Null on fallback markers written before that held.
     #[serde(default)]
     pub url: Option<String>,
     /// Verified sha256 (64 hex; null on the source fallback).
@@ -206,6 +235,98 @@ impl ArtifactProvider {
             }
         }?;
         Ok(staged)
+    }
+}
+
+/// A repo map: package name to https clone URL (`{"pkg":
+/// "https://github.com/owner/repo"}`), passed via `--repo-map` or
+/// `JUMBO_REPO_MAP`. The delivery platform derives it from its catalog.
+///
+/// Lookup tries the exact name, then the PEP 503 normalized form, then the
+/// file-name slug, so a record's normalized name meets a catalog's exact
+/// one (and vice versa).
+#[derive(Debug, Clone)]
+pub struct RepoMap {
+    path: PathBuf,
+    entries: BTreeMap<String, String>,
+    /// Slug/normalized index over the keys, so a record's normalized name
+    /// meets a catalog's exact one (and vice versa).
+    aliases: BTreeMap<String, String>,
+}
+
+impl RepoMap {
+    /// Load and parse a repo map file (a JSON object of package name to
+    /// https clone URL).
+    pub fn load(path: &Path) -> Result<Self, MaterializeError> {
+        let content =
+            std::fs::read_to_string(path).map_err(|e| MaterializeError::InvalidRepoMap {
+                path: path.display().to_string(),
+                reason: format!("failed to read: {e}"),
+            })?;
+        let value: serde_json::Value =
+            serde_json::from_str(&content).map_err(|e| MaterializeError::InvalidRepoMap {
+                path: path.display().to_string(),
+                reason: format!("failed to parse JSON: {e}"),
+            })?;
+        let Some(object) = value.as_object() else {
+            return Err(MaterializeError::InvalidRepoMap {
+                path: path.display().to_string(),
+                reason: "the top level must be a JSON object of package name to clone URL"
+                    .to_string(),
+            });
+        };
+        let mut entries = BTreeMap::new();
+        for (name, url) in object {
+            let Some(url) = url.as_str() else {
+                return Err(MaterializeError::InvalidRepoMap {
+                    path: path.display().to_string(),
+                    reason: format!("the entry for `{name}` is not a string"),
+                });
+            };
+            if parse_github_repo(url).is_none() {
+                return Err(MaterializeError::InvalidRepoMap {
+                    path: path.display().to_string(),
+                    reason: format!(
+                        "the entry for `{name}` is not an https github.com clone URL: {url}"
+                    ),
+                });
+            }
+            entries.insert(name.clone(), url.to_string());
+        }
+        let aliases = entries
+            .keys()
+            .map(|name| {
+                let alias = crate::resolver::index::package_slug(
+                    &crate::resolver::index::normalize_python_name(name),
+                );
+                (alias, name.clone())
+            })
+            .collect();
+        Ok(Self {
+            path: path.to_path_buf(),
+            entries,
+            aliases,
+        })
+    }
+
+    /// The display path of the map (for error contexts).
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// The clone URL recorded for `package`, if any: by exact name, then
+    /// by normalized/slugged form (either side of the lookup).
+    fn lookup(&self, package: &str) -> Option<&str> {
+        if let Some(url) = self.entries.get(package) {
+            return Some(url.as_str());
+        }
+        let alias = crate::resolver::index::package_slug(
+            &crate::resolver::index::normalize_python_name(package),
+        );
+        self.aliases
+            .get(&alias)
+            .and_then(|name| self.entries.get(name))
+            .map(String::as_str)
     }
 }
 
@@ -351,13 +472,14 @@ pub fn load_artifacts_marker(
 }
 
 /// Whether a dependency-artifact staging failure is a definitive "the
-/// recorded artifact cannot be used" — the signal to fall back to the
-/// dependency's source overlay instead of failing the build — and the
-/// human-readable reason to record for it.
+/// recorded artifact cannot be used" — the signal to fall back to
+/// materializing the dependency's real source instead of failing the
+/// build — and the human-readable reason to record for it.
 ///
 /// Falls back only on:
 /// - [`MaterializeError::ArtifactGone`] (the download answered 404/410:
 ///   the release asset no longer exists at the recorded URL);
+/// - [`MaterializeError::NoArtifact`] (the record published no artifact);
 /// - [`MaterializeError::MissingSha256`] (the record carries no digest,
 ///   so the artifact bytes would be unverifiable).
 ///
@@ -368,39 +490,436 @@ pub fn source_fallback_reason(err: &MaterializeError) -> Option<String> {
     match err {
         MaterializeError::ArtifactGone { url, status } => Some(format!(
             "artifact download for {url} answered HTTP {status}: the recorded artifact no longer \
-             exists at this URL; the source overlay at the recorded commit is used instead"
+             exists at this URL; the real repository source at the recorded commit is fetched \
+             instead"
+        )),
+        MaterializeError::NoArtifact { package, .. } => Some(format!(
+            "the record for {package} has no artifactUrl: there is no artifact to pull; the real \
+             repository source at the recorded commit is fetched instead"
         )),
         MaterializeError::MissingSha256 { package, .. } => Some(format!(
             "the record for {package} has no artifactSha256: the artifact bytes would be \
-             unverifiable; the source overlay at the recorded commit is used instead"
+             unverifiable; the real repository source at the recorded commit is fetched instead"
         )),
         _ => None,
     }
 }
 
+/// Resolve the repository coordinate of a dependency's record: owner/repo
+/// parsed from the record's `artifactUrl` when it is an https github.com
+/// URL (dead asset URLs still carry it), else the repo map's clone URL for
+/// the package. Without either, a typed error names the package and both
+/// resolution options.
+fn resolve_repo_coordinate(
+    record: &IndexRecord,
+    repo_map: Option<&RepoMap>,
+) -> Result<RepoCoordinate, MaterializeError> {
+    let unresolvable = |reason: String| MaterializeError::UnresolvableRepository {
+        package: record.package.clone(),
+        version: record.version.clone(),
+        reason,
+    };
+    if let Some(raw) = record.artifact_url.as_deref() {
+        if let Some(coordinate) = parse_github_repo(raw) {
+            return Ok(coordinate);
+        }
+    }
+    if let Some(map) = repo_map {
+        if let Some(clone_url) = map.lookup(&record.package) {
+            return parse_github_repo(clone_url).ok_or_else(|| {
+                unresolvable(format!(
+                    "the repo map {} maps it to `{clone_url}`, which is not an https \
+                     github.com clone URL",
+                    map.path().display()
+                ))
+            });
+        }
+        return Err(unresolvable(format!(
+            "its artifactUrl is not an https github.com URL and the repo map {} has no entry \
+             for `{}`",
+            map.path().display(),
+            record.package
+        )));
+    }
+    Err(unresolvable(match record.artifact_url.as_deref() {
+        Some(raw) => format!(
+            "its artifactUrl `{raw}` is not an https github.com URL and no repo map was provided \
+             (--repo-map <PATH> / JUMBO_REPO_MAP)"
+        ),
+        None => "it has no artifactUrl to parse an owner/repo from and no repo map was provided \
+                (--repo-map <PATH> / JUMBO_REPO_MAP)"
+            .to_string(),
+    }))
+}
+
+/// The codeload provenance URL of a record's real repository tree: the
+/// coordinate resolved, the commit validated as a full sha, and the URL
+/// passed through the egress validation.
+fn source_provenance_url(
+    record: &IndexRecord,
+    repo_map: Option<&RepoMap>,
+) -> Result<String, MaterializeError> {
+    let coordinate = resolve_repo_coordinate(record, repo_map)?;
+    if !is_full_commit_sha(&record.commit) {
+        return Err(MaterializeError::UnresolvableRepository {
+            package: record.package.clone(),
+            version: record.version.clone(),
+            reason: format!(
+                "the recorded commit `{}` is not a full 40-hex sha, so no repository tree can \
+                 be fetched at it",
+                record.commit
+            ),
+        });
+    }
+    Ok(codeload_tarball_url(&coordinate, &record.commit)?.url)
+}
+
+/// Whether `deps/<slug>/` already holds this record's source
+/// materialization: a previous marker entry in source mode at the same
+/// commit and provenance URL, plus a standing manifest that is not a
+/// minimal lock stub (the lock regeneration that precedes materialization
+/// re-writes stubs, so a clobbered stub means the real source has to be
+/// fetched again).
+fn source_materialization_stands(
+    project_dir: &Path,
+    overlay: &str,
+    record: &IndexRecord,
+    provenance_url: &str,
+    ecosystem: Ecosystem,
+    previous: &[MaterializedArtifact],
+) -> bool {
+    let marked = previous.iter().any(|a| {
+        a.package == record.package
+            && a.mode == MaterializationMode::Source
+            && a.commit == record.commit
+            && a.url.as_deref() == Some(provenance_url)
+    });
+    if !marked {
+        return false;
+    }
+    let manifest_name = match ecosystem {
+        Ecosystem::Python => "pyproject.toml",
+        Ecosystem::Npm => "package.json",
+    };
+    match std::fs::read_to_string(project_dir.join(overlay).join(manifest_name)) {
+        Ok(content) => !manifest_is_stub(&content),
+        Err(_) => false,
+    }
+}
+
+/// Whether a link target escapes the destination when resolved from the
+/// entry's (already stripped) relative path.
+fn link_target_escapes(entry_relative: &Path, target: &Path, root_relative: bool) -> bool {
+    let mut depth: Vec<std::ffi::OsString> = if root_relative {
+        Vec::new()
+    } else {
+        entry_relative
+            .parent()
+            .map(|p| {
+                p.components()
+                    .filter_map(|c| match c {
+                        std::path::Component::Normal(c) => Some(c.to_os_string()),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    for component in target.components() {
+        match component {
+            std::path::Component::Prefix(_) | std::path::Component::RootDir => return true,
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if depth.pop().is_none() {
+                    return true;
+                }
+            }
+            std::path::Component::Normal(c) => depth.push(c.to_os_string()),
+        }
+    }
+    false
+}
+
+/// Unpack a GitHub tarball into `dest`, stripping the leading directory
+/// (`<repo>-<ref>/`) every GitHub tarball carries.
+///
+/// Two passes over the staged file: first a validation pass (exactly one
+/// shared leading directory; no link target that resolves outside the
+/// unpacked tree), then the tar crate's own `unpack` — which additionally
+/// refuses entry paths escaping the destination — into a sibling staging
+/// directory whose single root is renamed into place.
+fn unpack_tarball_strip_one(
+    tarball: &Path,
+    dest: &Path,
+    package: &str,
+) -> Result<(), MaterializeError> {
+    let failure = |reason: String| MaterializeError::SourceTarball {
+        package: package.to_string(),
+        url: tarball.display().to_string(),
+        reason,
+    };
+    // Pass 1: shape validation.
+    let mut root_name: Option<std::ffi::OsString> = None;
+    {
+        let file = std::fs::File::open(tarball)
+            .map_err(|e| failure(format!("failed to open the staged tarball: {e}")))?;
+        let gz = flate2::read::GzDecoder::new(file);
+        let mut archive = tar::Archive::new(gz);
+        let entries = archive
+            .entries()
+            .map_err(|e| failure(format!("failed to read the tarball: {e}")))?;
+        for entry in entries {
+            let entry =
+                entry.map_err(|e| failure(format!("failed to read a tarball entry: {e}")))?;
+            let path = entry
+                .path()
+                .map_err(|e| failure(format!("failed to read an entry path: {e}")))?
+                .to_path_buf();
+            let mut components = path
+                .components()
+                .filter(|c| !matches!(c, std::path::Component::CurDir));
+            let Some(root) = components.next() else {
+                continue;
+            };
+            let root = root.as_os_str().to_os_string();
+            match &root_name {
+                None => root_name = Some(root),
+                Some(existing) if *existing == root => {}
+                Some(existing) => {
+                    return Err(failure(format!(
+                        "the tarball has more than one leading directory (`{}`, `{}`); only \
+                         single-root GitHub tarballs are accepted",
+                        existing.to_string_lossy(),
+                        root.to_string_lossy()
+                    )))
+                }
+            }
+            let relative: PathBuf = components.collect();
+            if relative.as_os_str().is_empty() {
+                continue; // the root directory entry itself
+            }
+            let entry_type = entry.header().entry_type();
+            if matches!(entry_type, tar::EntryType::Symlink | tar::EntryType::Link) {
+                if let Some(target) = entry.link_name().ok().flatten() {
+                    // A hardlink target is archive-root relative; a symlink
+                    // target is relative to the entry's own directory.
+                    let root_relative = entry_type == tar::EntryType::Link;
+                    if link_target_escapes(&relative, &target, root_relative) {
+                        return Err(failure(format!(
+                            "entry `{}` links to `{}`, which escapes the unpack destination",
+                            relative.display(),
+                            target.display()
+                        )));
+                    }
+                }
+            }
+        }
+    }
+    let Some(root_name) = root_name else {
+        return Err(failure(
+            "the tarball is empty: no repository tree to unpack".to_string(),
+        ));
+    };
+    // Pass 2: unpack via the tar crate (its own traversal guards apply),
+    // then hoist the single root directory into place.
+    let file = std::fs::File::open(tarball)
+        .map_err(|e| failure(format!("failed to open the staged tarball: {e}")))?;
+    let gz = flate2::read::GzDecoder::new(file);
+    let mut archive = tar::Archive::new(gz);
+    let parent = dest.parent().unwrap_or(Path::new("."));
+    std::fs::create_dir_all(parent)
+        .map_err(|e| failure(format!("failed to create the staging tree: {e}")))?;
+    let tmp = parent.join(format!(
+        ".{}-unpack-{}",
+        dest.file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "source".to_string()),
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&tmp);
+    archive
+        .unpack(&tmp)
+        .map_err(|e| failure(format!("failed to unpack the tarball: {e}")))?;
+    let unpacked_root = tmp.join(&root_name);
+    if !unpacked_root.is_dir() {
+        let _ = std::fs::remove_dir_all(&tmp);
+        return Err(failure(format!(
+            "the tarball's leading directory `{}` was not unpacked",
+            root_name.to_string_lossy()
+        )));
+    }
+    let result = (|| -> std::io::Result<()> {
+        if dest.exists() {
+            std::fs::remove_dir_all(dest)?;
+        }
+        std::fs::rename(&unpacked_root, dest)
+    })();
+    let _ = std::fs::remove_dir_all(&tmp);
+    result.map_err(|e| failure(format!("failed to place the unpacked tree: {e}")))
+}
+
+/// Sanity-check the unpacked project: its manifest must carry the record's
+/// package name (normalized). The version may differ — the record's
+/// version semantics hold; the name may not.
+fn verify_source_project_name(
+    dir: &Path,
+    package: &str,
+    ecosystem: Ecosystem,
+) -> Result<(), MaterializeError> {
+    let mismatch = |reason: String| MaterializeError::SourceNameMismatch {
+        package: package.to_string(),
+        path: dir.display().to_string(),
+        reason,
+    };
+    match ecosystem {
+        Ecosystem::Python => {
+            let manifest = dir.join("pyproject.toml");
+            let content = std::fs::read_to_string(&manifest).map_err(|e| {
+                mismatch(format!(
+                    "no pyproject.toml at the repository root (failed to read: {e})"
+                ))
+            })?;
+            let doc: toml::Table = content
+                .parse()
+                .map_err(|e| mismatch(format!("its pyproject.toml is not valid TOML: {e}")))?;
+            let name = doc
+                .get("project")
+                .and_then(|p| p.get("name"))
+                .and_then(|n| n.as_str())
+                .ok_or_else(|| mismatch("its pyproject.toml has no [project].name".into()))?;
+            let expected = crate::resolver::index::normalize_python_name(package);
+            let found = crate::resolver::index::normalize_python_name(name);
+            if found != expected {
+                return Err(mismatch(format!(
+                    "its manifest name `{name}` does not match the record's package `{package}`"
+                )));
+            }
+        }
+        Ecosystem::Npm => {
+            let manifest = dir.join("package.json");
+            let content = std::fs::read_to_string(&manifest).map_err(|e| {
+                mismatch(format!(
+                    "no package.json at the repository root (failed to read: {e})"
+                ))
+            })?;
+            let doc: serde_json::Value = content
+                .parse()
+                .map_err(|e| mismatch(format!("its package.json is not valid JSON: {e}")))?;
+            let name = doc
+                .get("name")
+                .and_then(|n| n.as_str())
+                .ok_or_else(|| mismatch("its package.json has no name".into()))?;
+            if name != package {
+                return Err(mismatch(format!(
+                    "its manifest name `{name}` does not match the record's package `{package}`"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Recursively copy a directory (symlinks preserved on unix).
+fn copy_dir(from: &Path, to: &Path) -> std::io::Result<()> {
+    for entry in walkdir::WalkDir::new(from) {
+        let entry = entry?;
+        let relative = entry.path().strip_prefix(from).unwrap_or(entry.path());
+        let target = to.join(relative);
+        if entry.file_type().is_dir() {
+            std::fs::create_dir_all(target)?;
+        } else if entry.file_type().is_symlink() {
+            let link = std::fs::read_link(entry.path())?;
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(link, &target)?;
+            #[cfg(not(unix))]
+            std::fs::copy(entry.path(), &target)?;
+        } else {
+            std::fs::copy(entry.path(), &target)?;
+        }
+    }
+    Ok(())
+}
+
+/// Move a directory, falling back to a recursive copy when the staging
+/// area and the project live on different filesystems.
+fn move_dir(from: &Path, to: &Path) -> std::io::Result<()> {
+    match std::fs::rename(from, to) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            copy_dir(from, to)?;
+            std::fs::remove_dir_all(from)
+        }
+    }
+}
+
+/// One staged fallback dependency: the fallback reason, the provenance
+/// codeload URL, and the staged (unpacked, name-verified) tree — `None`
+/// when the same materialization already stands and the fetch was skipped.
+struct StagedFallback<'a> {
+    dep: &'a ResolvedDependency,
+    reason: String,
+    provenance_url: String,
+    staged_tree: Option<PathBuf>,
+}
+
+/// Download the dependency's real repository tree at the recorded commit
+/// into `staged_tree` (unpacked, leading directory stripped, name
+/// verified). Nothing outside staging is touched.
+fn fetch_source_tree(
+    record: &IndexRecord,
+    ecosystem: Ecosystem,
+    provider: &ArtifactProvider,
+    staging_dir: &Path,
+    repo_map: Option<&RepoMap>,
+    staged_tree: &Path,
+) -> Result<(), MaterializeError> {
+    let coordinate = resolve_repo_coordinate(record, repo_map)?;
+    let url = codeload_tarball_url(&coordinate, &record.commit)?;
+    let failure = |reason: String| MaterializeError::SourceTarball {
+        package: record.package.clone(),
+        url: url.url.clone(),
+        reason,
+    };
+    provider
+        .stage(&url, staging_dir)
+        .map_err(|e| match e {
+            MaterializeError::ArtifactGone { status, .. } => failure(format!(
+                "HTTP {status}: no repository tarball exists at this URL (the repository was \
+                 deleted or made private, or the commit is gone)"
+            )),
+            MaterializeError::ArtifactDownload { reason, .. } => failure(reason),
+            other => other,
+        })
+        .and_then(|tarball| unpack_tarball_strip_one(&tarball, staged_tree, &record.package))?;
+    verify_source_project_name(staged_tree, &record.package, ecosystem)
+}
+
 /// Ingest the recorded artifacts of a manifest's internal dependencies,
 /// replacing each dependency's source overlay with the pulled artifact.
 ///
-/// Every candidate artifact is staged and sha256-verified before any
-/// mutation; dependencies whose records published no artifact keep their
-/// source overlays (reported as `skipped`). The rewrite reuses J3's
-/// `deps/<slug>` convention: the artifact lands at `deps/<slug>/<file>`
-/// and the manifest reference for that dependency points at the artifact.
+/// Every candidate artifact is staged and sha256-verified — and every
+/// fallback source tree is fetched, unpacked, and name-verified — before
+/// any mutation, so a failure aborts the whole run with the tree
+/// untouched.
 ///
 /// A dependency whose recorded artifact **cannot be used** — the download
-/// answered a definitive 404/410, or the record has no `artifactSha256`
-/// (see [`source_fallback_reason`]) — falls back to source materialization
-/// exactly like a null-artifact record: the `deps/<slug>/` source overlay
-/// at the recorded commit (written by the lock generation that precedes
-/// `--deps` materialization) stands, the manifest keeps pointing at it,
-/// and the returned entry carries `mode: "source"` plus the reason.
-/// Transient and integrity failures still abort with nothing mutated.
+/// answered a definitive 404/410, the record published no artifact, or it
+/// has no `artifactSha256` (see [`source_fallback_reason`]) — falls back
+/// to **source materialization**: the dependency's real repository tree at
+/// the recorded commit is fetched from codeload.github.com and unpacked
+/// into `deps/<slug>/`, replacing the minimal lock stub (which exists for
+/// resolution only and is never buildable), and the returned entry carries
+/// `mode: "source"` plus the reason and the provenance URL. When the same
+/// source materialization already stands, the fetch is skipped. Transient
+/// and integrity failures — of the artifact pull or of the fallback fetch
+/// itself — still abort with nothing mutated.
 pub fn materialize_dependency_artifacts(
     manifest: &Path,
     resolution: &[ResolvedDependency],
     ecosystem: Ecosystem,
     provider: &ArtifactProvider,
     staging_dir: &Path,
+    repo_map: Option<&RepoMap>,
 ) -> Result<Vec<MaterializedArtifact>, MaterializeError> {
     let project_dir = manifest
         .parent()
@@ -408,35 +927,62 @@ pub fn materialize_dependency_artifacts(
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
 
-    // Phase 1: stage and verify every candidate. Nothing is mutated on
-    // failure, so an unverifiable artifact aborts the whole run with the
-    // tree untouched. Definitive absence degrades to the source overlay.
+    // The previous materialization marker drives the fallback cleanup and
+    // the idempotence check: a dependency that switches from a pulled
+    // artifact to real source must not leave the stale artifact file
+    // behind, and a standing source materialization skips its re-fetch.
+    let previous: Vec<MaterializedArtifact> = load_artifacts_marker(&project_dir)
+        .map(|m| m.map(|m| m.artifacts).unwrap_or_default())
+        .unwrap_or_default();
+
+    // Phase 1: stage and verify every candidate — pulled artifacts and
+    // fallback source trees alike. Definitive absence degrades to the
+    // real-source fetch; everything else aborts with nothing mutated.
     let mut candidates: Vec<(&ResolvedDependency, ArtifactUrl, String, PathBuf)> = Vec::new();
-    let mut fallbacks: Vec<(&ResolvedDependency, String)> = Vec::new();
-    let mut skipped: Vec<&ResolvedDependency> = Vec::new();
+    let mut fallbacks: Vec<StagedFallback> = Vec::new();
     for dep in resolution {
-        if dep.record.artifact_url.is_none() {
-            skipped.push(dep);
-            continue;
-        }
         match stage_and_verify(&dep.record, provider, staging_dir) {
             Ok((url, sha256, staged)) => {
                 ArtifactKind::of(&url, ecosystem)?;
                 candidates.push((dep, url, sha256, staged));
             }
-            Err(err) => match source_fallback_reason(&err) {
-                Some(reason) => fallbacks.push((dep, reason)),
-                None => return Err(err),
-            },
+            Err(err) => {
+                let Some(reason) = source_fallback_reason(&err) else {
+                    return Err(err);
+                };
+                let provenance_url = source_provenance_url(&dep.record, repo_map)?;
+                let slug = crate::resolver::index::package_slug(&dep.name);
+                let overlay = format!("{INJECTED_DIR}/{slug}");
+                let staged_tree = if source_materialization_stands(
+                    &project_dir,
+                    &overlay,
+                    &dep.record,
+                    &provenance_url,
+                    ecosystem,
+                    &previous,
+                ) {
+                    None // the same materialization stands; skip the fetch
+                } else {
+                    let staged_tree = staging_dir.join("source").join(&slug);
+                    fetch_source_tree(
+                        &dep.record,
+                        ecosystem,
+                        provider,
+                        staging_dir,
+                        repo_map,
+                        &staged_tree,
+                    )?;
+                    Some(staged_tree)
+                };
+                fallbacks.push(StagedFallback {
+                    dep,
+                    reason,
+                    provenance_url,
+                    staged_tree,
+                });
+            }
         }
     }
-
-    // The previous materialization marker drives the fallback cleanup:
-    // a dependency that switches from a pulled artifact to its source
-    // overlay must not leave the stale artifact file behind.
-    let previous: Vec<MaterializedArtifact> = load_artifacts_marker(&project_dir)
-        .map(|m| m.map(|m| m.artifacts).unwrap_or_default())
-        .unwrap_or_default();
 
     // Phase 2: ingest — replace each source overlay with its artifact and
     // rewrite the manifest reference.
@@ -486,23 +1032,43 @@ pub fn materialize_dependency_artifacts(
         });
     }
 
-    // Phase 2b: source fallback — the `deps/<slug>/` source overlay the
-    // lock generation wrote stands as this dependency's materialization.
-    // A previously pulled artifact for the same package is removed (the
-    // marker below replaces its entry), and the manifest reference the
-    // lock generation wrote (`deps/<slug>` / `file:deps/<slug>`) is left
-    // exactly as `jumbo lock` produces it.
-    for (dep, reason) in fallbacks {
+    // Phase 2b: source fallback — the dependency's real repository tree at
+    // the recorded commit becomes its materialization. A previously pulled
+    // artifact for the same package is removed, the standing minimal stub
+    // is replaced (exactly one materialization exists), and the manifest
+    // reference the lock generation wrote (`deps/<slug>` /
+    // `file:deps/<slug>`) keeps pointing at the directory — now holding a
+    // real, buildable project.
+    for prep in &fallbacks {
+        let dep = prep.dep;
         let slug = crate::resolver::index::package_slug(&dep.name);
         let overlay = format!("{INJECTED_DIR}/{slug}");
         for prior in previous.iter().filter(|a| a.package == dep.name) {
             if prior.mode == MaterializationMode::Artifact {
                 let stale = project_dir.join(&prior.path);
-                // Best-effort: the manifest already points at the overlay
+                // Best-effort: the manifest points at the overlay
                 // directory, so a leftover file is inert even if it cannot
                 // be removed.
                 let _ = std::fs::remove_file(&stale);
             }
+        }
+        if let Some(staged_tree) = &prep.staged_tree {
+            let target = project_dir.join(&overlay);
+            if target.exists() {
+                std::fs::remove_dir_all(&target).map_err(|e| MaterializeError::Ingestion {
+                    package: dep.name.clone(),
+                    target: target.display().to_string(),
+                    reason: format!(
+                        "failed to remove the standing minimal stub before placing the \
+                             real source: {e}"
+                    ),
+                })?;
+            }
+            move_dir(staged_tree, &target).map_err(|e| MaterializeError::Ingestion {
+                package: dep.name.clone(),
+                target: target.display().to_string(),
+                reason: format!("failed to place the fetched source: {e}"),
+            })?;
         }
         materialized.push(MaterializedArtifact {
             package: dep.name.clone(),
@@ -510,8 +1076,8 @@ pub fn materialize_dependency_artifacts(
             commit: dep.record.commit.clone(),
             build_id: dep.record.build_id.clone(),
             mode: MaterializationMode::Source,
-            reason: Some(reason),
-            url: None,
+            reason: Some(prep.reason.clone()),
+            url: Some(prep.provenance_url.clone()),
             sha256: None,
             path: overlay.clone(),
             source_overlay_path: Some(overlay),
@@ -519,8 +1085,7 @@ pub fn materialize_dependency_artifacts(
         });
     }
 
-    // Preserve the skipped-dependency overlays in the marker so the next
-    // run (and humans) can see the full picture.
+    // Preserve the marker picture for dependencies this run did not touch.
     let mut artifacts = previous;
     artifacts.retain(|a| !materialized.iter().any(|m| m.package == a.package));
     artifacts.extend(materialized.iter().cloned());
@@ -550,7 +1115,6 @@ pub fn materialize_dependency_artifacts(
         reason: format!("failed to write: {e}"),
     })?;
 
-    let _ = skipped; // reported by the caller through the resolution
     Ok(materialized)
 }
 
@@ -791,9 +1355,17 @@ mod tests {
             .unwrap_or_else(|| panic!("HTTP {status} must fall back"));
             assert!(reason.contains(&format!("HTTP {status}")), "{reason}");
             assert!(reason.contains("no longer exists at this URL"), "{reason}");
-            assert!(reason.contains("source overlay"), "{reason}");
+            assert!(reason.contains("real repository source"), "{reason}");
         }
-        // A record without a digest cannot be verified -> source fallback.
+        // A record without an artifact and a record without a digest both
+        // degrade to the real-source fetch.
+        let reason = source_fallback_reason(&E::NoArtifact {
+            package: "demo-alpha".into(),
+            version: "2.4.0".into(),
+        })
+        .expect("a null artifactUrl must fall back");
+        assert!(reason.contains("no artifactUrl"), "{reason}");
+        assert!(reason.contains("real repository source"), "{reason}");
         let reason = source_fallback_reason(&E::MissingSha256 {
             package: "demo-alpha".into(),
             version: "2.4.0".into(),
@@ -831,10 +1403,6 @@ mod tests {
             E::UnsupportedArtifactUrl {
                 url: URL.into(),
                 reason: "host is not github.com".into(),
-            },
-            E::NoArtifact {
-                package: "demo-alpha".into(),
-                version: "2.4.0".into(),
             },
         ] {
             assert!(
@@ -885,17 +1453,139 @@ mod tests {
             marker.artifacts[0].url.as_deref(),
             Some("https://github.com/acme/pkg/releases/download/v2.4.0/demo_alpha-2.4.0-py3-none-any.whl")
         );
-        // Source-mode entries serialize with null url/sha256 and a reason.
+        // Source-mode entries serialize with the provenance url (the
+        // codeload tarball the tree came from) and no sha256.
         let mut source_entry = marker.artifacts[0].clone();
         source_entry.mode = MaterializationMode::Source;
         source_entry.reason = Some("artifact download answered HTTP 404".into());
-        source_entry.url = None;
+        source_entry.url = Some(
+            "https://codeload.github.com/acme/pkg/tar.gz/0123456789abcdef0123456789abcdef01234567"
+                .into(),
+        );
         source_entry.sha256 = None;
         let value = serde_json::to_value(&source_entry).expect("serialize");
         assert_eq!(value["mode"], "source");
-        assert_eq!(value["url"], serde_json::Value::Null);
+        assert_eq!(
+            value["url"],
+            "https://codeload.github.com/acme/pkg/tar.gz/0123456789abcdef0123456789abcdef01234567"
+        );
         assert_eq!(value["sha256"], serde_json::Value::Null);
         assert!(value["reason"].as_str().unwrap().contains("404"));
+        // Markers written by the pre-provenance fallback (a null url)
+        // still deserialize.
+        let pre_provenance = r#"{
+  "format": "jumbo-artifact-materialization/1",
+  "artifacts": [
+    {
+      "package": "demo-gamma",
+      "version": "1.0.0",
+      "commit": "f00dcafe0123456789abcdef0123456789abcdef0",
+      "mode": "source",
+      "reason": "artifact download answered HTTP 404",
+      "url": null,
+      "sha256": null,
+      "path": "deps/demo-gamma",
+      "sourceOverlayPath": "deps/demo-gamma",
+      "rewritten": null
+    }
+  ]
+}"#;
+        let marker: ArtifactsMarker =
+            serde_json::from_str(pre_provenance).expect("parse pre-provenance marker");
+        assert_eq!(marker.artifacts[0].mode, MaterializationMode::Source);
+        assert_eq!(marker.artifacts[0].url, None);
+    }
+
+    #[test]
+    fn repo_map_loads_and_looks_up_by_every_name_form() {
+        let dir = temp_dir("repomap");
+        let map_path = dir.join("repo-map.json");
+        std::fs::write(
+            &map_path,
+            r#"{
+  "demo-alpha": "https://github.com/acme/demo-alpha",
+  "@juntai/demo-kit": "https://github.com/acme/demo-kit.git",
+  "Meridian_Storage.Semantics": "https://github.com/juntai/meridian-storage"
+}
+"#,
+        )
+        .expect("write map");
+        let map = RepoMap::load(&map_path).expect("load");
+        // Exact, normalized (PEP 503), and slug lookups all resolve — in
+        // either direction between the record's name and the map's key.
+        assert_eq!(
+            map.lookup("demo-alpha"),
+            Some("https://github.com/acme/demo-alpha")
+        );
+        assert_eq!(
+            map.lookup("Demo_Alpha"),
+            Some("https://github.com/acme/demo-alpha")
+        );
+        assert_eq!(
+            map.lookup("@juntai/demo-kit"),
+            Some("https://github.com/acme/demo-kit.git")
+        );
+        assert_eq!(
+            map.lookup("juntai-demo-kit"),
+            Some("https://github.com/acme/demo-kit.git")
+        );
+        assert_eq!(
+            map.lookup("meridian-storage-semantics"),
+            Some("https://github.com/juntai/meridian-storage")
+        );
+        assert_eq!(
+            map.lookup("Meridian_Storage.Semantics"),
+            Some("https://github.com/juntai/meridian-storage")
+        );
+        assert_eq!(map.lookup("unknown-package"), None);
+        assert_eq!(map.path(), map_path.as_path());
+
+        // Bad maps are typed errors: not an object, non-string entry,
+        // non-github URL value.
+        std::fs::write(dir.join("array.json"), "[]").expect("array");
+        let err = RepoMap::load(&dir.join("array.json")).unwrap_err();
+        assert!(err.to_string().contains("top level must be a JSON object"));
+        std::fs::write(dir.join("bad-url.json"), r#"{"x": "https://evil.com/y"}"#).expect("bad");
+        let err = RepoMap::load(&dir.join("bad-url.json")).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("not an https github.com clone URL"));
+        let err = RepoMap::load(&dir.join("missing.json")).unwrap_err();
+        assert!(err.to_string().contains("failed to read"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn source_name_check_normalizes_python_but_not_npm() {
+        let dir = temp_dir("namecheck");
+        let python = dir.join("py");
+        std::fs::create_dir_all(python.join("src")).expect("dirs");
+        std::fs::write(
+            python.join("pyproject.toml"),
+            "[build-system]\nrequires = [\"hatchling\"]\nbuild-backend = \"hatchling.build\"\n\n[project]\nname = \"Demo_Gamma\"\nversion = \"9.9.9\"\n",
+        )
+        .expect("manifest");
+        // Normalized match; version may differ.
+        verify_source_project_name(&python, "demo-gamma", Ecosystem::Python).expect("python ok");
+        let err = verify_source_project_name(&python, "demo-omega", Ecosystem::Python).unwrap_err();
+        assert!(err.to_string().contains("does not match"), "{err}");
+
+        let npm = dir.join("npm");
+        std::fs::create_dir_all(&npm).expect("dirs");
+        std::fs::write(
+            npm.join("package.json"),
+            r#"{ "name": "@acme/demo-kit", "version": "3.0.0" }"#,
+        )
+        .expect("manifest");
+        verify_source_project_name(&npm, "@acme/demo-kit", Ecosystem::Npm).expect("npm ok");
+        let err = verify_source_project_name(&npm, "demo-kit", Ecosystem::Npm).unwrap_err();
+        assert!(err.to_string().contains("does not match"), "{err}");
+
+        // No manifest at all is a typed mismatch.
+        let err =
+            verify_source_project_name(&dir.join("empty"), "x", Ecosystem::Python).unwrap_err();
+        assert!(err.to_string().contains("no pyproject.toml"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

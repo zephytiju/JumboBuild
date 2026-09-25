@@ -605,8 +605,22 @@ pub fn restore_npm_manifest(content: &str, sources: &[InjectedSource]) -> String
     serde_json::to_string_pretty(&doc).unwrap_or_else(|_| content.to_string())
 }
 
+/// Marker string embedded in every jumbo-written minimal stub manifest.
+pub const STUB_MARKER: &str = "jumbo-injected internal source";
+
+/// Whether manifest content is a jumbo-written minimal lock stub (as
+/// opposed to a real project — a fetched repository tree, or user code).
+pub fn manifest_is_stub(content: &str) -> bool {
+    content.contains(STUB_MARKER)
+}
+
 /// Write the minimal source project for one injected internal dependency:
 /// a real, buildable project carrying the index record's name and version.
+///
+/// A non-stub manifest already standing at `deps/<slug>/` — a source
+/// materialization the dedup fallback fetched at the recorded commit — is
+/// never clobbered: regenerating lock inputs must not destroy it, so
+/// repeated runs leave exactly one (real) materialization in place.
 fn write_injected_source_project(
     project_dir: &Path,
     source: &InjectedSource,
@@ -617,6 +631,15 @@ fn write_injected_source_project(
         manifest: project_dir.display().to_string(),
         reason: format!("failed to create {}: {e}", dir.display()),
     })?;
+    let manifest_name = match ecosystem {
+        Ecosystem::Python => "pyproject.toml",
+        Ecosystem::Npm => "package.json",
+    };
+    if let Ok(existing) = std::fs::read_to_string(dir.join(manifest_name)) {
+        if !manifest_is_stub(&existing) {
+            return Ok(()); // a real materialization stands; keep it
+        }
+    }
     match ecosystem {
         Ecosystem::Python => {
             let extras = if source.extras.is_empty() {

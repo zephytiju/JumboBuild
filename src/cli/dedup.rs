@@ -55,6 +55,13 @@ pub struct DedupArgs {
     /// (default: JUMBO_ARTIFACT_DIR when set, otherwise download)
     #[arg(long, value_name = "DIR")]
     pub artifact_dir: Option<PathBuf>,
+
+    /// Repo map for the dependency source fallback: a JSON object mapping
+    /// package name to https github.com clone URL, consulted when a
+    /// record's artifactUrl is not a github.com URL
+    /// (default: JUMBO_REPO_MAP when set)
+    #[arg(long, value_name = "PATH")]
+    pub repo_map: Option<PathBuf>,
 }
 
 /// The ecosystem of a fingerprint report.
@@ -151,6 +158,26 @@ fn artifact_provider(dir: Option<&PathBuf>) -> ArtifactProvider {
     match dir {
         Some(dir) => ArtifactProvider::Cache(dir),
         None => ArtifactProvider::Remote,
+    }
+}
+
+/// The repo map for the dependency source fallback: an explicit
+/// `--repo-map` or the `JUMBO_REPO_MAP` environment variable, loaded when
+/// either is set.
+fn repo_map(path: Option<&PathBuf>) -> Result<Option<dedup::RepoMap>> {
+    let path = path
+        .cloned()
+        .or_else(|| std::env::var("JUMBO_REPO_MAP").ok().map(PathBuf::from));
+    match path {
+        Some(path) => {
+            if !path.exists() {
+                bail!("repo map not found: {}", path.display());
+            }
+            dedup::RepoMap::load(&path)
+                .map(Some)
+                .map_err(|e| anyhow::anyhow!(e))
+        }
+        None => Ok(None),
     }
 }
 
@@ -304,10 +331,12 @@ pub fn execute(args: DedupArgs) -> Result<()> {
                 let manifest = deps_manifest
                     .as_ref()
                     .expect("--deps implies a manifest was resolved");
+                let repo_map = repo_map(args.repo_map.as_ref())?;
                 // Source overlays first (J3's inject-only lock inputs), so
                 // the artifact rewrite always applies to an injected
                 // manifest. The generation carries the resolution taken
-                // against the declared forms.
+                // against the declared forms. A standing real-source
+                // materialization is not clobbered back to a stub.
                 let generation =
                     fingerprint::generate_lock_inputs(manifest, &index).map_err(|e| {
                         anyhow::anyhow!(e)
@@ -319,23 +348,18 @@ pub fn execute(args: DedupArgs) -> Result<()> {
                     ecosystem_of(&report),
                     &provider,
                     &staging,
+                    repo_map.as_ref(),
                 )
                 .map_err(|e| anyhow::anyhow!(e).context("materializing dependency artifacts"))?;
-                // The overlays that stand: records that published no
-                // artifact, plus anything that fell back to source
-                // materialization (a dead or unverifiable artifact record).
-                let mut kept: Vec<String> = generation
-                    .internal
+                // The source materializations that stand: dependencies
+                // whose recorded artifact could not be used (dead asset,
+                // no artifactUrl, no digest) now hold their real repository
+                // source at the recorded commit.
+                let mut kept: Vec<String> = materialized
                     .iter()
-                    .filter(|d| d.record.artifact_url.is_none())
-                    .map(|d| d.name.clone())
+                    .filter(|m| m.mode == dedup::MaterializationMode::Source)
+                    .map(|m| m.package.clone())
                     .collect();
-                kept.extend(
-                    materialized
-                        .iter()
-                        .filter(|m| m.mode == dedup::MaterializationMode::Source)
-                        .map(|m| m.package.clone()),
-                );
                 kept.sort();
                 kept.dedup();
                 materialized_deps = Some(serde_json::json!({

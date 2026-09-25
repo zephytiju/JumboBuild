@@ -309,6 +309,7 @@ Decide build-or-reuse against the index by fingerprint; optionally materialize r
 * `--deps` — Materialize the recorded artifacts of the manifest's internal dependencies, replacing their source overlays (manifest: --manifest or pyproject.toml/package.json in the current directory)
 * `--dist-dir <DIR>` — Build-output directory for a pulled own-record artifact (default: dist)
 * `--artifact-dir <DIR>` — Resolve artifacts by exact file name from a local directory (a CI asset cache or offline fixture directory) instead of downloading; the recorded SHA-256 is still enforced (default: JUMBO_ARTIFACT_DIR when set, otherwise download)
+* `--repo-map <PATH>` — Repo map for the dependency source fallback: a JSON object mapping package name to https github.com clone URL, consulted when a record's artifactUrl is not a github.com URL (default: JUMBO_REPO_MAP when set)
 
 
 
