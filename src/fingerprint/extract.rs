@@ -627,13 +627,7 @@ sdist = { hash = "sha256:aaaa1111", url = "https://files.pythonhosted.org/packag
                     None,
                     Some("deps/demo-alpha")
                 ),
-                entry(
-                    "numpy",
-                    "1.26.4",
-                    EntrySource::PyPI,
-                    Some("aaaa1111"),
-                    None
-                ),
+                entry("numpy", "1.26.4", EntrySource::PyPI, Some("aaaa1111"), None),
             ]
         );
         // Root project excluded; npm-style names untouched here.

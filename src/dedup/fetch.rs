@@ -347,6 +347,18 @@ pub fn download_artifact(url: &ArtifactUrl, dest: &Path) -> Result<(), Materiali
             if code == 200 {
                 return Ok(());
             }
+            // 404/410 are definitive: the release asset is gone at the
+            // recorded URL (deleted or re-published under another tag).
+            // They carry a dedicated variant so the dependency ingestion
+            // path can fall back to source materialization, while every
+            // other status (5xx outages, auth failures, ...) stays a hard
+            // download error — real outages must remain visible.
+            if code == 404 || code == 410 {
+                return Err(MaterializeError::ArtifactGone {
+                    url: current.url.clone(),
+                    status: code,
+                });
+            }
             return Err(MaterializeError::ArtifactDownload {
                 url: current.url.clone(),
                 reason: match code {
@@ -354,7 +366,6 @@ pub fn download_artifact(url: &ArtifactUrl, dest: &Path) -> Result<(), Materiali
                         "HTTP {code}: authentication required or insufficient; set GITHUB_TOKEN, \
                          GH_TOKEN, or run `gh auth login` (credentials are never stored by jumbo)"
                     ),
-                    404 => "HTTP 404: the recorded artifact no longer exists at this URL".into(),
                     other => format!("HTTP {other}"),
                 },
             });

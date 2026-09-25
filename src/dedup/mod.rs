@@ -15,7 +15,12 @@
 //! manifest's internal dependencies in place of their source overlays:
 //! Python wheels enter the uv build as direct wheel sources under
 //! `deps/<slug>/`, Node tarballs via `file:` sources — never a registry
-//! protocol. Null fingerprints (bootstrap records) never match.
+//! protocol. Null fingerprints (bootstrap records) never match. A
+//! dependency whose recorded artifact is definitively unusable — the
+//! download answered 404/410, or the record has no `artifactSha256` —
+//! falls back to its `deps/<slug>/` source overlay at the recorded commit
+//! instead of failing the build; transient (5xx, network) and integrity
+//! (digest mismatch) failures still abort.
 //!
 //! Boundary: the decision and the pull only — no version bumping, no
 //! publication, no index writes, no rebuild orchestration.
@@ -30,7 +35,7 @@ pub use error::MaterializeError;
 pub use fetch::{download_artifact, validate_artifact_url, ArtifactUrl};
 pub use ingest::{
     load_artifacts_marker, materialize_dependency_artifacts, materialize_self_artifact,
-    recorded_sha256, sha256_of_file, stage_and_verify, verify_sha256, ArtifactKind,
-    ArtifactProvider, ArtifactsMarker, MaterializedArtifact, ARTIFACTS_MARKER_FORMAT,
-    DEFAULT_DIST_DIR,
+    recorded_sha256, sha256_of_file, source_fallback_reason, stage_and_verify, verify_sha256,
+    ArtifactKind, ArtifactProvider, ArtifactsMarker, MaterializationMode, MaterializedArtifact,
+    ARTIFACTS_MARKER_FORMAT, DEFAULT_DIST_DIR,
 };

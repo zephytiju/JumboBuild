@@ -313,12 +313,6 @@ pub fn execute(args: DedupArgs) -> Result<()> {
                         anyhow::anyhow!(e)
                             .context(format!("injecting lock inputs for {}", manifest.display()))
                     })?;
-                let kept: Vec<String> = generation
-                    .internal
-                    .iter()
-                    .filter(|d| d.record.artifact_url.is_none())
-                    .map(|d| d.name.clone())
-                    .collect();
                 let materialized = dedup::materialize_dependency_artifacts(
                     manifest,
                     &generation.internal,
@@ -327,6 +321,23 @@ pub fn execute(args: DedupArgs) -> Result<()> {
                     &staging,
                 )
                 .map_err(|e| anyhow::anyhow!(e).context("materializing dependency artifacts"))?;
+                // The overlays that stand: records that published no
+                // artifact, plus anything that fell back to source
+                // materialization (a dead or unverifiable artifact record).
+                let mut kept: Vec<String> = generation
+                    .internal
+                    .iter()
+                    .filter(|d| d.record.artifact_url.is_none())
+                    .map(|d| d.name.clone())
+                    .collect();
+                kept.extend(
+                    materialized
+                        .iter()
+                        .filter(|m| m.mode == dedup::MaterializationMode::Source)
+                        .map(|m| m.package.clone()),
+                );
+                kept.sort();
+                kept.dedup();
                 materialized_deps = Some(serde_json::json!({
                 "materialized": serde_json::to_value(&materialized)?,
                 "keptSourceOverlays": kept,

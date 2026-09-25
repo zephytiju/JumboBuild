@@ -239,8 +239,10 @@ pub fn reproduce(
                     version: dep_record.version.clone(),
                     commit: dep_record.commit.clone(),
                     build_id: dep_record.build_id.clone(),
-                    url: url.url.clone(),
-                    sha256,
+                    mode: crate::dedup::MaterializationMode::Artifact,
+                    reason: None,
+                    url: Some(url.url.clone()),
+                    sha256: Some(sha256),
                     path: relative,
                     source_overlay_path: Some(format!("deps/{slug}")),
                     rewritten: None,
@@ -267,8 +269,10 @@ pub fn reproduce(
             version: record.version.clone(),
             commit: record.commit.clone(),
             build_id: record.build_id.clone(),
-            url: url.url.clone(),
-            sha256,
+            mode: crate::dedup::MaterializationMode::Artifact,
+            reason: None,
+            url: Some(url.url.clone()),
+            sha256: Some(sha256),
             path: format!("dist/{}", url.file_name),
             source_overlay_path: None,
             rewritten: None,
@@ -455,7 +459,10 @@ mod tests {
         assert_eq!(report.recomputed_fingerprint, report.recorded_fingerprint);
         // The own artifact reproduced the recorded digest.
         let own = report.artifact.as_ref().expect("own artifact");
-        assert_eq!(own.sha256, sha256_hex(b"consumer wheel bytes"));
+        assert_eq!(
+            own.sha256.as_deref(),
+            Some(sha256_hex(b"consumer wheel bytes").as_str())
+        );
         assert_eq!(own.path, "dist/consumer-2.4.0-py3-none-any.whl");
         assert!(out
             .join("dist")
