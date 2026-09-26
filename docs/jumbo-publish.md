@@ -12,7 +12,9 @@ secrets, and nothing else.
 - Workflow: [`.github/workflows/jumbo-publish.yml`](../.github/workflows/jumbo-publish.yml)
 - Member forwarder template: [`templates/member-jumbo-publish.yml`](../templates/member-jumbo-publish.yml)
 - Index append implementation: [`scripts/jumbo_index_append.py`](../scripts/jumbo_index_append.py)
-  (unit tests: [`scripts/tests/test_jumbo_index_append.py`](../scripts/tests/test_jumbo_index_append.py))
+  (unit tests: [`scripts/tests/test_jumbo_index_append.py`](../scripts/tests/test_jumbo_index_append.py),
+  run in CI by [`index-append.yml`](../.github/workflows/index-append.yml) — including the
+  concurrent two-writer race that must converge to exactly one record and one artifact)
 
 ## The two-line caller
 
