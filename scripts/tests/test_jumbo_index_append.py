@@ -6,8 +6,10 @@ version, duplicate fingerprint — same file and cross-file — non-increasing
 version), the non-fast-forward retry (a concurrent append lands on the
 remote first; the push is retried on the fresh tip without rewriting
 anything), the idempotent already-recorded path, the exhausted-retry
-refusal, and validator rejection. No network, no credentials: pushes go to
-a local bare repository over the file:// protocol.
+refusal, validator rejection, and a true concurrent two-writer race on the
+same fingerprint (two processes launched in real time converge to exactly
+one record; the loser receives the existing record). No network, no
+credentials: pushes go to a local bare repository over the file:// protocol.
 """
 
 from __future__ import annotations
@@ -52,7 +54,13 @@ def run_git(cwd: Path, *args: str) -> str:
     env.pop("GIT_CONFIG_GLOBAL", None)
     env["GIT_CONFIG_GLOBAL"] = "/dev/null"
     env["GIT_CONFIG_SYSTEM"] = "/dev/null"
-    proc = subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True, env=env)
+    # Harness commits must not depend on the ambient git identity (CI runners
+    # have none; clones do not inherit the fixture's repo-local config).
+    proc = subprocess.run(
+        ["git", "-C", str(cwd), "-c", "user.name=Append Test",
+         "-c", "user.email=append-test@invalid", *args],
+        capture_output=True, text=True, env=env,
+    )
     assert proc.returncode == 0, f"git {args} failed: {proc.stderr}"
     return proc.stdout.strip()
 
@@ -204,6 +212,93 @@ class PreconditionRefusals(unittest.TestCase):
         self.assertEqual(proc.returncode, 1)
         self.assertIn("strictly greater", proc.stderr)
         self.assertEqual(len((index / "index" / "demo-pkg.jsonl").read_text().splitlines()), 1)
+
+
+class TrueConcurrentRace(unittest.TestCase):
+    """Two writers racing in real time on the same fingerprint.
+
+    The PushRetryProtocol tests stage the race sequentially (the rival
+    completes before our push starts). This test launches two append
+    processes *concurrently* against the same remote — the shape the
+    acceptance criterion describes: concurrent pipelines covering the same
+    repository. The invariants hold under every interleaving (fully
+    serialized or truly racing): exactly one record lands, the loser
+    receives the existing record — the winner's, never its own draft — and
+    exactly one artifact coordinate exists for the fingerprint.
+    """
+
+    def setUp(self):
+        self.origin = bare_origin("race")
+        seed = make_index_repo("race-seed", {"demo-pkg.jsonl": [
+            record(version="1.0.0", fingerprint="0" * 64, timestamp="2026-09-01T00:00:00Z")
+        ]})
+        run_git(seed, "push", "-q", str(self.origin), "main:main")
+        self.writer_a = clone("race-a", self.origin)
+        self.writer_b = clone("race-b", self.origin)
+
+    def test_two_concurrent_writers_same_fingerprint_converge_to_one_record(self):
+        # Two pipeline runs covered the same repository: identical inputs —
+        # same package, version, fingerprint, and artifact — differing only
+        # in their run identities (timestamp, buildId, pipelineRun).
+        rec_a = record(version="1.1.0", fingerprint="e" * 64,
+                       buildId="demo-pkg-1.1.0-gha111",
+                       pipelineRun="https://github.com/example/repo/actions/runs/111")
+        rec_b = record(version="1.1.0", fingerprint="e" * 64,
+                       timestamp="2026-09-23T00:00:07Z",
+                       buildId="demo-pkg-1.1.0-gha222",
+                       pipelineRun="https://github.com/example/repo/actions/runs/222")
+        self.assertEqual(rec_a["artifactUrl"], rec_b["artifactUrl"])
+        self.assertEqual(rec_a["artifactSha256"], rec_b["artifactSha256"])
+
+        argv = lambda writer, rec: [
+            sys.executable, str(SCRIPT), "--index-dir", str(writer),
+            "--record", json.dumps(rec), "--push", "--backoff-base", "0",
+        ]
+        # Launch both writers before reaping either so their precondition
+        # checks race on the same tip whenever the OS schedules them so.
+        procs = [
+            subprocess.Popen(argv(w, r), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            for w, r in ((self.writer_a, rec_a), (self.writer_b, rec_b))
+        ]
+        results = []
+        for proc in procs:
+            out, errout = proc.communicate(timeout=120)
+            self.assertEqual(proc.returncode, 0, errout)
+            results.append(json.loads(out))
+
+        # One winner, one loser; the loser reports already-recorded.
+        statuses = sorted(r["status"] for r in results)
+        self.assertEqual(statuses, ["already-recorded", "appended"],
+                         f"both writers must converge, got {statuses}")
+        winner, loser = (results if results[0]["status"] == "appended"
+                         else [results[1], results[0]])
+        self.assertTrue(winner["pushed"])
+
+        # The remote holds exactly one 1.1.0 record: never a duplicate.
+        verify = clone("race-verify", self.origin)
+        lines = (verify / "index" / "demo-pkg.jsonl").read_text().splitlines()
+        self.assertEqual(len(lines), 2)
+        self.assertEqual(json.loads(lines[0])["version"], "1.0.0")
+        landed = json.loads(lines[1])
+        self.assertEqual(landed["version"], "1.1.0")
+
+        # The loser received the *existing* record — the winner's, with the
+        # winner's run identity — so both writers converge on the same
+        # artifact coordinate: one record, one artifact.
+        self.assertEqual(loser["conflictReason"], "version already recorded")
+        self.assertEqual(loser["conflict"], landed)
+        self.assertEqual(loser["conflict"]["buildId"], landed["buildId"])
+        self.assertEqual(landed["artifactUrl"], rec_a["artifactUrl"])
+        self.assertEqual(landed["artifactSha256"], rec_a["artifactSha256"])
+
+        # Exactly two commits in total: the fixture and the single append.
+        self.assertEqual(
+            run_git(verify, "rev-list", "--count", "HEAD"), "2"
+        )
+        self.assertIn(
+            f"index: append demo-pkg@1.1.0 ({rec_a['executor']})",
+            run_git(verify, "log", "-1", "--pretty=%s"),
+        )
 
 
 class PushRetryProtocol(unittest.TestCase):

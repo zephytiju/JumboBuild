@@ -1,0 +1,36 @@
+name: Index append hardening
+
+# The JumboIndex append client (scripts/jumbo_index_append.py) and its
+# protocol suite: canonical record shape, every precondition refusal, the
+# fast-forward-only push with bounded retry, and the concurrent two-writer
+# race on an equal fingerprint (exactly one record and one artifact; the
+# loser receives the existing record). The suite is offline by design: the
+# remote is a local bare repository, and no credential ever exists.
+
+on:
+  pull_request:
+    paths:
+      - "scripts/jumbo_index_append.py"
+      - "scripts/tests/**"
+      - ".github/workflows/index-append.yml"
+  push:
+    branches:
+      - main
+    paths:
+      - "scripts/jumbo_index_append.py"
+      - "scripts/tests/**"
+      - ".github/workflows/index-append.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  append-protocol:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Run the append-protocol suite (incl. the concurrent-writer race)
+        run: python3 scripts/tests/test_jumbo_index_append.py -v
