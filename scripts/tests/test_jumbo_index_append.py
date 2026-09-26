@@ -54,7 +54,13 @@ def run_git(cwd: Path, *args: str) -> str:
     env.pop("GIT_CONFIG_GLOBAL", None)
     env["GIT_CONFIG_GLOBAL"] = "/dev/null"
     env["GIT_CONFIG_SYSTEM"] = "/dev/null"
-    proc = subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True, env=env)
+    # Harness commits must not depend on the ambient git identity (CI runners
+    # have none; clones do not inherit the fixture's repo-local config).
+    proc = subprocess.run(
+        ["git", "-C", str(cwd), "-c", "user.name=Append Test",
+         "-c", "user.email=append-test@invalid", *args],
+        capture_output=True, text=True, env=env,
+    )
     assert proc.returncode == 0, f"git {args} failed: {proc.stderr}"
     return proc.stdout.strip()
 
