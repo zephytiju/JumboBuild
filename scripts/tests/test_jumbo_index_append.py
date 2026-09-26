@@ -132,6 +132,40 @@ class CanonicalShape(unittest.TestCase):
             with self.assertRaises(jia.AppendError):
                 jia.validate_record(bad)
 
+    def test_image_digest_shape_is_enforced(self):
+        # A well-formed GHCR digest passes.
+        jia.validate_record(record(imageDigest="sha256:" + "d" * 64))
+        # Malformed or misplaced values never reach the index.
+        for bad in [
+            record(imageDigest="d" * 64),  # missing the sha256: prefix
+            record(imageDigest="sha256:ZZ" + "d" * 62),  # not hex
+            record(imageDigest="sha256:short"),  # truncated
+            record(imageDigest=""),  # empty
+        ]:
+            with self.assertRaises(jia.AppendError):
+                jia.validate_record(bad)
+
+    def test_artifact_url_host_is_allowlisted(self):
+        # Release-asset hosts the standard allows (§3.4, matching the
+        # JumboIndex index-side validator's allowlist).
+        for host in ["github.com", "objects.githubusercontent.com", "release-assets.githubusercontent.com"]:
+            jia.validate_record(record(artifactUrl=f"https://{host}/example/demo-pkg/releases/download/v1.0.0/x.whl"))
+        # Everything else is refused before it can reach the index: other
+        # registries, non-https, and localhost/loopback/private/reserved
+        # addresses in any spelling.
+        for bad in [
+            record(artifactUrl="https://evil.example/x"),
+            record(artifactUrl="https://ghcr.io/v2/demo/manifests/1"),  # not a release-asset host
+            record(artifactUrl="http://github.com/example/demo-pkg/releases/download/v1.0.0/x.whl"),
+            record(artifactUrl="https://127.0.0.1/x"),
+            record(artifactUrl="https://[::1]/x"),
+            record(artifactUrl="https://10.0.0.1/x"),
+            record(artifactUrl="https://169.254.169.254/latest/meta-data"),
+            record(artifactUrl="https://192.168.1.4/x"),
+        ]:
+            with self.assertRaises(jia.AppendError):
+                jia.validate_record(bad)
+
     def test_extraheader_carries_the_token_from_env_not_argv(self):
         class FakeProc:
             returncode = 0

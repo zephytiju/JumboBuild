@@ -9,9 +9,14 @@
 # on the CALLER repository, appends the JumboIndex record per that
 # repository's docs/APPEND-PROTOCOL.md, and (opt-in, default off) republishes
 # to the public registry so external consumers keep being served — driven by
-# the jumbo-computed version. A fingerprint hit (dedup) skips the build in
-# this executor exactly as in CircleCI: the recorded artifact is pulled,
-# SHA-256 verified, and the run ends without publishing.
+# the jumbo-computed version. Image-producing packages opt in with
+# publish-image: true — the service image (Dockerfile at the repository
+# root) is built from the same release commit and pushed to GHCR, and the
+# pushed digest is verified against the registry (a digest mismatch aborts
+# the build before any index append, standard §3.7 failure behavior) before
+# being recorded as the record's imageDigest. A fingerprint hit (dedup)
+# skips the build in this executor exactly as in CircleCI: the recorded
+# artifact is pulled, SHA-256 verified, and the run ends without publishing.
 #
 # Caller usage (see docs/jumbo-publish.md for the full contract):
 #
@@ -21,6 +26,7 @@
 #       secrets: inherit
 #       permissions:
 #         contents: write
+#         packages: write   # only needed with publish-image: true (GHCR push)
 #
 # Required secrets (org-level, passed with `secrets: inherit`):
 #   JUNTAI_GITHUB_ARTIFACT_TOKEN - reads the private JumboBuild checkout and
@@ -30,6 +36,8 @@
 #     GitHub App or user token with contents:write on zephytiju/JumboIndex).
 #   PYPI_TOKEN / NPM_TOKEN       - only when publish-to-public-registry is
 #     enabled; never referenced in this file as a literal, only via secrets.
+#   The GHCR push uses the caller's own GITHUB_TOKEN with packages: write;
+#   no additional secret exists or is read for images.
 #
 # Credentials enter exclusively through secrets/env. No credential literals
 # appear in this workflow, and outbound traffic goes to github.com plus the
@@ -52,6 +60,10 @@ on:
         description: "Also publish to PyPI/npm for external consumers, driven by the jumbo-computed version"
         type: boolean
         default: false
+      publish-image:
+        description: "Build and push the service image (Dockerfile at the repository root) to GHCR; the verified digest is recorded as the index record's imageDigest"
+        type: boolean
+        default: false
       index-repository:
         description: "JumboIndex repository (owner/name)"
         type: string
@@ -72,6 +84,9 @@ on:
       reused:
         description: "'true' when a fingerprint hit skipped the build"
         value: ${{ jobs.publish.outputs.reused }}
+      image-digest:
+        description: "Verified GHCR image digest (sha256:...) when publish-image was enabled and the image was pushed; empty otherwise"
+        value: ${{ jobs.publish.outputs.image-digest }}
   workflow_dispatch:
     inputs:
       commit:
@@ -86,6 +101,10 @@ on:
         description: "Also publish to PyPI/npm for external consumers, driven by the jumbo-computed version"
         type: boolean
         default: false
+      publish-image:
+        description: "Build and push the service image (Dockerfile at the repository root) to GHCR; the verified digest is recorded as the index record's imageDigest"
+        type: boolean
+        default: false
       index-repository:
         description: "JumboIndex repository (owner/name)"
         type: string
@@ -93,9 +112,13 @@ on:
 
 # The GitHub Release carrying the artifacts is created on the caller
 # repository; reusable workflows cannot elevate permissions, so the caller
-# must grant contents: write on the calling job.
+# must grant contents: write on the calling job. Image publication (opt-in
+# publish-image) additionally needs the caller to grant packages: write:
+# the called workflow can only downgrade, never elevate, what the calling
+# workflow passes to the GITHUB_TOKEN.
 permissions:
   contents: write
+  packages: write
 
 # Publication runs queue per ref (never cancelled mid-flight); the index
 # append protocol makes concurrent runs converge idempotently regardless.
@@ -121,6 +144,7 @@ jobs:
       bump: ${{ steps.identity.outputs.bump }}
       published: ${{ steps.release.outputs.published }}
       reused: ${{ steps.dedup.outputs.duplicate }}
+      image-digest: ${{ steps.image-verify.outputs.digest }}
     steps:
       - name: Resolve the release commit and the JumboBuild coordinates
         id: coords
@@ -368,13 +392,75 @@ jobs:
             echo "asset-url=https://github.com/${GITHUB_REPOSITORY}/releases/download/${tag}/${asset}"
           } >> "$GITHUB_OUTPUT"
 
-      # 8. Append the index record per JumboIndex docs/APPEND-PROTOCOL.md:
+      # 8. Service image (opt-in, image-producing packages): build the image
+      #    from the same release commit and push it to GHCR, the image
+      #    registry of the standard (§3.4). The pushed digest is then
+      #    verified against the registry BEFORE anything is recorded: a
+      #    digest mismatch aborts the build (§3.7 failure behavior) — the
+      #    index append below never runs with unverified provenance.
+      - name: Resolve the GHCR image coordinates
+        id: image-coords
+        if: inputs.publish-image == true && steps.promote.outputs.publish_required == 'true'
+        env:
+          JUMBO_VERSION: ${{ steps.identity.outputs.version }}
+        run: |
+          set -euo pipefail
+          # GHCR requires lowercase image paths.
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          echo "image=$image"
+          {
+            echo "image=$image"
+            echo "tag=$image:v${JUMBO_VERSION}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx (service image publication)
+        if: inputs.publish-image == true && steps.promote.outputs.publish_required == 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR (service image publication)
+        if: inputs.publish-image == true && steps.promote.outputs.publish_required == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Build and push the service image to GHCR
+        id: image
+        if: inputs.publish-image == true && steps.promote.outputs.publish_required == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ steps.image-coords.outputs.tag }}
+
+      - name: Verify the pushed image digest against the registry (§3.7)
+        id: image-verify
+        if: inputs.publish-image == true && steps.promote.outputs.publish_required == 'true'
+        env:
+          JUMBO_IMAGE_TAG: ${{ steps.image-coords.outputs.tag }}
+          JUMBO_PUSHED_DIGEST: ${{ steps.image.outputs.digest }}
+        run: |
+          set -euo pipefail
+          bash jumbobuild/scripts/verify_image_digest.sh \
+            --image "$JUMBO_IMAGE_TAG" \
+            --expected "$JUMBO_PUSHED_DIGEST"
+          # The registry-observed digest that matched the push is the only
+          # value allowed into the index record.
+          observed="$(docker buildx imagetools inspect "$JUMBO_IMAGE_TAG" | sed -n 's/^Digest:[[:space:]]*//p' | head -n 1)"
+          echo "digest=$observed" >> "$GITHUB_OUTPUT"
+          echo "::notice title=jumbo image::${JUMBO_IMAGE_TAG} verified at ${observed}"
+
+      # 9. Append the index record per JumboIndex docs/APPEND-PROTOCOL.md:
       #    serialized fast-forward append, fetch-and-retry on non-FF,
-      #    validator-gated, no history rewrites ever.
+      #    validator-gated, no history rewrites ever. imageDigest carries
+      #    the verified GHCR digest when the image was pushed, else null.
       - name: Append the index record to JumboIndex
         if: steps.release.outputs.published == 'true'
         env:
           JUMBO_INDEX_TOKEN: ${{ secrets.JUNTAI_INDEX_TOKEN }}
+          JUMBO_IMAGE_DIGEST: ${{ steps.image-verify.outputs.digest }}
         run: |
           set -euo pipefail
           build_id="${{ steps.identity.outputs.package }}-${{ steps.identity.outputs.version }}-gha${GITHUB_RUN_ID}"
@@ -383,6 +469,7 @@ jobs:
             --arg version "${{ steps.identity.outputs.version }}" \
             --arg artifactUrl "${{ steps.release.outputs.asset-url }}" \
             --arg artifactSha256 "${{ steps.checksums.outputs.asset-sha256 }}" \
+            --arg imageDigest "$JUMBO_IMAGE_DIGEST" \
             --arg buildId "$build_id" \
             --arg pipelineRun "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
             --arg timestamp "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
@@ -395,7 +482,7 @@ jobs:
               canonicalExtract: $p.canonicalExtract,
               artifactUrl: $artifactUrl,
               artifactSha256: $artifactSha256,
-              imageDigest: null,
+              imageDigest: (if $imageDigest == "" then null else $imageDigest end),
               buildId: $buildId,
               pipelineRun: $pipelineRun,
               executor: "jumbo-publish-github-actions",
@@ -408,7 +495,7 @@ jobs:
             --push \
             --token-env JUMBO_INDEX_TOKEN
 
-      # 9. Opt-in public registry publication — public packages keep
+      # 10. Opt-in public registry publication — public packages keep
       #    serving external consumers, always driven by the jumbo-computed
       #    version (set in the build step above). Credentials come only
       #    from caller secrets; nothing is published when the gate is off.
@@ -449,6 +536,10 @@ jobs:
               echo "- package: \`${{ steps.identity.outputs.package }}\`"
               echo "- version: \`${{ steps.identity.outputs.version }}\` (bump: ${{ steps.identity.outputs.bump }})"
               echo "- published: ${{ steps.release.outputs.published == 'true' }}"
+              if [[ -n "${{ steps.image-verify.outputs.digest }}" ]]; then
+                echo "- image: \`${{ steps.image-coords.outputs.tag }}\`"
+                echo "- image digest (verified): \`${{ steps.image-verify.outputs.digest }}\`"
+              fi
               echo "- public registry: ${{ inputs.publish-to-public-registry }}"
             fi
           } >> "$GITHUB_STEP_SUMMARY"
