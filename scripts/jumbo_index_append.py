@@ -35,12 +35,14 @@ from __future__ import annotations
 
 import argparse
 import base64
+import ipaddress
 import json
 import os
 import re
 import subprocess
 import sys
 import time
+import urllib.parse
 from pathlib import Path
 from typing import Any
 
@@ -64,8 +66,16 @@ RECORD_KEYS = (
 
 COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+IMAGE_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 VERSION_RE = re.compile(r"^\d+\.\d+\.\d+[A-Za-z0-9.+-]*$")
 TIMESTAMP_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$")
+
+# Release-asset hosts the standard allows in artifactUrl (GitHub Releases
+# assets on the package repository, §3.4) — the same allowlist the JumboIndex
+# index-side validator enforces, so a record the executor accepts the index
+# accepts too. Anything else (other hosts, localhost/loopback, private or
+# reserved IP literals) is refused before it can reach the index.
+ALLOWED_ARTIFACT_HOSTS = {"github.com", "objects.githubusercontent.com", "release-assets.githubusercontent.com"}
 
 
 class AppendError(RuntimeError):
@@ -106,13 +116,32 @@ def validate_record(record: dict[str, Any]) -> None:
     if fingerprint is not None and (not isinstance(fingerprint, str) or not SHA256_RE.match(fingerprint)):
         raise AppendError("fingerprint must be a 64-hex digest or null")
     url = record["artifactUrl"]
-    if url is not None and (not isinstance(url, str) or not url.startswith("https://")):
-        raise AppendError("artifactUrl must be an https:// URL or null")
+    if url is not None:
+        if not isinstance(url, str):
+            raise AppendError("artifactUrl must be an https:// URL or null")
+        try:
+            parsed = urllib.parse.urlsplit(url)
+        except ValueError as exc:
+            raise AppendError(f"artifactUrl is not a parseable URL: {exc}") from exc
+        if parsed.scheme != "https":
+            raise AppendError("artifactUrl must be an https:// URL or null")
+        host = parsed.hostname or ""
+        if host.lower() not in ALLOWED_ARTIFACT_HOSTS:
+            raise AppendError(f"artifactUrl host {host!r} is not in the release-asset allowlist")
+        try:
+            addr = ipaddress.ip_address(host)
+            if not addr.is_global:
+                raise AppendError("artifactUrl must not resolve to a non-global address")
+        except ValueError:
+            pass  # a hostname, not an IP literal
     sha = record["artifactSha256"]
     if sha is not None and (not isinstance(sha, str) or not SHA256_RE.match(sha)):
         raise AppendError("artifactSha256 must be a 64-hex digest or null")
     if sha is not None and url is None:
         raise AppendError("artifactSha256 set without artifactUrl")
+    image_digest = record["imageDigest"]
+    if image_digest is not None and (not isinstance(image_digest, str) or not IMAGE_DIGEST_RE.match(image_digest)):
+        raise AppendError("imageDigest must be a sha256:<64-hex> image digest or null")
     if not isinstance(record["executor"], str) or not record["executor"]:
         raise AppendError("executor must be a non-empty string")
     timestamp = record["timestamp"]

@@ -86,12 +86,14 @@ jobs:
 | `commit` | string | `""` | Commit SHA of the caller repository to release; empty means the triggering commit. `workflow_dispatch` uses it to re-release a specific commit. |
 | `ecosystem` | string | `auto` | `python`, `npm`, or `auto` (detected from the package manifest by jumbo). |
 | `publish-to-public-registry` | boolean | `false` | Opt-in publication to PyPI/npm for external consumers, always driven by the jumbo-computed version. |
+| `publish-image` | boolean | `false` | Opt-in for **image-producing packages**: build the service image (`Dockerfile` at the repository root) from the same release commit, push it to GHCR, verify the pushed digest against the registry, and record it as the record's `imageDigest`. See [Image-producing packages](#image-producing-packages). |
 | `index-repository` | string | `zephytiju/JumboIndex` | The index repository to resolve against and append to. |
 
 Workflow outputs (for downstream jobs): `package`, `version`, `bump`
 (`none|minor|patch|bootstrap`), `published` (`true` when artifacts were
 published and the index appended), `reused` (`true` when a fingerprint hit
-skipped the build).
+skipped the build), and `image-digest` (the verified `sha256:...` GHCR digest
+when `publish-image` was enabled and the image was pushed; empty otherwise).
 
 ## Required secrets
 
@@ -111,7 +113,9 @@ may ever appear as a literal in any repository file.
   private, so the caller must be in the same GitHub organization
   (`zephytiju`) — public Meridian-family repositories qualify.
 - The calling job grants `permissions: contents: write` (the GitHub Release
-  on the caller repository). No other permission is requested.
+  on the caller repository). Image-producing packages additionally grant
+  `packages: write` (the GHCR push with the caller's `GITHUB_TOKEN`) — only
+  with `publish-image: true`. No other permission is requested.
 - The GitHub App (or user) behind `JUNTAI_GITHUB_ARTIFACT_TOKEN` needs read
   access to `zephytiju/JumboBuild` and `zephytiju/JumboIndex`.
 - The GitHub App (or user) behind `JUNTAI_INDEX_TOKEN` needs write (push)
@@ -131,6 +135,7 @@ may ever appear as a literal in any repository file.
 | Promote | `jumbo promote` | Decision JSON; `publishRequired` is true exactly when a new version was computed. |
 | Build on bump | `uv build` / `npm pack` | The manifest keeps declaring only the major; the build's version is set from the decision's `publish.version` before building. |
 | Checksums + Release | `sha256sum` → `gh release create v<version>` on the **caller** repository | Assets + `SHA256SUMS`; notes carry the version, bump, commit, fingerprint, executor, and run URL. |
+| Service image (opt-in) | `docker/build-push-action@v6` → `scripts/verify_image_digest.sh` | Only with `publish-image: true`: build the `Dockerfile` at the repository root from the same release commit, push to `ghcr.io/<owner>/<repo>:v<version>`, then verify the pushed digest against the registry **before** anything is recorded — a digest mismatch aborts the build with no index append (standard §3.7). |
 | Index append | `scripts/jumbo_index_append.py --push` | JumboIndex append protocol: canonical one-line record, serialized fast-forward push, fetch-and-retry on non-FF (bounded backoff), validator-gated, no history rewrites ever. `executor` is `jumbo-publish-github-actions`. |
 | Public registry (opt-in) | `uv publish` / `npm publish` | Gated by `publish-to-public-registry` (default **off**); version always the jumbo-computed one; tokens only from caller secrets. |
 
@@ -140,12 +145,60 @@ The appended record has exactly the JumboIndex record shape (the CircleCI
 executor appends the same fields): `package`, `major`, `version`, `commit`,
 `fingerprint`, `canonicalExtract` from the promotion decision's `publish`
 block, plus the executor-filled `artifactUrl` (the release asset URL of the
-primary artifact), `artifactSha256`, `imageDigest` (`null` here — this
-workflow ships language artifacts, not service images), `buildId`
+primary artifact), `artifactSha256`, `imageDigest` (the verified GHCR digest
+when `publish-image` was enabled — else `null`; see
+[Image-producing packages](#image-producing-packages)), `buildId`
 (`<package>-<version>-gha<run id>`), `pipelineRun` (the caller's Actions run
 URL), `executor` (`jumbo-publish-github-actions`), and `timestamp`. The
 index covers public and private packages uniformly, so consumers resolve
 both through the same major-based rule.
+
+## Image-producing packages
+
+A package that produces a service image opts in with `publish-image: true`
+and grants `packages: write` on the calling job. The contract for that path
+(the standard's §3.4/§3.6/§3.7 requirements, executor form):
+
+```yaml
+jobs:
+  jumbo-publish:
+    uses: zephytiju/JumboBuild/.github/workflows/jumbo-publish.yml@<ref>
+    secrets: inherit
+    permissions:
+      contents: write
+      packages: write   # only needed with publish-image: true (GHCR push)
+    with:
+      publish-image: true
+```
+
+- **Registry**: service images live on GHCR only (`ghcr.io/<owner>/<repo>:v<version>`,
+  lowercase as GHCR requires). The digest verification refuses to inspect any
+  reference whose registry is not exactly `ghcr.io` — no other registry,
+  localhost/loopback, or private address is ever contacted for images.
+- **Same release commit**: the image is built from the caller repository's
+  checkout at the release commit — the exact commit the language artifacts,
+  the release tag, and the index record refer to.
+- **Credentials**: the push authenticates with the caller's own `GITHUB_TOKEN`
+  (`packages: write`); no image-specific secret exists. Digests are public
+  values; no credential literal appears anywhere.
+- **Provenance before recording**: after the push, the workflow verifies the
+  registry-observed digest equals the digest the push reported
+  (`scripts/verify_image_digest.sh`). The verified digest is the only value
+  ever written to the record's `imageDigest` field — the field deployment
+  pinning consumes (§3.6). A mismatch or malformed digest aborts the build
+  **before** the index append, so no record can carry unverified provenance
+  (§3.7 failure behavior). The GitHub Release may exist unrecorded after an
+  abort; resolution only ever goes through the index, so nothing consumes it.
+- **Dedup**: a fingerprint hit skips the build, and with it the image leg —
+  reuse pulls the recorded language artifact and never re-publishes an image.
+- **CI evidence**: `.github/workflows/jumbo-publish-image-check.yml`
+  exercises this exact path against the real registry on every change to it —
+  build → push → digest verification (positive control) → §3.7 mismatch and
+  malformed-digest and non-GHCR-host negative controls → capture of the
+  verified digest into a record that passes the executor-side validation.
+  The fixture record is uploaded as run evidence and is deliberately **not**
+  appended to the authoritative JumboIndex: records are append-only, and a
+  fixture package is not a real promoted internal package.
 
 ## Local verification (no real publications)
 
