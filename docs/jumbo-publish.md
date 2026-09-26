@@ -10,6 +10,7 @@ per-repo release workflow logic**: it calls the workflow, inherits the org
 secrets, and nothing else.
 
 - Workflow: [`.github/workflows/jumbo-publish.yml`](../.github/workflows/jumbo-publish.yml)
+- Member forwarder template: [`templates/member-jumbo-publish.yml`](../templates/member-jumbo-publish.yml)
 - Index append implementation: [`scripts/jumbo_index_append.py`](../scripts/jumbo_index_append.py)
   (unit tests: [`scripts/tests/test_jumbo_index_append.py`](../scripts/tests/test_jumbo_index_append.py))
 
@@ -39,10 +40,27 @@ grant the release write it needs (GitHub Releases on the caller repository):
       contents: write
 ```
 
-A complete caller workflow:
+A complete caller workflow is committed as the **member forwarder template**
+at [`templates/member-jumbo-publish.yml`](../templates/member-jumbo-publish.yml).
+It lives outside JumboBuild's own `.github/workflows/` so GitHub Actions never
+picks it up in this repository. To adopt it:
+
+1. Copy the template into your repository as
+   `.github/workflows/jumbo-publish.yml` (the file name is yours to choose;
+   only the location is fixed).
+2. Replace `<ref>` with the JumboBuild tag or full commit SHA you release
+   with (see the pinning note above).
+3. Nothing else — no inputs to wire, no release steps to add. The forwarder
+   triggers on `push` to your default branch and on `workflow_dispatch`
+   (which is how Mahout-orchestrated re-releases dispatch it), inherits the
+   org secrets, and grants `contents: write` for the GitHub Release on your
+   repository.
+
+The template, in full:
 
 ```yaml
-name: jumbo release
+name: jumbo publish
+
 on:
   push:
     branches: [main]
@@ -52,6 +70,9 @@ jobs:
   jumbo-publish:
     uses: zephytiju/JumboBuild/.github/workflows/jumbo-publish.yml@<ref>
     secrets: inherit
+    # Reusable workflows cannot elevate permissions; the GitHub Release and
+    # the tag it creates live on THIS repository, so the calling job grants
+    # contents: write. No other permission is needed.
     permissions:
       contents: write
 ```
