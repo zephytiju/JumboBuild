@@ -1,0 +1,176 @@
+# CI acceptance check for the jumbo-publish image-provenance contract
+# (Jumbo Build & Versioning Standard, §3.4/§3.5/§3.6/§3.7).
+#
+# The reusable jumbo-publish workflow publishes images for image-producing
+# packages; this check exercises that exact image leg in CI so the gate is
+# verified continuously rather than only on the first onboarding:
+#
+#   1. §3.7 negative control: a malformed expected digest aborts the build
+#      before any registry contact.
+#   2. A sample image-producing package publishes to GHCR from this commit
+#      (fixture: tests/fixtures/image-sample) and the pushed digest is
+#      verified against the registry with the same script the reusable
+#      workflow uses (scripts/verify_image_digest.sh).
+#   3. §3.7 negative control on the live registry: an expected digest that
+#      differs from the registry digest aborts the build.
+#   4. The verified digest is captured into a record with the JumboIndex
+#      record shape (schema/record.schema.json fields) and passes the same
+#      executor-side record validation the index append runs. The record is
+#      uploaded as a run artifact for evidence; the authoritative JumboIndex
+#      is never appended by this check (a fixture package is not a real
+#      promoted internal package, and index records are append-only).
+#   5. The executor-side record validation unit tests
+#      (scripts/tests/test_jumbo_index_append.py) run in the same job, so
+#      the imageDigest and artifactUrl provenance gates are verified
+#      continuously too.
+#
+# Credentials: the GHCR push uses this repository's GITHUB_TOKEN (packages:
+# write). No credential literal appears anywhere in this file.
+name: jumbo publish image check
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/jumbo-publish.yml"
+      - ".github/workflows/jumbo-publish-image-check.yml"
+      - "scripts/verify_image_digest.sh"
+      - "scripts/jumbo_index_append.py"
+      - "scripts/tests/**"
+      - "tests/fixtures/image-sample/**"
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/jumbo-publish.yml"
+      - ".github/workflows/jumbo-publish-image-check.yml"
+      - "scripts/verify_image_digest.sh"
+      - "scripts/jumbo_index_append.py"
+      - "scripts/tests/**"
+      - "tests/fixtures/image-sample/**"
+
+permissions:
+  contents: read
+  packages: write
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  # The sample package's GHCR path (lowercase is required by GHCR).
+  SAMPLE_IMAGE: ghcr.io/${{ github.repository_owner }}/jumbo-publish-image-sample
+
+jobs:
+  image-provenance:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: §3.7 negative control - a malformed digest aborts before any registry contact
+        run: |
+          set -euo pipefail
+          if bash scripts/verify_image_digest.sh --image "$SAMPLE_IMAGE:not-pushed" --expected not-a-digest 2>abort.log; then
+            echo "the malformed digest was not rejected" >&2
+            exit 1
+          fi
+          grep -q "not a valid sha256 image digest" abort.log
+          echo "malformed digest correctly aborted with exit 1 and no registry call"
+
+      - name: Registry host negative control - only ghcr.io references are inspected
+        run: |
+          set -euo pipefail
+          digest="sha256:$(printf 'a%.0s' {1..64})"
+          for bad in "localhost:5000/demo:ci" "192.168.1.4:5000/demo:ci" "registry.example.com/demo:ci" "barepath:ci"; do
+            if bash scripts/verify_image_digest.sh --image "$bad" --expected "$digest" 2>abort.log; then
+              echo "a non-ghcr.io image reference was not rejected: $bad" >&2
+              exit 1
+            fi
+            grep -q "not a ghcr.io reference" abort.log
+          done
+          echo "non-ghcr.io references correctly aborted with exit 1 and no registry call"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Build and push the sample image
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: tests/fixtures/image-sample
+          file: tests/fixtures/image-sample/Dockerfile
+          push: true
+          tags: ${{ env.SAMPLE_IMAGE }}:ci-${{ github.run_id }}
+
+      - name: Verify the pushed digest against the registry (positive control)
+        run: |
+          set -euo pipefail
+          bash scripts/verify_image_digest.sh \
+            --image "$SAMPLE_IMAGE:ci-${{ github.run_id }}" \
+            --expected "${{ steps.push.outputs.digest }}"
+
+      - name: §3.7 negative control - a registry digest mismatch aborts the build
+        run: |
+          set -euo pipefail
+          zeros="sha256:$(printf '0%.0s' {1..64})"
+          if bash scripts/verify_image_digest.sh --image "$SAMPLE_IMAGE:ci-${{ github.run_id }}" --expected "$zeros" 2>abort.log; then
+            echo "a mismatched digest was accepted" >&2
+            exit 1
+          fi
+          grep -q "digest mismatch" abort.log
+          echo "mismatch correctly aborted with exit 1 before any index append"
+
+      - name: Capture the verified digest into the JumboIndex record shape
+        run: |
+          set -euo pipefail
+          commit="${{ github.event.pull_request.head.sha || github.sha }}"
+          jq -n \
+            --arg package "jumbo-publish-image-sample" \
+            --arg commit "$commit" \
+            --arg imageDigest "${{ steps.push.outputs.digest }}" \
+            --arg buildId "jumbo-publish-image-sample-1.0.0-ci${{ github.run_id }}" \
+            --arg pipelineRun "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${{ github.run_id }}" \
+            --arg timestamp "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            '{
+              package: $package,
+              major: 1,
+              version: "1.0.0",
+              commit: $commit,
+              fingerprint: null,
+              canonicalExtract: null,
+              artifactUrl: null,
+              artifactSha256: null,
+              imageDigest: $imageDigest,
+              buildId: $buildId,
+              pipelineRun: $pipelineRun,
+              executor: "jumbo-publish-image-check",
+              timestamp: $timestamp
+            }' > record.json
+          cat record.json
+          python3 - <<'PY'
+          import json, sys
+          sys.path.insert(0, "scripts")
+          import jumbo_index_append as jia
+
+          record = json.load(open("record.json"))
+          jia.validate_record(record)
+          line = jia.canonical_line(record)
+          assert line.count("\n") == 1
+          assert '"imageDigest":"sha256:' in line, "the verified digest must be in the record"
+          print("record passes the executor-side validation with the verified GHCR digest")
+          PY
+
+      - name: Upload the sample record as run evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: jumbo-publish-image-sample-record-${{ github.run_id }}
+          path: record.json
+
+      - name: Run the executor-side record validation unit tests
+        run: python3 -m unittest scripts.tests.test_jumbo_index_append -v
