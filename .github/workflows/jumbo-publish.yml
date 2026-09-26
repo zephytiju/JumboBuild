@@ -322,8 +322,8 @@ jobs:
           sha256sum ./* > SHA256SUMS
           cat SHA256SUMS
           case "${{ steps.identity.outputs.ecosystem }}" in
-            python) primary="$(ls -1 ./*.whl | head -n 1)" ;;
-            npm)   primary="$(ls -1 ./*.tgz | head -n 1)" ;;
+            python) primary="$(find . -maxdepth 1 -type f -name '*.whl' | sort | head -n 1)" ;;
+            npm)   primary="$(find . -maxdepth 1 -type f -name '*.tgz' | sort | head -n 1)" ;;
           esac
           primary="${primary#./}"
           {
