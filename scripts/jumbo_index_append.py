@@ -385,6 +385,10 @@ def append_with_retry(
             }
 
         last_error = (proc.stderr + proc.stdout).strip()
+        # Surface the push error immediately: the retry below must never
+        # mask why the push failed (an auth/permission failure and a race
+        # both land here, and only this message tells them apart).
+        print(f"jumbo_index_append: push attempt {attempts} failed:\n{last_error}", file=sys.stderr)
         if attempts >= max_attempts:
             raise AppendError(
                 f"push still failing after {attempts} attempts (bounded backoff exhausted); "
@@ -396,8 +400,10 @@ def append_with_retry(
         # re-check the preconditions on it, and re-append. Discarding our
         # own unpushed commit by resetting to the fetched tip is the
         # protocol's rebase-and-retry with append-only semantics — nothing
-        # published is ever rewritten.
-        require_git(index_dir, "fetch", remote, branch)
+        # published is ever rewritten. The fetch carries the same token as
+        # the push: over https the index repository is private, and an
+        # anonymous fetch cannot even read it.
+        require_git(index_dir, "fetch", remote, branch, token=token, host=host)
         fetched = require_git(index_dir, "rev-parse", "FETCH_HEAD")
         require_git(index_dir, "reset", "--hard", fetched)
         sleep_seconds = min(backoff_base * (2 ** (attempts - 1)), 60.0)
