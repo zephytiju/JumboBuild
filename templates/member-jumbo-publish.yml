@@ -9,10 +9,12 @@
 #   1. Copy this file into your repository as
 #      .github/workflows/jumbo-publish.yml (the file name is yours to choose;
 #      only the location is fixed).
-#   2. Replace <ref> below with the zephytiju/JumboBuild ref you release
-#      with — a tag or a full commit SHA (pinning the ref also pins the jumbo
-#      binary this workflow builds, because the reusable workflow builds jumbo
-#      from the commit its file was called at).
+#   2. Replace both <ref> occurrences below with the zephytiju/JumboBuild
+#      ref you release with — a tag or a full commit SHA. The uses: line
+#      picks the workflow version; the jumbobuild-ref input pins the ref the
+#      reusable workflow builds the jumbo binary from (under workflow_call
+#      GitHub does not expose the uses: ref to the called workflow, so the
+#      input is the authoritative pin — keep both identical).
 #   3. Nothing else. This forwarder carries NO release logic: every release
 #      step (lock, fingerprint, dedup, promote, publish on bump, index
 #      append, opt-in public registry publication) is owned by the reusable
@@ -36,6 +38,10 @@ jobs:
   jumbo-publish:
     uses: zephytiju/JumboBuild/.github/workflows/jumbo-publish.yml@<ref>
     secrets: inherit
+    # The same JumboBuild ref the uses: line pins — the reusable workflow
+    # builds the jumbo binary from exactly this ref.
+    with:
+      jumbobuild-ref: <ref>
     # Reusable workflows cannot elevate permissions; the GitHub Release and
     # the tag it creates live on THIS repository, so the calling job grants
     # contents: write. No other permission is needed.
