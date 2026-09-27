@@ -316,6 +316,10 @@ jobs:
       - name: Install the Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      # Restore/build happen at the pre-move path (see the move step below);
+      # rust-cache's post-save looks for the directory there and skips the
+      # target-dir save when it is gone — a perf cost, never a correctness
+      # issue (the cargo-home part of the cache still saves).
       - name: Cache the cargo build of jumbo
         uses: Swatinem/rust-cache@v2
         with:
@@ -325,8 +329,21 @@ jobs:
         run: cargo build --release --locked
         working-directory: jumbobuild
 
+      # The self-checkout must not remain inside the caller's working tree:
+      # actions/checkout only accepts paths under GITHUB_WORKSPACE, but the
+      # promotion guard (§2.3) refuses dirty trees, and an untracked
+      # jumbobuild/ directory inside the caller repository dirties EVERY
+      # caller tree (including JumboBuild's own on direct runs — the guard
+      # counts reported paths regardless of gitignore status). Same-volume
+      # rename, so the built binary moves with it in one step.
+      - name: Move the JumboBuild checkout out of the caller working tree
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/jumbo-build"
+          mv "$GITHUB_WORKSPACE/jumbobuild" "$RUNNER_TEMP/jumbo-build/jumbobuild"
+
       - name: Put jumbo on PATH
-        run: echo "${GITHUB_WORKSPACE}/jumbobuild/target/release" >> "$GITHUB_PATH"
+        run: echo "$RUNNER_TEMP/jumbo-build/jumbobuild/target/release" >> "$GITHUB_PATH"
 
       # uv runs the Python side of the standard build (lock, build,
       # publish). Unconditional so ecosystem detection stays jumbo's job.
@@ -558,7 +575,7 @@ jobs:
           JUMBO_PUSHED_DIGEST: ${{ steps.image.outputs.digest }}
         run: |
           set -euo pipefail
-          bash jumbobuild/scripts/verify_image_digest.sh \
+          bash "$RUNNER_TEMP/jumbo-build/jumbobuild/scripts/verify_image_digest.sh" \
             --image "$JUMBO_IMAGE_TAG" \
             --expected "$JUMBO_PUSHED_DIGEST"
           # The registry-observed digest that matched the push is the only
@@ -606,7 +623,7 @@ jobs:
               timestamp: $timestamp
             }' "$JUMBO_OUT/promote.json" > "$JUMBO_OUT/record.json"
           cat "$JUMBO_OUT/record.json"
-          python3 jumbobuild/scripts/jumbo_index_append.py \
+          python3 "$RUNNER_TEMP/jumbo-build/jumbobuild/scripts/jumbo_index_append.py" \
             --index-dir "$JUMBO_INDEX_PATH" \
             --record-file "$JUMBO_OUT/record.json" \
             --push \
