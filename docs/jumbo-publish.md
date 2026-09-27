@@ -127,10 +127,35 @@ when `publish-image` was enabled and the image was pushed; empty otherwise).
 All secrets are org-level and flow in with `secrets: inherit`. None of them
 may ever appear as a literal in any repository file.
 
+The workflow resolves index/artifact authentication at run time, in this
+order:
+
+1. **Preferred — the org CI GitHub App pair.** When `JUNTAI_CI_APP_ID` and
+   `JUNTAI_CI_APP_PRIVATE_KEY` are both present, the workflow mints a
+   short-lived **installation token** at run time
+   (`actions/create-github-app-token`, pinned to a full commit SHA). The
+   token is downgraded to exactly `contents: read+write`, scoped to the two
+   repositories the executor touches (`zephytiju/JumboBuild` and the index
+   repository), and revoked when the job ends. It authenticates the
+   JumboBuild checkout, the JumboIndex fetch, **and** the index append. No
+   long-lived credential is stored anywhere; the private key flows only from
+   its secret into the minting action — never echoed, logged, or written to
+   a file.
+2. **Backward-compatible fallback — the static token secrets.** When the App
+   pair is absent, the workflow falls back to the two static secrets below,
+   exactly as it did before the App path existed. If only one half of the
+   App pair is set, the run warns and uses the fallback.
+3. **Neither path available** — the workflow fails fast with an actionable
+   `::error` naming both options, before any build work. The caller's
+   default `GITHUB_TOKEN` cannot read another repository, so continuing
+   would only fail later at the index clone (the failure mode this
+   resolution replaces).
+
 | Secret | Required | Used for |
 | --- | --- | --- |
-| `JUNTAI_GITHUB_ARTIFACT_TOKEN` | yes | A GitHub App installation or user token that can **read** the private `zephytiju/JumboBuild` (the workflow/JumboBuild checkout) and **clone** the private `zephytiju/JumboIndex`. The caller's default `GITHUB_TOKEN` cannot cross repository boundaries; it is used as a fallback and works only if it can read both repositories. |
-| `JUNTAI_INDEX_TOKEN` | yes (on publish) | A token with `contents: write` on `zephytiju/JumboIndex` — pushes the index append. Passed to `scripts/jumbo_index_append.py` through the `JUMBO_INDEX_TOKEN` environment variable only. |
+| `JUNTAI_CI_APP_ID` + `JUNTAI_CI_APP_PRIVATE_KEY` | preferred (one of the two auth paths must exist) | The org CI GitHub App pair. Mints a short-lived installation token (`contents: read+write`, scoped to `zephytiju/JumboBuild` + the index repository, revoked at job end) used for the JumboBuild checkout, the index fetch, and the index append. The private key is consumed only as the minting action's `private-key` input. |
+| `JUNTAI_GITHUB_ARTIFACT_TOKEN` | static fallback | When the App pair is absent: a token that can **read** the private `zephytiju/JumboBuild` (the workflow/JumboBuild checkout) and **clone** the private `zephytiju/JumboIndex`. |
+| `JUNTAI_INDEX_TOKEN` | static fallback (on publish) | When the App pair is absent: a token with `contents: write` on `zephytiju/JumboIndex` — pushes the index append. Passed to `scripts/jumbo_index_append.py` through the `JUMBO_INDEX_TOKEN` environment variable only. |
 | `PYPI_TOKEN` | only with `publish-to-public-registry: true` and a Python package | Trusted publishing token for `uv publish`. Consumed via the `UV_PUBLISH_TOKEN` env var. |
 | `NPM_TOKEN` | only with `publish-to-public-registry: true` and an npm package | Automation token for `npm publish`. Consumed via the `NODE_AUTH_TOKEN` env var. |
 
@@ -143,19 +168,27 @@ may ever appear as a literal in any repository file.
   on the caller repository). Image-producing packages additionally grant
   `packages: write` (the GHCR push with the caller's `GITHUB_TOKEN`) — only
   with `publish-image: true`. No other permission is requested.
-- The GitHub App (or user) behind `JUNTAI_GITHUB_ARTIFACT_TOKEN` needs read
-  access to `zephytiju/JumboBuild` and `zephytiju/JumboIndex`.
-- The GitHub App (or user) behind `JUNTAI_INDEX_TOKEN` needs write (push)
-  access to `zephytiju/JumboIndex`; index branch protection should keep
-  requiring the index validator and forbidding force-pushes.
+- **App path (preferred)**: the org CI GitHub App must be installed on
+  `zephytiju/JumboBuild` and `zephytiju/JumboIndex` with repository
+  permission `Contents: Read and write` — that is all the executor needs,
+  and the minted installation token is downgraded to exactly it (scoped to
+  those two repositories, revoked when the job ends).
+- **Static fallback**: the token behind `JUNTAI_GITHUB_ARTIFACT_TOKEN` needs
+  read access to `zephytiju/JumboBuild` and `zephytiju/JumboIndex`; the
+  token behind `JUNTAI_INDEX_TOKEN` needs write (push) access to
+  `zephytiju/JumboIndex`. Index branch protection should keep requiring the
+  index validator and forbidding force-pushes (this also holds for the App
+  path — the minted token pushes the append the same way).
 
 ## What the workflow does
 
 | Step | Command / action | Notes |
 | --- | --- | --- |
+| Resolve index/artifact auth | presence checks on the secrets | App pair present → mint an installation token; else the static `JUNTAI_GITHUB_ARTIFACT_TOKEN` / `JUNTAI_INDEX_TOKEN` fallback; neither → actionable `::error` before any build work. |
+| Mint installation token | `actions/create-github-app-token@<full SHA>` | App path only: short-lived token downgraded to `contents: read+write`, scoped to `zephytiju/JumboBuild` + the index repository, revoked when the job ends; the private key flows only from its secret into the action input. |
 | Checkout caller repo | `actions/checkout@v6` at the release commit | Clean, attributable tree — `jumbo promote` refuses a dirty tree. |
 | Build jumbo | `actions/checkout@v6` + `cargo build --release --locked` | From the JumboBuild ref pinned by `jumbobuild-ref` (direct runs on JumboBuild fall back to the ref the workflow was dispatched at — never from `GITHUB_WORKFLOW_REF`, which names the caller's workflow under `workflow_call`); cargo build cached with `Swatinem/rust-cache@v2`. |
-| Fetch the index | `gh repo clone zephytiju/JumboIndex` | `JUMBO_INDEX_PATH` points every later jumbo command at this clone. |
+| Fetch the index | `gh repo clone zephytiju/JumboIndex` | Authenticated with the minted installation token or the static artifact token. `JUMBO_INDEX_PATH` points every later jumbo command at this clone. |
 | Lock | `jumbo lock` | Resolves internal deps from the index, generates `uv.lock` / `package-lock.json`. |
 | Fingerprint | `jumbo fingerprint` | `sha256(own commit + canonical extract)`; informational evidence for the run log. |
 | Dedup | `jumbo dedup` | **Fingerprint hit ⇒ `jumbo dedup --materialize` pulls the recorded artifact (exact URL, SHA-256 verified) into `dist/` and the run ends — no build, no publish, no append.** Same skip-build rule as CircleCI. |
@@ -163,7 +196,7 @@ may ever appear as a literal in any repository file.
 | Build on bump | `uv build` / `npm pack` | The manifest keeps declaring only the major; the build's version is set from the decision's `publish.version` before building. |
 | Checksums + Release | `sha256sum` → `gh release create v<version>` on the **caller** repository | Assets + `SHA256SUMS`; notes carry the version, bump, commit, fingerprint, executor, and run URL. |
 | Service image (opt-in) | `docker/build-push-action@v6` → `scripts/verify_image_digest.sh` | Only with `publish-image: true`: build the `Dockerfile` at the repository root from the same release commit, push to `ghcr.io/<owner>/<repo>:v<version>`, then verify the pushed digest against the registry **before** anything is recorded — a digest mismatch aborts the build with no index append (standard §3.7). |
-| Index append | `scripts/jumbo_index_append.py --push` | JumboIndex append protocol: canonical one-line record, serialized fast-forward push, fetch-and-retry on non-FF (bounded backoff), validator-gated, no history rewrites ever. `executor` is `jumbo-publish-github-actions`. |
+| Index append | `scripts/jumbo_index_append.py --push` | JumboIndex append protocol: canonical one-line record, serialized fast-forward push, fetch-and-retry on non-FF (bounded backoff), validator-gated, no history rewrites ever. Authenticated with the minted installation token or the static `JUNTAI_INDEX_TOKEN`. `executor` is `jumbo-publish-github-actions`. |
 | Public registry (opt-in) | `uv publish` / `npm publish` | Gated by `publish-to-public-registry` (default **off**); version always the jumbo-computed one; tokens only from caller secrets. |
 
 ## The index record from this executor
@@ -246,7 +279,8 @@ python3 /path/to/JumboBuild/scripts/jumbo_index_append.py \
 
 Appending without `--push` writes and validates the append on the local
 clone only. Omitting the flag is the offline/dry-run mode; the real workflow
-passes `--push` with `JUMBO_INDEX_TOKEN` from the caller's secrets.
+passes `--push` with the minted installation token (App pair) or
+`JUMBO_INDEX_TOKEN` from the caller's secrets (static fallback).
 
 ## Boundary notes
 

@@ -22,11 +22,21 @@
 #      calling this workflow, that is a design change — stop and return to
 #      the Jumbo Build & Versioning Standard first.
 #
-# Secrets flow in with `secrets: inherit` from your repository/org settings:
-# JUNTAI_GITHUB_ARTIFACT_TOKEN and JUNTAI_INDEX_TOKEN are required, and
-# PYPI_TOKEN / NPM_TOKEN only when the reusable workflow is called with
-# publish-to-public-registry enabled. Tokens are consumed via secrets and
-# environment only — never as literals in any file.
+# Secrets flow in with `secrets: inherit` from your repository/org settings.
+# Index/artifact authentication resolves in this order (docs/jumbo-publish.md
+# in zephytiju/JumboBuild has the details):
+#   1. PREFERRED — the org CI GitHub App pair JUNTAI_CI_APP_ID +
+#      JUNTAI_CI_APP_PRIVATE_KEY: the executor mints a short-lived
+#      installation token (contents read+write, scoped to JumboBuild and the
+#      index repository, revoked at job end) for the checkouts, the index
+#      fetch, and the index append. No long-lived credential is stored.
+#   2. FALLBACK — the static secrets JUNTAI_GITHUB_ARTIFACT_TOKEN (read on
+#      JumboBuild + JumboIndex) and JUNTAI_INDEX_TOKEN (contents:write on
+#      JumboIndex). If neither the App pair nor these secrets exist, the run
+#      fails fast with an actionable error naming both options.
+#   PYPI_TOKEN / NPM_TOKEN are needed only when the reusable workflow is
+#   called with publish-to-public-registry enabled. Tokens are consumed via
+#   secrets and environment only — never as literals in any file.
 name: jumbo publish
 
 on:

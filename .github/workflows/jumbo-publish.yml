@@ -30,12 +30,28 @@
 #         contents: write
 #         packages: write   # only needed with publish-image: true (GHCR push)
 #
-# Required secrets (org-level, passed with `secrets: inherit`):
-#   JUNTAI_GITHUB_ARTIFACT_TOKEN - reads the private JumboBuild checkout and
-#     clones the private JumboIndex repository (the caller's default
-#     GITHUB_TOKEN cannot cross repository boundaries).
-#   JUNTAI_INDEX_TOKEN           - pushes the index append to JumboIndex (a
-#     GitHub App or user token with contents:write on zephytiju/JumboIndex).
+# Required secrets (org-level, passed with `secrets: inherit`). The workflow
+# resolves the index/artifact authentication at run time, in this order:
+#
+#   1. PREFERRED — the org CI GitHub App pair:
+#        JUNTAI_CI_APP_ID + JUNTAI_CI_APP_PRIVATE_KEY
+#      A short-lived installation token is minted at run time (downgraded to
+#      exactly contents read+write, scoped to zephytiju/JumboBuild and the
+#      index repository, revoked when the job ends) and used for the
+#      JumboBuild checkout, the JumboIndex fetch, and the index append. No
+#      long-lived credential is stored anywhere; the private key flows only
+#      from its secret into the minting action — never echoed, logged, or
+#      written to a file.
+#   2. FALLBACK — the static token secrets (backward compatible):
+#        JUNTAI_GITHUB_ARTIFACT_TOKEN - reads the private JumboBuild checkout
+#          and clones the private JumboIndex repository (the caller's default
+#          GITHUB_TOKEN cannot cross repository boundaries).
+#        JUNTAI_INDEX_TOKEN           - pushes the index append to JumboIndex
+#          (a GitHub App or user token with contents:write on
+#          zephytiju/JumboIndex).
+#   3. NEITHER PATH AVAILABLE — the workflow fails fast with an actionable
+#      error naming both options (before any build work).
+#
 #   PYPI_TOKEN / NPM_TOKEN       - only when publish-to-public-registry is
 #     enabled; never referenced in this file as a literal, only via secrets.
 #   The GHCR push uses the caller's own GITHUB_TOKEN with packages: write;
@@ -205,7 +221,74 @@ jobs:
           echo "JUMBO_OUT=${jumbo_state}" >> "$GITHUB_ENV"
           echo "Releasing ${GITHUB_REPOSITORY}@${commit} with jumbo from ${build_repo}@${build_ref}"
 
-      # 1. The caller repository at the triggering commit. Promotion only
+      # 1. Resolve the index/artifact authentication path. Preferred: the org
+      #    CI GitHub App pair (JUNTAI_CI_APP_ID + JUNTAI_CI_APP_PRIVATE_KEY)
+      #    — a short-lived installation token is minted in the next step and
+      #    used for the JumboBuild checkout, the JumboIndex fetch, and the
+      #    index append, so no long-lived credential is stored anywhere.
+      #    Backward-compatible fallback: the static JUNTAI_GITHUB_ARTIFACT_
+      #    TOKEN (checkouts + index fetch) and JUNTAI_INDEX_TOKEN (index
+      #    append) secrets. Neither path available: fail fast here with an
+      #    actionable error naming both options — the default GITHUB_TOKEN
+      #    cannot read another repository, so continuing would only fail
+      #    later at the index clone (the failure mode this resolution
+      #    replaces). Presence checks only: no secret VALUE enters this
+      #    step, and the App private key flows exclusively from its secret
+      #    into the minting action below.
+      - name: Resolve the index/artifact authentication path
+        id: auth
+        env:
+          INDEX_REPOSITORY: ${{ inputs.index-repository }}
+        run: |
+          set -euo pipefail
+          app_id_present='${{ secrets.JUNTAI_CI_APP_ID != '' }}'
+          app_key_present='${{ secrets.JUNTAI_CI_APP_PRIVATE_KEY != '' }}'
+          artifact_token_present='${{ secrets.JUNTAI_GITHUB_ARTIFACT_TOKEN != '' }}'
+          index_token_present='${{ secrets.JUNTAI_INDEX_TOKEN != '' }}'
+          if [[ ! "$INDEX_REPOSITORY" =~ ^([A-Za-z0-9._-]+)/([A-Za-z0-9._-]+)$ ]]; then
+            echo "::error title=jumbo index auth::index-repository must be owner/name (got: ${INDEX_REPOSITORY})" >&2
+            exit 1
+          fi
+          {
+            echo "index-owner=${BASH_REMATCH[1]}"
+            echo "index-name=${BASH_REMATCH[2]}"
+          } >> "$GITHUB_OUTPUT"
+          if [[ "$app_id_present" == true && "$app_key_present" == true ]]; then
+            echo "mode=app" >> "$GITHUB_OUTPUT"
+            echo "index auth: GitHub App pair present - a short-lived installation token will be minted for zephytiju/JumboBuild and ${BASH_REMATCH[1]}/${BASH_REMATCH[2]}"
+          elif [[ "$artifact_token_present" == true ]]; then
+            if [[ "$app_id_present" == true || "$app_key_present" == true ]]; then
+              echo "::warning title=jumbo index auth::only one of JUNTAI_CI_APP_ID / JUNTAI_CI_APP_PRIVATE_KEY is set - falling back to the static JUNTAI_GITHUB_ARTIFACT_TOKEN / JUNTAI_INDEX_TOKEN secrets (set both to use the preferred App path)"
+            fi
+            if [[ "$index_token_present" != true ]]; then
+              echo "::warning title=jumbo index auth::JUNTAI_INDEX_TOKEN is not set - runs that publish will fail at the index append"
+            fi
+            echo "mode=static" >> "$GITHUB_OUTPUT"
+            echo "index auth: using the static JUNTAI_GITHUB_ARTIFACT_TOKEN (checkouts + index fetch) and JUNTAI_INDEX_TOKEN (index append)"
+          else
+            echo "::error title=jumbo index auth::no index/artifact credentials are available to this run. Configure one of: (1) the org CI GitHub App pair - secrets JUNTAI_CI_APP_ID and JUNTAI_CI_APP_PRIVATE_KEY (preferred: short-lived installation tokens, no long-lived credential is stored); or (2) the static secrets JUNTAI_GITHUB_ARTIFACT_TOKEN (read access to zephytiju/JumboBuild and the index repository) and JUNTAI_INDEX_TOKEN (contents:write on the index repository). See docs/jumbo-publish.md in zephytiju/JumboBuild." >&2
+            exit 1
+          fi
+
+      # 2. Mint the installation token (App path only). The minting action is
+      #    pinned to a full commit SHA; the private key flows from its secret
+      #    into the action input and nowhere else (never echoed, logged, or
+      #    written to a file). permission-contents: write downgrades the
+      #    minted token to exactly contents read+write on the two
+      #    repositories the executor touches — no extra permissions — and
+      #    the action revokes the token when the job ends.
+      - name: Mint the GitHub App installation token
+        id: app-token
+        if: steps.auth.outputs.mode == 'app'
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.JUNTAI_CI_APP_ID }}
+          private-key: ${{ secrets.JUNTAI_CI_APP_PRIVATE_KEY }}
+          owner: ${{ steps.auth.outputs.index-owner }}
+          repositories: JumboBuild,${{ steps.auth.outputs.index-name }}
+          permission-contents: write
+
+      # 3. The caller repository at the triggering commit. Promotion only
       #    happens on a clean attributable tree: checkout gives exactly the
       #    release commit, and persist-credentials keeps no token in the
       #    local git config (later git/gh calls pass their own tokens).
@@ -215,11 +298,12 @@ jobs:
           ref: ${{ steps.coords.outputs.commit }}
           persist-credentials: false
 
-      # 2. JumboBuild at the ref the caller pinned (jumbobuild-ref; direct
+      # 4. JumboBuild at the ref the caller pinned (jumbobuild-ref; direct
       #    runs on JumboBuild fall back to the ref this workflow lives at).
-      #    Cross-repository access needs the artifact token or any token with
-      #    read access; the caller's default GITHUB_TOKEN cannot cross
-      #    repository boundaries.
+      #    Cross-repository access needs the minted installation token or
+      #    the static artifact token; the caller's default GITHUB_TOKEN
+      #    cannot cross repository boundaries (the auth resolution above
+      #    fails fast when neither credential exists).
       - name: Check out JumboBuild at the pinned ref
         uses: actions/checkout@v6
         with:
@@ -227,7 +311,7 @@ jobs:
           ref: ${{ steps.coords.outputs.build-ref }}
           path: jumbobuild
           persist-credentials: false
-          token: ${{ secrets.JUNTAI_GITHUB_ARTIFACT_TOKEN || github.token }}
+          token: ${{ steps.app-token.outputs.token || secrets.JUNTAI_GITHUB_ARTIFACT_TOKEN }}
 
       - name: Install the Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -249,12 +333,14 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@v7
 
-      # 3. The Jumbo index (private: the caller repository must have access
-      #    through JUNTAI_GITHUB_ARTIFACT_TOKEN; the default GITHUB_TOKEN
-      #    works only if it can read the index repository).
+      # 5. The Jumbo index (private). Authenticated with the minted
+      #    installation token when the App pair is present, else the static
+      #    JUNTAI_GITHUB_ARTIFACT_TOKEN — the auth resolution above fails
+      #    fast when neither exists (the caller's default GITHUB_TOKEN can
+      #    never read another repository).
       - name: Fetch the Jumbo index
         env:
-          GH_TOKEN: ${{ secrets.JUNTAI_GITHUB_ARTIFACT_TOKEN || github.token }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token || secrets.JUNTAI_GITHUB_ARTIFACT_TOKEN }}
           INDEX_REPOSITORY: ${{ inputs.index-repository }}
         run: |
           set -euo pipefail
@@ -264,7 +350,7 @@ jobs:
           echo "JUMBO_INDEX_PATH=${index_dir}" >> "$GITHUB_ENV"
           echo "JUMBO_INDEX_REPOSITORY=${INDEX_REPOSITORY}" >> "$GITHUB_ENV"
 
-      # 4. The standard jumbo release steps — identical commands to the
+      # 6. The standard jumbo release steps — identical commands to the
       #    CircleCI executor, identical outputs. jumbo prefixes its stdout
       #    with progress lines; `sed -n '/^{/,$p'` keeps the JSON document
       #    (pipefail still surfaces a jumbo failure).
@@ -294,7 +380,7 @@ jobs:
             echo "reuse_version=$(jq -r '.matchedRecord.record.version // ""' "$JUMBO_OUT/dedup.json")"
           } >> "$GITHUB_OUTPUT"
 
-      # 5. Fingerprint hit: pull the recorded artifact (exact URL,
+      # 7. Fingerprint hit: pull the recorded artifact (exact URL,
       #    SHA-256 verified) into dist/ and stop — no build, no publish,
       #    no index append. This is the skip-build path either executor
       #    takes.
@@ -341,7 +427,7 @@ jobs:
             echo "bump=${{ steps.promote.outputs.bump }}"
           } >> "$GITHUB_OUTPUT"
 
-      # 6. Publish on bump: build the artifacts at the jumbo-computed
+      # 8. Publish on bump: build the artifacts at the jumbo-computed
       #    version (the manifest's own version declares only the major;
       #    minor/patch are pipeline-owned, so the version for this build is
       #    set from the promotion decision before building).
@@ -384,7 +470,7 @@ jobs:
             echo "asset-sha256=$(sha256sum "$primary" | cut -d' ' -f1)"
           } >> "$GITHUB_OUTPUT"
 
-      # 7. The GitHub Release on the CALLER repository (the artifact
+      # 9. The GitHub Release on the CALLER repository (the artifact
       #    storage of the standard: language artifacts are release assets
       #    on the package repository).
       - name: Publish the GitHub Release on the caller repository
@@ -421,7 +507,7 @@ jobs:
             echo "asset-url=https://github.com/${GITHUB_REPOSITORY}/releases/download/${tag}/${asset}"
           } >> "$GITHUB_OUTPUT"
 
-      # 8. Service image (opt-in, image-producing packages): build the image
+      # 10. Service image (opt-in, image-producing packages): build the image
       #    from the same release commit and push it to GHCR, the image
       #    registry of the standard (§3.4). The pushed digest is then
       #    verified against the registry BEFORE anything is recorded: a
@@ -481,14 +567,16 @@ jobs:
           echo "digest=$observed" >> "$GITHUB_OUTPUT"
           echo "::notice title=jumbo image::${JUMBO_IMAGE_TAG} verified at ${observed}"
 
-      # 9. Append the index record per JumboIndex docs/APPEND-PROTOCOL.md:
+      # 11. Append the index record per JumboIndex docs/APPEND-PROTOCOL.md:
       #    serialized fast-forward append, fetch-and-retry on non-FF,
       #    validator-gated, no history rewrites ever. imageDigest carries
       #    the verified GHCR digest when the image was pushed, else null.
+      #    Authenticated with the minted installation token when the App
+      #    pair is present, else the static JUNTAI_INDEX_TOKEN.
       - name: Append the index record to JumboIndex
         if: steps.release.outputs.published == 'true'
         env:
-          JUMBO_INDEX_TOKEN: ${{ secrets.JUNTAI_INDEX_TOKEN }}
+          JUMBO_INDEX_TOKEN: ${{ steps.app-token.outputs.token || secrets.JUNTAI_INDEX_TOKEN }}
           JUMBO_IMAGE_DIGEST: ${{ steps.image-verify.outputs.digest }}
         run: |
           set -euo pipefail
@@ -524,7 +612,7 @@ jobs:
             --push \
             --token-env JUMBO_INDEX_TOKEN
 
-      # 10. Opt-in public registry publication — public packages keep
+      # 12. Opt-in public registry publication — public packages keep
       #    serving external consumers, always driven by the jumbo-computed
       #    version (set in the build step above). Credentials come only
       #    from caller secrets; nothing is published when the gate is off.
