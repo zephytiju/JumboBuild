@@ -16,7 +16,7 @@ secrets, and nothing else.
   run in CI by [`index-append.yml`](../.github/workflows/index-append.yml) — including the
   concurrent two-writer race that must converge to exactly one record and one artifact)
 
-## The two-line caller
+## The caller
 
 Add this to a workflow in the public repository (for example
 `.github/workflows/jumbo-release.yml` triggered on `push` to the default
@@ -27,12 +27,32 @@ jobs:
   jumbo-publish:
     uses: zephytiju/JumboBuild/.github/workflows/jumbo-publish.yml@<ref>
     secrets: inherit
+    with:
+      jumbobuild-ref: <ref>
 ```
 
 `<ref>` is the JumboBuild ref to release with — a tag or a full commit SHA.
-The workflow builds the `jumbo` binary from exactly the JumboBuild commit
-the workflow file was called at, so a pinned `<ref>` also pins the release
-toolchain.
+It appears twice on purpose: the `uses:` line picks the workflow (release
+logic) version, and `jumbobuild-ref` pins the JumboBuild ref the workflow
+builds the `jumbo` binary from. Keep the two identical (the forwarder
+template carries a single `<ref>` placeholder used in both places), so a
+pinned `<ref>` also pins the release toolchain.
+
+**Why the explicit input**: under `workflow_call`, GitHub exposes the
+called workflow only the caller's context — `GITHUB_WORKFLOW_REF` names the
+*caller's* workflow file and ref, not this workflow's. The called workflow
+cannot read the ref its `uses:` line was pinned at without OIDC token
+introspection (`job_workflow_ref` / `job_workflow_sha` claims), which would
+force every caller to grant `id-token: write` and the workflow to fetch and
+parse a runtime OIDC token. The explicit input is the cleaner contract: no
+new caller permissions, no token plumbing, and the resolution is
+deterministically testable. The tradeoff is that the pin is stated twice;
+if the two ever disagree, the release logic runs at the `uses:` ref while
+jumbo builds from `jumbobuild-ref`. Callers that omit `jumbobuild-ref` fail
+fast at coordinate resolution with an error naming the input (the workflow
+never silently trusts caller context), and direct runs on the JumboBuild
+repository itself (`workflow_dispatch`) still fall back to the ref the
+workflow was dispatched at.
 
 Reusable workflows cannot elevate permissions, so the calling job must also
 grant the release write it needs (GitHub Releases on the caller repository):
@@ -50,9 +70,11 @@ picks it up in this repository. To adopt it:
 1. Copy the template into your repository as
    `.github/workflows/jumbo-publish.yml` (the file name is yours to choose;
    only the location is fixed).
-2. Replace `<ref>` with the JumboBuild tag or full commit SHA you release
-   with (see the pinning note above).
-3. Nothing else — no inputs to wire, no release steps to add. The forwarder
+2. Replace both `<ref>` occurrences with the JumboBuild tag or full commit
+   SHA you release with (see the pinning note above) — the `uses:` line and
+   the `jumbobuild-ref` input.
+3. Nothing else — no further inputs to wire, no release steps to add. The
+   forwarder
    triggers on `push` to your default branch and on `workflow_dispatch`
    (which is how Mahout-orchestrated re-releases dispatch it), inherits the
    org secrets, and grants `contents: write` for the GitHub Release on your
@@ -72,6 +94,10 @@ jobs:
   jumbo-publish:
     uses: zephytiju/JumboBuild/.github/workflows/jumbo-publish.yml@<ref>
     secrets: inherit
+    # The same JumboBuild ref the uses: line pins — the reusable workflow
+    # builds the jumbo binary from exactly this ref.
+    with:
+      jumbobuild-ref: <ref>
     # Reusable workflows cannot elevate permissions; the GitHub Release and
     # the tag it creates live on THIS repository, so the calling job grants
     # contents: write. No other permission is needed.
@@ -84,6 +110,7 @@ jobs:
 | Input | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `commit` | string | `""` | Commit SHA of the caller repository to release; empty means the triggering commit. `workflow_dispatch` uses it to re-release a specific commit. |
+| `jumbobuild-ref` | string | `""` | JumboBuild ref (tag, branch, or full SHA) to build the `jumbo` binary from — pin the same ref the `uses:` line uses. **Required when the workflow is called with `workflow_call`** (the called workflow cannot see the `uses:` ref; omitting it fails fast). Empty falls back to the ref this workflow lives at, which direct runs on JumboBuild itself use. |
 | `ecosystem` | string | `auto` | `python`, `npm`, or `auto` (detected from the package manifest by jumbo). |
 | `publish-to-public-registry` | boolean | `false` | Opt-in publication to PyPI/npm for external consumers, always driven by the jumbo-computed version. |
 | `publish-image` | boolean | `false` | Opt-in for **image-producing packages**: build the service image (`Dockerfile` at the repository root) from the same release commit, push it to GHCR, verify the pushed digest against the registry, and record it as the record's `imageDigest`. See [Image-producing packages](#image-producing-packages). |
@@ -127,7 +154,7 @@ may ever appear as a literal in any repository file.
 | Step | Command / action | Notes |
 | --- | --- | --- |
 | Checkout caller repo | `actions/checkout@v6` at the release commit | Clean, attributable tree — `jumbo promote` refuses a dirty tree. |
-| Build jumbo | `actions/checkout@v6` + `cargo build --release --locked` | From the JumboBuild commit the workflow lives at (`GITHUB_WORKFLOW_REF`), cargo build cached with `Swatinem/rust-cache@v2`. |
+| Build jumbo | `actions/checkout@v6` + `cargo build --release --locked` | From the JumboBuild ref pinned by `jumbobuild-ref` (direct runs on JumboBuild fall back to the ref the workflow was dispatched at — never from `GITHUB_WORKFLOW_REF`, which names the caller's workflow under `workflow_call`); cargo build cached with `Swatinem/rust-cache@v2`. |
 | Fetch the index | `gh repo clone zephytiju/JumboIndex` | `JUMBO_INDEX_PATH` points every later jumbo command at this clone. |
 | Lock | `jumbo lock` | Resolves internal deps from the index, generates `uv.lock` / `package-lock.json`. |
 | Fingerprint | `jumbo fingerprint` | `sha256(own commit + canonical extract)`; informational evidence for the run log. |
@@ -164,11 +191,12 @@ jobs:
   jumbo-publish:
     uses: zephytiju/JumboBuild/.github/workflows/jumbo-publish.yml@<ref>
     secrets: inherit
+    with:
+      jumbobuild-ref: <ref>
+      publish-image: true
     permissions:
       contents: write
       packages: write   # only needed with publish-image: true (GHCR push)
-    with:
-      publish-image: true
 ```
 
 - **Registry**: service images live on GHCR only (`ghcr.io/<owner>/<repo>:v<version>`,

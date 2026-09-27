@@ -24,6 +24,8 @@
 #     jumbo-publish:
 #       uses: zephytiju/JumboBuild/.github/workflows/jumbo-publish.yml@<ref>
 #       secrets: inherit
+#       with:
+#         jumbobuild-ref: <ref>   # the same JumboBuild ref the uses: line pins
 #       permissions:
 #         contents: write
 #         packages: write   # only needed with publish-image: true (GHCR push)
@@ -50,6 +52,10 @@ on:
     inputs:
       commit:
         description: "Commit SHA of the caller repository to release (default: the triggering commit)"
+        type: string
+        default: ""
+      jumbobuild-ref:
+        description: "JumboBuild ref (tag, branch, or full SHA) to build jumbo from — pin the same ref the uses: line uses. Required when called with workflow_call; empty falls back to this workflow's own ref (direct runs on JumboBuild)."
         type: string
         default: ""
       ecosystem:
@@ -91,6 +97,10 @@ on:
     inputs:
       commit:
         description: "Commit SHA of the caller repository to release (default: the triggering commit)"
+        type: string
+        default: ""
+      jumbobuild-ref:
+        description: "JumboBuild ref (tag, branch, or full SHA) to build jumbo from; empty uses the ref this workflow was dispatched at"
         type: string
         default: ""
       ecosystem:
@@ -150,20 +160,36 @@ jobs:
         id: coords
         env:
           INPUT_COMMIT: ${{ inputs.commit }}
+          INPUT_JUMBOBUILD_REF: ${{ inputs.jumbobuild-ref }}
         run: |
           set -euo pipefail
           commit="${INPUT_COMMIT:-${GITHUB_SHA}}"
-          # GITHUB_WORKFLOW_REF points at THIS workflow file
-          # (owner/repo/.github/workflows/jumbo-publish.yml@ref) — the
-          # JumboBuild commit/ref the caller pinned, from which jumbo is
-          # built. The workflow never releases with a jumbo it does not
-          # live at.
-          workflow_ref="${GITHUB_WORKFLOW_REF:?GITHUB_WORKFLOW_REF is required}"
-          repo_and_path="${workflow_ref%@*}"
-          build_ref="${workflow_ref##*@}"
-          build_repo="${repo_and_path%%/.github/*}"
-          if [[ -z "$build_ref" || "$build_repo" != */* || "$build_repo" == "$repo_and_path" ]]; then
-            echo "cannot parse GITHUB_WORKFLOW_REF: ${workflow_ref}" >&2
+          # JumboBuild coordinates: the repository owning THIS workflow file,
+          # and the ref jumbo is built from. GITHUB_WORKFLOW_REF cannot
+          # supply either: it names the workflow that TRIGGERED the run, so
+          # under workflow_call it is the CALLER's file and ref
+          # (e.g. member-repo/.github/workflows/jumbo-release.yml@refs/heads/main)
+          # — trusting it made this workflow check out the caller repository
+          # as JumboBuild and fail building jumbo. Reusable callers therefore
+          # pin the build ref explicitly via the jumbobuild-ref input (the
+          # same ref their uses: line pins). The implicit GITHUB_WORKFLOW_REF
+          # value is trusted only for DIRECT runs on the JumboBuild repository
+          # itself, where it genuinely is this workflow's file and ref.
+          build_repo="zephytiju/JumboBuild"
+          build_ref="${INPUT_JUMBOBUILD_REF:-}"
+          if [[ -z "$build_ref" ]]; then
+            workflow_ref="${GITHUB_WORKFLOW_REF:?GITHUB_WORKFLOW_REF is required}"
+            repo_and_path="${workflow_ref%@*}"
+            called_repo="${repo_and_path%%/.github/*}"
+            if [[ "$called_repo" == "$build_repo" ]]; then
+              build_ref="${workflow_ref##*@}"
+            else
+              echo "::error title=jumbo coordinates::the jumbobuild-ref input is required when jumbo-publish is called with workflow_call (GITHUB_WORKFLOW_REF names the caller workflow ${called_repo}, not ${build_repo}). Pin the same JumboBuild ref the uses: line uses, e.g. jumbobuild-ref: main." >&2
+              exit 1
+            fi
+          fi
+          if [[ -z "$build_ref" || ! "$build_repo" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]]; then
+            echo "invalid JumboBuild coordinates: repo=${build_repo} ref=${build_ref}" >&2
             exit 1
           fi
           {
@@ -189,9 +215,12 @@ jobs:
           ref: ${{ steps.coords.outputs.commit }}
           persist-credentials: false
 
-      # 2. JumboBuild at the commit this workflow lives at (private: the
-      #    artifact token or any token with read access is required).
-      - name: Check out JumboBuild at the workflow's own commit
+      # 2. JumboBuild at the ref the caller pinned (jumbobuild-ref; direct
+      #    runs on JumboBuild fall back to the ref this workflow lives at).
+      #    Cross-repository access needs the artifact token or any token with
+      #    read access; the caller's default GITHUB_TOKEN cannot cross
+      #    repository boundaries.
+      - name: Check out JumboBuild at the pinned ref
         uses: actions/checkout@v6
         with:
           repository: ${{ steps.coords.outputs.build-repo }}
