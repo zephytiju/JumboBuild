@@ -3,7 +3,8 @@
 Public repositories release to jumbo through one reusable workflow that lives
 in the JumboBuild repository. Jumbo publication is executor-agnostic — the
 release steps (`jumbo lock` → `jumbo fingerprint` → `jumbo dedup` →
-`jumbo promote`, then build/publish on a bump) are jumbo behaviors defined
+`jumbo promote`, then — on the build path — dependency materialization and
+build/publish on a bump) are jumbo behaviors defined
 once by the [Jumbo Build & Versioning Standard]; the executor only runs the
 same jumbo commands with a token. A public repository therefore carries **no
 per-repo release workflow logic**: it calls the workflow, inherits the org
@@ -193,11 +194,28 @@ order:
 | Fingerprint | `jumbo fingerprint` | `sha256(own commit + canonical extract)`; informational evidence for the run log. |
 | Dedup | `jumbo dedup` | **Fingerprint hit ⇒ `jumbo dedup --materialize` pulls the recorded artifact (exact URL, SHA-256 verified) into `dist/` and the run ends — no build, no publish, no append.** Same skip-build rule as CircleCI. |
 | Promote | `jumbo promote` | Decision JSON; `publishRequired` is true exactly when a new version was computed. |
-| Build on bump | `uv build` / `npm pack` | The manifest keeps declaring only the major; the build's version is set from the decision's `publish.version` before building. |
+| Materialize dependencies (build path) | `jumbo dedup --materialize --deps --manifest <manifest>` via [`scripts/jumbo_publish_materialize_deps.sh`](../scripts/jumbo_publish_materialize_deps.sh) | Only when publishing: replaces each internal dependency's resolution-only stub under `deps/<slug>/` with its recorded release artifact (exact URL, SHA-256 verified — or the real repository source at the recorded commit when the artifact cannot be used) and repoints the manifest at it, **before any build tool runs**. The stubs `jumbo lock` writes are enough to resolve and fingerprint but are not buildable — a build backend invoked on one aborts (hatchling: "Unable to determine which files to ship"). With the wheels landed at `deps/<slug>/*.whl` the build consumes real artifacts on any uv/npm version. A pre-build guard in the script hard-fails if any materialized entry is missing on disk, so stubs can never reach a build silently. |
+| Build on bump | `uv build` / `npm pack` | The manifest keeps declaring only the major; the build's version is set from the decision's `publish.version` before building; the dependency artifacts are already materialized under `deps/`. |
 | Checksums + Release | `sha256sum` → `gh release create v<version>` on the **caller** repository | Assets + `SHA256SUMS`; notes carry the version, bump, commit, fingerprint, executor, and run URL. |
 | Service image (opt-in) | `docker/build-push-action@v6` → `scripts/verify_image_digest.sh` | Only with `publish-image: true`: build the `Dockerfile` at the repository root from the same release commit, push to `ghcr.io/<owner>/<repo>:v<version>`, then verify the pushed digest against the registry **before** anything is recorded — a digest mismatch aborts the build with no index append (standard §3.7). |
 | Index append | `scripts/jumbo_index_append.py --push` | JumboIndex append protocol: canonical one-line record, serialized fast-forward push, fetch-and-retry on non-FF (bounded backoff), validator-gated, no history rewrites ever. Authenticated with the minted installation token or the static `JUNTAI_INDEX_TOKEN`. `executor` is `jumbo-publish-github-actions`. |
 | Public registry (opt-in) | `uv publish` / `npm publish` | Gated by `publish-to-public-registry` (default **off**); version always the jumbo-computed one; tokens only from caller secrets. |
+
+**Build-path CI evidence**: `.github/workflows/jumbo-publish-build-path-check.yml`
+pins the build path continuously and offline. A negative control runs the
+old order (no materialization) on a fixture consumer and must fail with the
+stub signature — uv requires building the path-sourced stub as early as
+`uv version`, and hatchling refuses it ("Unable to determine which files to
+ship"), exactly the failure that blocked the first dependent-repo
+onboarding. The positive control runs the new order with the same script the
+executor runs, shows the recorded wheel under `deps/<slug>/` **before** the
+build step with the manifest repointed at it (SHA-256 verified against the
+fixture record), builds successfully on a uv matrix (0.7 / 0.8 / latest —
+the lines where the executor's `uv version <version>` build step exists),
+then installs the built wheel with the materialized dependency wheel in a
+fresh venv and imports it. Dispatching that workflow is the standing
+dry-run demonstration of the build path: no release, no registry, no index
+append, and the fixture index clone is never pushed.
 
 ## The index record from this executor
 
@@ -272,7 +290,8 @@ cargo build --release                       # the jumbo the workflow builds
 export JUMBO_INDEX_PATH=/path/to/JumboIndex # a local clone; never pushed
 cd /path/to/public-repo-copy                # a throwaway copy, never pushed
 jumbo lock && jumbo fingerprint && jumbo dedup && jumbo promote
-uv version <nextVersion> && uv build --out-dir dist   # on publishRequired
+jumbo dedup --materialize --deps --manifest pyproject.toml   # on publishRequired (the build path)
+uv version <nextVersion> && uv build --out-dir dist   # after the deps are materialized
 python3 /path/to/JumboBuild/scripts/jumbo_index_append.py \
   --index-dir "$JUMBO_INDEX_PATH" --record-file record.json   # NO --push
 ```

@@ -1,0 +1,13 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "demo-consumer"
+version = "1.0.0"
+description = "Fixture consumer for the jumbo-publish build-path check"
+requires-python = ">=3.9"
+dependencies = ["demo-alpha@1"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/demo_consumer"]

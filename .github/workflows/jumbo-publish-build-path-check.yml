@@ -1,0 +1,303 @@
+# CI acceptance check for the jumbo-publish build path: dependency
+# materialization BEFORE the build (Jumbo Build & Versioning Standard,
+# §3.4 "Artifact Storage and Materialization"; engine side:
+# src/dedup/ingest.rs).
+#
+# The executor's build (miss) path must replace every internal
+# dependency's resolution-only stub under deps/<slug>/ with its recorded,
+# SHA-256-verified release artifact before any build tool runs — the
+# first dependent-repo onboarding failed exactly here: uv invoked the
+# build backend on the stub and hatchling aborted with "Unable to
+# determine which files to ship", on every uv version it was tried with.
+# This check pins both halves of that contract, offline (the fixture
+# index is a local clone that is never pushed, and the recorded artifact
+# is served from a local artifact cache through jumbo's
+# JUMBO_ARTIFACT_DIR support — the github.com URL in the fixture record
+# is validated but never contacted; no credential exists anywhere):
+#
+#   1. Negative control (the reported defect): the OLD step order —
+#      lock → promote → build, no materialization — must FAIL with the
+#      stub failure signature (uv requires building the path-sourced
+#      stub as early as `uv version`, and the build itself fails the
+#      same way), and the stub (not a real package) must be what stood
+#      under deps/ when it did.
+#   2. Positive control (the fix, on a uv matrix): the NEW step order —
+#      lock → fingerprint → dedup → promote → materialize (the same
+#      scripts/jumbo_publish_materialize_deps.sh the executor runs) →
+#      build — must show the real wheel under deps/ BEFORE the build
+#      step, the manifest repointed at it, and the build must then
+#      succeed on every supported uv line. The built consumer wheel is
+#      installed in a fresh venv together with the materialized
+#      dependency wheel and imported, proving the dependency closure the
+#      build consumed is the real recorded artifact.
+#
+# The positive-control job is also the standing dry-run demonstration of
+# the build path: dispatch this workflow and the run log shows
+# deps/<slug>/*.whl materialized ahead of the build step, with no
+# release, no registry, and no index append anywhere.
+name: jumbo publish build path check
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/jumbo-publish.yml"
+      - ".github/workflows/jumbo-publish-build-path-check.yml"
+      - "scripts/jumbo_publish_materialize_deps.sh"
+      - "tests/fixtures/build-path/**"
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/jumbo-publish.yml"
+      - ".github/workflows/jumbo-publish-build-path-check.yml"
+      - "scripts/jumbo_publish_materialize_deps.sh"
+      - "tests/fixtures/build-path/**"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # 1. The reported defect, reproduced: without materialization the stub
+  #    under deps/ reaches uv build and the build backend refuses it.
+  stub-build-regression:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install the Rust toolchain and build jumbo
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked
+      - name: Put jumbo on PATH
+        run: echo "$GITHUB_WORKSPACE/target/release" >> "$GITHUB_PATH"
+
+      - name: Install uv (the executor's Python build tool)
+        uses: astral-sh/setup-uv@v7
+
+      - name: Stage the fixture dependency, index, and artifact cache
+        run: |
+          set -euo pipefail
+          # jumbo command outputs live outside the fixture checkouts,
+          # exactly as the executor keeps them outside the caller tree.
+          echo "JUMBO_OUT=$RUNNER_TEMP/jumbo-state" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/jumbo-state"
+          fixture="$RUNNER_TEMP/build-path-fixture"
+          mkdir -p "$fixture/artifact-cache"
+          cp -r tests/fixtures/build-path/demo-alpha "$fixture/demo-alpha"
+          cd "$fixture/demo-alpha"
+          git init -q -b main
+          git config user.email "fixture@example.invalid"
+          git config user.name "build-path fixture"
+          git add -A
+          git commit -qm "demo-alpha 1.0.0"
+          uv build --out-dir dist
+          wheel="$(find dist -type f -name '*.whl' | head -n 1)"
+          cp "$wheel" "$fixture/artifact-cache/"
+          {
+            echo "FIXTURE_DIR=${fixture}"
+            echo "WHEEL_NAME=$(basename "$wheel")"
+            echo "WHEEL_SHA256=$(sha256sum "$wheel" | cut -d' ' -f1)"
+            echo "DEMO_ALPHA_COMMIT=$(git rev-parse HEAD)"
+            echo "JUMBO_INDEX_PATH=${fixture}/index-repo"
+            echo "JUMBO_ARTIFACT_DIR=${fixture}/artifact-cache"
+          } >> "$GITHUB_ENV"
+
+      - name: Write the fixture index record (local clone, never pushed)
+        run: |
+          set -euo pipefail
+          mkdir -p "$JUMBO_INDEX_PATH/index"
+          # The artifactUrl is a github.com URL (jumbo validates the host)
+          # that is never contacted: JUMBO_ARTIFACT_DIR serves the bytes,
+          # and the recorded sha256 is enforced either way.
+          jq -nc \
+            --arg commit "$DEMO_ALPHA_COMMIT" \
+            --arg url "https://github.com/acme/jumbo-build-path-fixtures/releases/download/v1.0.0/${WHEEL_NAME}" \
+            --arg sha "$WHEEL_SHA256" \
+            '{package:"demo-alpha",major:1,version:"1.0.0",commit:$commit,fingerprint:null,canonicalExtract:null,artifactUrl:$url,artifactSha256:$sha,imageDigest:null,buildId:"demo-alpha-1.0.0-fixture",pipelineRun:null,executor:"build-path-check-fixture",timestamp:"2026-01-01T00:00:00Z"}' \
+            > "$JUMBO_INDEX_PATH/index/demo-alpha.jsonl"
+          cat "$JUMBO_INDEX_PATH/index/demo-alpha.jsonl"
+
+      - name: Prepare the consumer at a clean release commit
+        run: |
+          set -euo pipefail
+          miss="$FIXTURE_DIR/consumer-miss"
+          cp -r tests/fixtures/build-path/demo-consumer "$miss"
+          cd "$miss"
+          git init -q -b main
+          git config user.email "fixture@example.invalid"
+          git config user.name "build-path fixture"
+          git add -A
+          git commit -qm "demo-consumer 1.0.0"
+
+      - name: Run the OLD build path (lock → promote → build, no materialization)
+        working-directory: ${{ runner.temp }}/build-path-fixture/consumer-miss
+        run: |
+          set -euo pipefail
+          jumbo lock > "$JUMBO_OUT/lock.json"
+          test -d deps/demo-alpha
+          grep -q "jumbo-injected internal source" deps/demo-alpha/pyproject.toml
+          echo "the resolution-only stub stands at deps/demo-alpha"
+
+      - name: The stub must fail the build (the reported defect)
+        working-directory: ${{ runner.temp }}/build-path-fixture/consumer-miss
+        run: |
+          set -euo pipefail
+          version="$(jumbo promote | sed -n '/^{/,$p' | tee "$JUMBO_OUT/promote.json" | jq -r .nextVersion)"
+          # The stub fails as early as `uv version`: resolving the build
+          # inputs already requires building the path-sourced dependency.
+          if { uv version "$version" && uv build --out-dir dist; } > "$JUMBO_OUT/stub-build.log" 2>&1; then
+            echo "the stub built - the reported defect is NOT reproduced" >&2
+            cat "$JUMBO_OUT/stub-build.log"
+            exit 1
+          fi
+          grep -q "Failed to build" "$JUMBO_OUT/stub-build.log"
+          grep -q "Unable to determine which files to ship" "$JUMBO_OUT/stub-build.log"
+          echo "defect reproduced: uv invoked the build backend on the stub and hatchling refused it"
+          grep -E "Failed to build|Unable to determine" "$JUMBO_OUT/stub-build.log"
+
+  # 2. The fix, on every supported uv line: the same materialization step
+  #    the executor runs puts the real wheel under deps/ before the build,
+  #    and the build then succeeds regardless of the uv version — the fix
+  #    must not depend on a uv-version matrix.
+  materialized-build-path:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Every uv line the executor's build step supports: `uv version
+        # <version>` (the jumbo-computed bump) exists from uv 0.7 on —
+        # 0.5.x/0.6.x cannot run the executor's Python build step at all.
+        # The point of the matrix is the materialization invariant: after
+        # the fix, no uv line ever builds the deps/ stub.
+        uv-version: ["0.7.22", "0.8.24", "latest"]
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install the Rust toolchain and build jumbo
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked
+      - name: Put jumbo on PATH
+        run: echo "$GITHUB_WORKSPACE/target/release" >> "$GITHUB_PATH"
+
+      - name: Install uv ${{ matrix.uv-version }}
+        uses: astral-sh/setup-uv@v7
+        with:
+          version: ${{ matrix.uv-version }}
+
+      - name: Stage the fixture dependency, index, and artifact cache
+        run: |
+          set -euo pipefail
+          # jumbo command outputs live outside the fixture checkouts,
+          # exactly as the executor keeps them outside the caller tree.
+          echo "JUMBO_OUT=$RUNNER_TEMP/jumbo-state" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/jumbo-state"
+          fixture="$RUNNER_TEMP/build-path-fixture"
+          mkdir -p "$fixture/artifact-cache"
+          cp -r tests/fixtures/build-path/demo-alpha "$fixture/demo-alpha"
+          cd "$fixture/demo-alpha"
+          git init -q -b main
+          git config user.email "fixture@example.invalid"
+          git config user.name "build-path fixture"
+          git add -A
+          git commit -qm "demo-alpha 1.0.0"
+          uv build --out-dir dist
+          wheel="$(find dist -type f -name '*.whl' | head -n 1)"
+          cp "$wheel" "$fixture/artifact-cache/"
+          {
+            echo "FIXTURE_DIR=${fixture}"
+            echo "WHEEL_NAME=$(basename "$wheel")"
+            echo "WHEEL_SHA256=$(sha256sum "$wheel" | cut -d' ' -f1)"
+            echo "DEMO_ALPHA_COMMIT=$(git rev-parse HEAD)"
+            echo "JUMBO_INDEX_PATH=${fixture}/index-repo"
+            echo "JUMBO_ARTIFACT_DIR=${fixture}/artifact-cache"
+          } >> "$GITHUB_ENV"
+
+      - name: Write the fixture index record (local clone, never pushed)
+        run: |
+          set -euo pipefail
+          mkdir -p "$JUMBO_INDEX_PATH/index"
+          jq -nc \
+            --arg commit "$DEMO_ALPHA_COMMIT" \
+            --arg url "https://github.com/acme/jumbo-build-path-fixtures/releases/download/v1.0.0/${WHEEL_NAME}" \
+            --arg sha "$WHEEL_SHA256" \
+            '{package:"demo-alpha",major:1,version:"1.0.0",commit:$commit,fingerprint:null,canonicalExtract:null,artifactUrl:$url,artifactSha256:$sha,imageDigest:null,buildId:"demo-alpha-1.0.0-fixture",pipelineRun:null,executor:"build-path-check-fixture",timestamp:"2026-01-01T00:00:00Z"}' \
+            > "$JUMBO_INDEX_PATH/index/demo-alpha.jsonl"
+
+      - name: Prepare the consumer at a clean release commit
+        run: |
+          set -euo pipefail
+          consumer="$FIXTURE_DIR/consumer"
+          cp -r tests/fixtures/build-path/demo-consumer "$consumer"
+          cd "$consumer"
+          git init -q -b main
+          git config user.email "fixture@example.invalid"
+          git config user.name "build-path fixture"
+          git add -A
+          git commit -qm "demo-consumer 1.0.0"
+          echo "CONSUMER_DIR=${consumer}" >> "$GITHUB_ENV"
+
+      - name: Executor build path (lock → fingerprint → dedup → promote)
+        working-directory: ${{ runner.temp }}/build-path-fixture/consumer
+        run: |
+          set -euo pipefail
+          jumbo lock | sed -n '/^{/,$p' > "$JUMBO_OUT/lock.json"
+          jumbo fingerprint | sed -n '/^{/,$p' > "$JUMBO_OUT/fingerprint.json"
+          jumbo dedup | sed -n '/^{/,$p' > "$JUMBO_OUT/dedup.json"
+          duplicate="$(jq -r .duplicate "$JUMBO_OUT/dedup.json")"
+          [[ "$duplicate" == "false" ]] || { echo "expected a dedup miss in the fixture, got duplicate=${duplicate}" >&2; exit 1; }
+          jumbo promote | sed -n '/^{/,$p' > "$JUMBO_OUT/promote.json"
+          [[ "$(jq -r .publishRequired "$JUMBO_OUT/promote.json")" == "true" ]]
+          echo "dedup miss; promoted to $(jq -r .nextVersion "$JUMBO_OUT/promote.json")"
+
+      - name: Materialize the recorded dependency artifacts (the executor step)
+        id: deps
+        working-directory: ${{ runner.temp }}/build-path-fixture/consumer
+        run: |
+          bash "$GITHUB_WORKSPACE/scripts/jumbo_publish_materialize_deps.sh" python
+
+      - name: The wheel is under deps/ BEFORE the build, and the manifest points at it
+        working-directory: ${{ runner.temp }}/build-path-fixture/consumer
+        run: |
+          set -euo pipefail
+          [[ -f "deps/demo-alpha/${WHEEL_NAME}" ]]
+          grep -F "path = \"deps/demo-alpha/${WHEEL_NAME}\"" pyproject.toml
+          [[ -f deps/.jumbo-artifacts.json ]]
+          jq -e --arg sha "$WHEEL_SHA256" \
+            '.artifacts[] | select(.package == "demo-alpha" and .mode == "artifact" and .sha256 == $sha)' \
+            deps/.jumbo-artifacts.json > /dev/null
+          echo "deps/demo-alpha/${WHEEL_NAME} (sha256 verified, manifest repointed) is in place before any build tool runs"
+
+      - name: Build at the jumbo-computed version (must succeed on this uv)
+        working-directory: ${{ runner.temp }}/build-path-fixture/consumer
+        run: |
+          set -euo pipefail
+          version="$(jq -r .nextVersion "$JUMBO_OUT/promote.json")"
+          uv version "$version"
+          uv build --out-dir dist
+          ls -l dist
+          test -n "$(find dist -type f -name '*.whl')"
+
+      - name: The build consumed the real dependency (install and import)
+        working-directory: ${{ runner.temp }}/build-path-fixture/consumer
+        run: |
+          set -euo pipefail
+          venv="$RUNNER_TEMP/venv"
+          uv venv "$venv"
+          uv pip install --python "$venv/bin/python" --no-deps dist/*.whl deps/demo-alpha/*.whl
+          "$venv/bin/python" -c "from demo_consumer import consumer_value; assert consumer_value() == 42, consumer_value(); print('consumer imports the materialized demo-alpha wheel: OK')"
+
+      - name: Run summary
+        if: always()
+        run: |
+          {
+            echo "## jumbo publish build path check (uv ${{ matrix.uv-version }})"
+            echo
+            echo "- materialized dependency artifacts: ${{ steps.deps.outputs.materialized }}"
+            echo "- wheel under deps/ before the build: deps/demo-alpha/${{ env.WHEEL_NAME }}"
+          } >> "$GITHUB_STEP_SUMMARY"
