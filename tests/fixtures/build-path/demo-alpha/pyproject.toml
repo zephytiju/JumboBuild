@@ -1,0 +1,12 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "demo-alpha"
+version = "1.0.0"
+description = "Fixture internal dependency for the jumbo-publish build-path check"
+requires-python = ">=3.9"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/demo_alpha"]

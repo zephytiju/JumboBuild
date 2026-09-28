@@ -4,8 +4,13 @@
 # Jumbo publication is executor-agnostic: this workflow runs the SAME jumbo
 # commands the CircleCI umbrella pipelines run — lock → fingerprint → dedup →
 # promote — and a public repository releases to jumbo by calling it with NO
-# per-repo workflow logic. On a promotion (publish-on-bump) it builds the
-# artifacts at the jumbo-computed version, publishes them as a GitHub Release
+# per-repo workflow logic. On a promotion (publish-on-bump) it first
+# materializes the recorded artifacts of the manifest's internal
+# dependencies into deps/ (scripts/jumbo_publish_materialize_deps.sh —
+# real wheels replace the resolution-only stubs the lock generation
+# wrote, so the build never sees a stub on any uv/npm version) and then
+# builds the artifacts at the jumbo-computed version, publishes them as a
+# GitHub Release
 # on the CALLER repository, appends the JumboIndex record per that
 # repository's docs/APPEND-PROTOCOL.md, and (opt-in, default off) republishes
 # to the public registry so external consumers keep being served — driven by
@@ -444,10 +449,31 @@ jobs:
             echo "bump=${{ steps.promote.outputs.bump }}"
           } >> "$GITHUB_OUTPUT"
 
-      # 8. Publish on bump: build the artifacts at the jumbo-computed
+      # 8. Build path: materialize the recorded artifacts of the manifest's
+      #    internal dependencies BEFORE any build tool runs. `jumbo lock`
+      #    writes resolution-only stubs under deps/<slug>/ — enough to
+      #    resolve and fingerprint, never buildable (a build backend
+      #    invoked on a stub aborts, e.g. hatchling "Unable to determine
+      #    which files to ship"). This step replaces each stub with the
+      #    recorded release artifact (exact URL, SHA-256 verified) — or
+      #    the real repository source at the recorded commit when the
+      #    artifact cannot be used — and repoints the manifest at it, so
+      #    the build consumes real wheels/tarballs on any uv/npm version.
+      #    The dedup-reuse path above is untouched: it pulls its own
+      #    recorded artifact into dist/ and never builds. The step is the
+      #    same script the build-path CI check exercises
+      #    (jumbo-publish-build-path-check.yml).
+      - name: Materialize the recorded dependency artifacts (build path)
+        id: deps
+        if: steps.promote.outputs.publish_required == 'true'
+        run: |
+          bash "$RUNNER_TEMP/jumbo-build/jumbobuild/scripts/jumbo_publish_materialize_deps.sh" "${{ steps.identity.outputs.ecosystem }}"
+
+      # 9. Publish on bump: build the artifacts at the jumbo-computed
       #    version (the manifest's own version declares only the major;
       #    minor/patch are pipeline-owned, so the version for this build is
-      #    set from the promotion decision before building).
+      #    set from the promotion decision before building). The
+      #    dependencies it declares are already materialized under deps/.
       - name: Build the artifacts at the jumbo-computed version
         id: build
         if: steps.promote.outputs.publish_required == 'true'
@@ -487,7 +513,7 @@ jobs:
             echo "asset-sha256=$(sha256sum "$primary" | cut -d' ' -f1)"
           } >> "$GITHUB_OUTPUT"
 
-      # 9. The GitHub Release on the CALLER repository (the artifact
+      # 10. The GitHub Release on the CALLER repository (the artifact
       #    storage of the standard: language artifacts are release assets
       #    on the package repository).
       - name: Publish the GitHub Release on the caller repository
@@ -524,7 +550,7 @@ jobs:
             echo "asset-url=https://github.com/${GITHUB_REPOSITORY}/releases/download/${tag}/${asset}"
           } >> "$GITHUB_OUTPUT"
 
-      # 10. Service image (opt-in, image-producing packages): build the image
+      # 11. Service image (opt-in, image-producing packages): build the image
       #    from the same release commit and push it to GHCR, the image
       #    registry of the standard (§3.4). The pushed digest is then
       #    verified against the registry BEFORE anything is recorded: a
@@ -584,7 +610,7 @@ jobs:
           echo "digest=$observed" >> "$GITHUB_OUTPUT"
           echo "::notice title=jumbo image::${JUMBO_IMAGE_TAG} verified at ${observed}"
 
-      # 11. Append the index record per JumboIndex docs/APPEND-PROTOCOL.md:
+      # 12. Append the index record per JumboIndex docs/APPEND-PROTOCOL.md:
       #    serialized fast-forward append, fetch-and-retry on non-FF,
       #    validator-gated, no history rewrites ever. imageDigest carries
       #    the verified GHCR digest when the image was pushed, else null.
@@ -629,7 +655,7 @@ jobs:
             --push \
             --token-env JUMBO_INDEX_TOKEN
 
-      # 12. Opt-in public registry publication — public packages keep
+      # 13. Opt-in public registry publication — public packages keep
       #    serving external consumers, always driven by the jumbo-computed
       #    version (set in the build step above). Credentials come only
       #    from caller secrets; nothing is published when the gate is off.
@@ -669,6 +695,7 @@ jobs:
             else
               echo "- package: \`${{ steps.identity.outputs.package }}\`"
               echo "- version: \`${{ steps.identity.outputs.version }}\` (bump: ${{ steps.identity.outputs.bump }})"
+              echo "- dependency artifacts materialized under deps/: ${{ steps.deps.outputs.materialized || '0' }}"
               echo "- published: ${{ steps.release.outputs.published == 'true' }}"
               if [[ -n "${{ steps.image-verify.outputs.digest }}" ]]; then
                 echo "- image: \`${{ steps.image-coords.outputs.tag }}\`"
