@@ -441,9 +441,14 @@ pub fn resolve_by_build_id<'a>(
             return Ok((record.package.clone(), *line, record));
         }
     }
-    Err(PinningError::BuildIdNotFound {
-        package: package.unwrap_or("<any>").to_string(),
-        build_id: build_id.to_string(),
+    Err(match package {
+        Some(package) => PinningError::BuildIdNotFound {
+            package: package.to_string(),
+            build_id: build_id.to_string(),
+        },
+        None => PinningError::BuildIdNotFoundAnywhere {
+            build_id: build_id.to_string(),
+        },
     })
 }
 

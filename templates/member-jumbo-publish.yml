@@ -5,7 +5,8 @@
 # expect it to run inside JumboBuild: it lives outside .github/workflows so
 # GitHub Actions never picks it up in this repository.
 #
-# How to adopt (see docs/jumbo-publish.md in zephytiju/JumboBuild):
+# How to adopt (see docs/member-onboarding.md in zephytiju/JumboBuild for the
+# full walkthrough; docs/jumbo-publish.md for the executor contract):
 #   1. Copy this file into your repository as
 #      .github/workflows/jumbo-publish.yml (the file name is yours to choose;
 #      only the location is fixed).
@@ -43,17 +44,33 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      commit:
+        description: "Commit SHA of this repository to release (default: the triggering commit)"
+        type: string
+        default: ""
 
 jobs:
   jumbo-publish:
     uses: zephytiju/JumboBuild/.github/workflows/jumbo-publish.yml@<ref>
     secrets: inherit
-    # The same JumboBuild ref the uses: line pins — the reusable workflow
-    # builds the jumbo binary from exactly this ref.
     with:
+      # The same JumboBuild ref the uses: line pins — the reusable workflow
+      # builds the jumbo binary from exactly this ref.
       jumbobuild-ref: <ref>
-    # Reusable workflows cannot elevate permissions; the GitHub Release and
-    # the tag it creates live on THIS repository, so the calling job grants
-    # contents: write. No other permission is needed.
+      # Release-commit passthrough (the executor's documented `commit`
+      # input): empty on push runs and on plain dispatches means the
+      # triggering commit; an explicit dispatch input releases that exact
+      # existing commit — the re-release path a fingerprint-equal dedup
+      # re-run uses. The executor itself defaults an empty value to
+      # GITHUB_SHA, so push behavior is unchanged.
+      commit: ${{ inputs.commit }}
+    # Reusable workflows cannot elevate permissions; the calling job must
+    # grant what the called workflow needs. contents: write covers the
+    # GitHub Release and its tag, which live on THIS repository. The
+    # reusable workflow also declares packages: write (the GHCR push, only
+    # exercised with publish-image: true), and reusable workflows cannot
+    # elevate permissions — so this job grants both.
     permissions:
       contents: write
+      packages: write

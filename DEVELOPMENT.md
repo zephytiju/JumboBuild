@@ -1,6 +1,6 @@
 # Jumbo Build development guide
 
-[User guide](./README.md) · [Generated CLI reference](./docs/cli-reference.md)
+[User guide](./README.md) · [Member onboarding guide](./docs/member-onboarding.md) · [Generated CLI reference](./docs/cli-reference.md)
 
 This guide is for contributors changing Jumbo Build itself. It explains the development workflow, the boundaries between modules, and the contracts that should remain stable as the CLI evolves.
 

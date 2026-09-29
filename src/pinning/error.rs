@@ -24,9 +24,20 @@ pub enum PinningError {
     #[error(
         "buildId `{build_id}` not found for `{package}`: no record (recorded or derived \
             bootstrap buildId) matches; list the history with `jumbo pin {package} \
-            --latest-of-major <M>` or resolve the buildId from the deployment record"
+            --latest-of-major <M>` — the manifest carries the package's buildIds — or \
+            resolve the buildId from the deployment record"
     )]
     BuildIdNotFound { package: String, build_id: String },
+
+    /// No record of any package carries the requested buildId (the
+    /// whole-index search, no `--package` constraint).
+    #[error(
+        "buildId `{build_id}` not found in the index: no record of any package (recorded or \
+            derived bootstrap buildId) matches; a buildId is carried by its index record and \
+            by every `jumbo pin <package> --latest-of-major <M>` manifest of the package — \
+            resolve it from the deployment record or the release notes"
+    )]
+    BuildIdNotFoundAnywhere { build_id: String },
 
     /// No record of the package carries the requested commit.
     #[error(
