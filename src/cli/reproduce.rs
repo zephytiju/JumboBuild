@@ -67,8 +67,7 @@ fn staging_dir() -> PathBuf {
 
 pub fn execute(args: ReproduceArgs) -> Result<()> {
     let source = resolver::resolve_source(args.index.as_deref())?;
-    let index = resolver::Index::load(&source)
-        .map_err(|e| anyhow::anyhow!(e).context(format!("index source: {}", source.describe())))?;
+    let index = resolver::Index::load(&source)?;
     let options = ReproduceOptions {
         package: args.package.clone(),
         out_dir: args
@@ -78,8 +77,10 @@ pub fn execute(args: ReproduceArgs) -> Result<()> {
     };
     let provider = artifact_provider(args.artifact_dir.as_ref());
     let staging = staging_dir();
-    let result = pinning::reproduce(&index, &args.build_id, &options, &provider, &staging)
-        .map_err(|e| anyhow::anyhow!(e).context(format!("reproducing {}", args.build_id)));
+    // The typed pinning error is the primary message: it already names the
+    // package, buildId, and remediation — a wrapping context would only
+    // bury it under "Caused by".
+    let result = pinning::reproduce(&index, &args.build_id, &options, &provider, &staging);
     let _ = std::fs::remove_dir_all(&staging);
     let report = result?;
     println!("{}", serde_json::to_string_pretty(&report)?);

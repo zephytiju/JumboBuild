@@ -12,6 +12,8 @@ secrets, and nothing else.
 
 - Workflow: [`.github/workflows/jumbo-publish.yml`](../.github/workflows/jumbo-publish.yml)
 - Member forwarder template: [`templates/member-jumbo-publish.yml`](../templates/member-jumbo-publish.yml)
+  (the member-side walkthrough — onboarding, declarations, local parity,
+  secrets, pin/reproduce — is [docs/member-onboarding.md](./member-onboarding.md))
 - Index append implementation: [`scripts/jumbo_index_append.py`](../scripts/jumbo_index_append.py)
   (unit tests: [`scripts/tests/test_jumbo_index_append.py`](../scripts/tests/test_jumbo_index_append.py),
   run in CI by [`index-append.yml`](../.github/workflows/index-append.yml) — including the
@@ -55,12 +57,17 @@ never silently trusts caller context), and direct runs on the JumboBuild
 repository itself (`workflow_dispatch`) still fall back to the ref the
 workflow was dispatched at.
 
-Reusable workflows cannot elevate permissions, so the calling job must also
-grant the release write it needs (GitHub Releases on the caller repository):
+Reusable workflows cannot elevate permissions, so the calling job must grant
+everything the executor's workflow declares (`contents: write` for the
+GitHub Release and its tag on the caller repository; `packages: write` is
+declared too and only exercised with `publish-image: true` — the caller
+must grant it regardless, since a reusable workflow can only downgrade,
+never elevate):
 
 ```yaml
     permissions:
       contents: write
+      packages: write
 ```
 
 A complete caller workflow is committed as the **member forwarder template**
@@ -90,20 +97,36 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      commit:
+        description: "Commit SHA of this repository to release (default: the triggering commit)"
+        type: string
+        default: ""
 
 jobs:
   jumbo-publish:
     uses: zephytiju/JumboBuild/.github/workflows/jumbo-publish.yml@<ref>
     secrets: inherit
-    # The same JumboBuild ref the uses: line pins — the reusable workflow
-    # builds the jumbo binary from exactly this ref.
     with:
+      # The same JumboBuild ref the uses: line pins — the reusable workflow
+      # builds the jumbo binary from exactly this ref.
       jumbobuild-ref: <ref>
-    # Reusable workflows cannot elevate permissions; the GitHub Release and
-    # the tag it creates live on THIS repository, so the calling job grants
-    # contents: write. No other permission is needed.
+      # Release-commit passthrough (the executor's documented `commit`
+      # input): empty on push runs and on plain dispatches means the
+      # triggering commit; an explicit dispatch input releases that exact
+      # existing commit — the re-release path a fingerprint-equal dedup
+      # re-run uses. The executor itself defaults an empty value to
+      # GITHUB_SHA, so push behavior is unchanged.
+      commit: ${{ inputs.commit }}
+    # Reusable workflows cannot elevate permissions; the calling job must
+    # grant what the called workflow needs. contents: write covers the
+    # GitHub Release and its tag, which live on THIS repository. The
+    # reusable workflow also declares packages: write (the GHCR push, only
+    # exercised with publish-image: true), and reusable workflows cannot
+    # elevate permissions — so this job grants both.
     permissions:
       contents: write
+      packages: write
 ```
 
 ## Inputs
@@ -166,9 +189,10 @@ order:
   private, so the caller must be in the same GitHub organization
   (`zephytiju`) — public Meridian-family repositories qualify.
 - The calling job grants `permissions: contents: write` (the GitHub Release
-  on the caller repository). Image-producing packages additionally grant
-  `packages: write` (the GHCR push with the caller's `GITHUB_TOKEN`) — only
-  with `publish-image: true`. No other permission is requested.
+  on the caller repository) and `packages: write` (declared by the executor
+  workflow, so the caller must grant it; it is exercised only with
+  `publish-image: true`, the GHCR push with the caller's `GITHUB_TOKEN`).
+  No other permission is requested.
 - **App path (preferred)**: the org CI GitHub App must be installed on
   `zephytiju/JumboBuild` and `zephytiju/JumboIndex` with repository
   permission `Contents: Read and write` — that is all the executor needs,

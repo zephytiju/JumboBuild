@@ -331,7 +331,13 @@ Compute the auto-promotion version bump decision (publish-on-bump contract for e
 
 ## `jumbo pin`
 
-Emit a deployment pin manifest for one promoted build (by buildId, commit, or latest of major)
+Emit a deployment pin manifest (`jumbo.deployment-pin/v1`) for one promoted build of one package — the fields a downstream Pulumi program flows into the existing vangu Selection and PackageLock path.
+
+Exactly one selector is required: --by-build-id (the earliest record whose recorded or derived `bootstrap-…` buildId matches), --by-commit (the newest record promoted from that commit — a dependency refresh on an unchanged commit appends patch records, the newest is the one a deployment of that commit pins), or --latest-of-major (the newest record of the major — exactly what dependency resolution resolves). Recency is record order, never wall clock.
+
+The manifest carries buildId (and buildIdSource), commit, version, the exact digest-pinned imageRef when the record published an imageDigest, the artifact URL + SHA-256, the fingerprint, and the record's index location for audit. On stdout as pretty JSON; exit codes: 0 on success, 1 on any failure (the typed error on stderr, e.g. PIN_IMAGE_REQUIRED under --require-image), 2 on command-line usage errors.
+
+See docs/pinning.md for the authoritative field mapping and docs/member-onboarding.md for the walkthrough.
 
 **Usage:** `jumbo pin [OPTIONS] <--by-build-id <BUILD_ID>|--by-commit <SHA>|--latest-of-major <MAJOR>> <PACKAGE>`
 
@@ -352,7 +358,15 @@ Emit a deployment pin manifest for one promoted build (by buildId, commit, or la
 
 ## `jumbo reproduce`
 
-Reproduce the pinned build a buildId refers to (alias: jumbo build --pinned <BUILD_ID>)
+Reproduce the pinned build a buildId refers to — the same run as `jumbo build --pinned <BUILD_ID>`.
+
+The index record is the lock — no repository lock file is consulted: the record is resolved by buildId (recorded, or the documented `bootstrap-…` derivation for imported records), the fingerprint sha256(commit + canonical extract) is recomputed from the recorded inputs and must equal the recorded one (a mismatch aborts before anything is fetched or written), every internal dependency of the recorded closure is materialized at its exact recorded version under <out>/deps/<slug>/, and the own artifact is materialized under <out>/dist/ — reproducing the recorded SHA-256.
+
+Artifacts come from the network (the validated github.com-only fetch layer, identical locally and in CI) or from a local cache directory (--artifact-dir / JUMBO_ARTIFACT_DIR) whose bytes are still verified against the recorded digest — the cache is a transport, not a trust anchor.
+
+Exit codes: 0 on a digest-verified reproduction (the report JSON on stdout), 1 on any failure (the typed error on stderr), 2 on command-line usage errors.
+
+See docs/pinning.md for the contract and docs/member-onboarding.md for the walkthrough.
 
 **Usage:** `jumbo reproduce [OPTIONS] <BUILD_ID>`
 

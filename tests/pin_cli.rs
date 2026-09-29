@@ -409,3 +409,71 @@ fn pin_selector_errors_and_exclusivity() {
     assert!(!out.status.success());
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn pin_output_is_deterministic_and_exit_codes_follow_the_contract() {
+    let dir = temp_dir("det");
+    let index_dir = fixture_index(
+        &dir,
+        &[(
+            "demo-alpha",
+            &[record_json(serde_json::json!({
+                "version": "2.0.0",
+                "buildId": "demo-2.0.0-001",
+                "fingerprint": "a".repeat(64),
+            }))],
+        )],
+    );
+    let args = [
+        "pin",
+        "demo-alpha",
+        "--latest-of-major",
+        "2",
+        "--index",
+        index_dir.to_str().unwrap(),
+    ];
+    let first = run_jumbo(&args, &dir);
+    let second = run_jumbo(&args, &dir);
+    assert!(first.status.success(), "stderr: {}", stderr_of(&first));
+    assert_eq!(first.status.code(), Some(0));
+    assert!(stderr_of(&first).is_empty(), "errors go to stderr only");
+    assert!(second.status.success(), "stderr: {}", stderr_of(&second));
+    // The manifest carries no run-local values: two runs are byte-identical.
+    assert_eq!(
+        first.stdout, second.stdout,
+        "manifest must be deterministic"
+    );
+
+    // Typed failure: exit 1, the error on stderr, no manifest on stdout.
+    let typed = run_jumbo(
+        &[
+            "pin",
+            "demo-alpha",
+            "--by-build-id",
+            "missing-id",
+            "--index",
+            index_dir.to_str().unwrap(),
+        ],
+        &dir,
+    );
+    assert_eq!(typed.status.code(), Some(1));
+    assert!(stderr_of(&typed).contains("not found"));
+    assert!(typed.stdout.is_empty());
+
+    // Usage error: exit 2 (clap's argument-parse contract).
+    let usage = run_jumbo(
+        &[
+            "pin",
+            "demo-alpha",
+            "--latest-of-major",
+            "2",
+            "--by-commit",
+            "0123456789abcdef0123456789abcdef01234567",
+            "--index",
+            index_dir.to_str().unwrap(),
+        ],
+        &dir,
+    );
+    assert_eq!(usage.status.code(), Some(2));
+    let _ = fs::remove_dir_all(&dir);
+}

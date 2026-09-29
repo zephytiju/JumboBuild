@@ -69,14 +69,15 @@ pub fn execute(args: PinArgs) -> Result<()> {
     let selector: Option<PinSelector> = (&args.selector).into();
     let selector = selector.expect("clap enforces exactly one selector");
     let source = resolver::resolve_source(args.index.as_deref())?;
-    let index = resolver::Index::load(&source)
-        .map_err(|e| anyhow::anyhow!(e).context(format!("index source: {}", source.describe())))?;
+    let index = resolver::Index::load(&source)?;
     let options = PinOptions {
         image_name: args.image_name.clone(),
         require_image: args.require_image,
     };
-    let manifest = pinning::pin(&index, &args.package, &selector, &options)
-        .map_err(|e| anyhow::anyhow!(e).context(format!("pinning {}", args.package)))?;
+    // The typed pinning error is the primary message: it already names the
+    // package and the remediation — a wrapping context would only bury it
+    // under "Caused by".
+    let manifest = pinning::pin(&index, &args.package, &selector, &options)?;
     println!("{}", serde_json::to_string_pretty(&manifest)?);
     Ok(())
 }

@@ -225,6 +225,7 @@ Install the generated file in the location expected by your shell. See `jumbo co
 ## Development and support
 
 - [Development guide](./DEVELOPMENT.md)
+- [Member onboarding: declaring, building, and pinning with jumbo](./docs/member-onboarding.md) — the service-owner walkthrough
 - [Generated CLI reference](./docs/cli-reference.md)
 - [Deployment pinning contract](./docs/pinning.md)
 - For complete, version-matched command details, run `jumbo --help` or `jumbo <command> --help`.

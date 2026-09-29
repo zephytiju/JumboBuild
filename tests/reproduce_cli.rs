@@ -66,6 +66,10 @@ fn stdout_json(out: &Output) -> serde_json::Value {
     serde_json::from_slice(&out.stdout).expect("stdout is valid JSON")
 }
 
+fn stdout_of(out: &Output) -> String {
+    String::from_utf8_lossy(&out.stdout).to_string()
+}
+
 fn stderr_of(out: &Output) -> String {
     String::from_utf8_lossy(&out.stderr).to_string()
 }
@@ -439,6 +443,83 @@ fn closure_dep_without_artifact_keeps_its_source_coordinate() {
     assert!(
         report["artifact"].is_null(),
         "record published no own artifact"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn exit_codes_follow_the_documented_contract() {
+    // 0 on a digest-verified reproduction, 1 on a typed failure, 2 on a
+    // command-line usage error (help text contract, `jumbo reproduce --help`).
+    let (dir, cache) = fixture("exitcodes", false);
+    let index = dir.join("index").to_str().unwrap().to_string();
+    let artifact_dir = cache.to_str().unwrap().to_string();
+    let out_dir = dir.join("reproduced").to_str().unwrap().to_string();
+
+    let ok = run_jumbo(
+        &[
+            "reproduce",
+            "consumer-2.4.0-001",
+            "--index",
+            &index,
+            "--artifact-dir",
+            &artifact_dir,
+            "--out",
+            &out_dir,
+        ],
+        &dir,
+    );
+    assert_eq!(ok.status.code(), Some(0), "stderr: {}", stderr_of(&ok));
+    assert!(stderr_of(&ok).is_empty(), "errors go to stderr only");
+
+    let typed = run_jumbo(&["reproduce", "no-such-build", "--index", &index], &dir);
+    assert_eq!(typed.status.code(), Some(1));
+    assert!(stderr_of(&typed).contains("not found"));
+    assert!(stdout_of(&typed).is_empty(), "no report JSON on failure");
+
+    let usage = run_jumbo(&["reproduce"], &dir);
+    assert_eq!(usage.status.code(), Some(2));
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn reproduction_output_is_deterministic() {
+    // Two runs of the same record produce byte-identical report JSON (the
+    // report carries no timestamps; record order, not wall clock).
+    let (dir, cache) = fixture("determinism", false);
+    let args = |tag: &str| {
+        vec![
+            "reproduce".to_string(),
+            "consumer-2.4.0-001".to_string(),
+            "--index".to_string(),
+            dir.join("index").to_str().unwrap().to_string(),
+            "--artifact-dir".to_string(),
+            cache.to_str().unwrap().to_string(),
+            "--out".to_string(),
+            dir.join(tag).to_str().unwrap().to_string(),
+        ]
+    };
+    let first = run_jumbo(
+        &args("run1").iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+        &dir,
+    );
+    let second = run_jumbo(
+        &args("run2").iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+        &dir,
+    );
+    assert!(first.status.success(), "stderr: {}", stderr_of(&first));
+    assert!(second.status.success(), "stderr: {}", stderr_of(&second));
+    let a: serde_json::Value = stdout_json(&first);
+    let mut b: serde_json::Value = stdout_json(&second);
+    // The only legitimate difference is where the outputs landed.
+    assert_eq!(b["outDir"], dir.join("run2").to_str().unwrap());
+    b["outDir"] = a["outDir"].clone();
+    assert_eq!(a, b, "report JSON must be deterministic");
+    // The materialized bytes are identical too.
+    let wheel = "dist/consumer-2.4.0-py3-none-any.whl";
+    assert_eq!(
+        sha256_hex(&fs::read(dir.join("run1").join(wheel)).expect("run1 wheel")),
+        sha256_hex(&fs::read(dir.join("run2").join(wheel)).expect("run2 wheel"))
     );
     let _ = fs::remove_dir_all(&dir);
 }

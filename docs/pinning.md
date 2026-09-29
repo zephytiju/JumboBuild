@@ -6,7 +6,9 @@ authoritative field mapping from a JumboIndex record to a deployment pin,
 the machine contract of the pin manifest, the reference adapter that feeds
 the existing vangu Selection/PackageLock path, and the pinned-reproduction
 contract. The mapping is **additive**: the deployed IaC keeps its exact
-semantics — the pin only supplies field values.
+semantics — the pin only supplies field values. The member-side walkthrough
+is [docs/member-onboarding.md](./member-onboarding.md) (§8 pin and
+reproduce).
 
 ## 1. Index record → pin manifest
 
