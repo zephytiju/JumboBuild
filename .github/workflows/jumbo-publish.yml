@@ -405,9 +405,21 @@ jobs:
       # 7. Fingerprint hit: pull the recorded artifact (exact URL,
       #    SHA-256 verified) into dist/ and stop — no build, no publish,
       #    no index append. This is the skip-build path either executor
-      #    takes.
+      #    takes. The step exports the caller's own GITHUB_TOKEN: on a
+      #    PRIVATE repository the recorded
+      #    github.com/<o>/<r>/releases/download/... URL answers 404 even
+      #    WITH an Authorization header — GitHub serves private release
+      #    assets only through the authenticated api.github.com asset
+      #    route, and jumbo's fetch layer resolves the asset there when
+      #    the direct URL 404s. The caller's token can always read the
+      #    release this workflow created on the caller repository; public
+      #    assets never need it (they 302 from the recorded URL), and the
+      #    token enters only through the environment — never a log line
+      #    or a command line.
       - name: Pull the recorded artifact (fingerprint hit - build skipped)
         if: steps.dedup.outputs.duplicate == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           jumbo dedup --materialize --dist-dir dist | sed -n '/^{/,$p' > "$JUMBO_OUT/dedup-materialized.json"

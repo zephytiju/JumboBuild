@@ -192,7 +192,7 @@ order:
 | Fetch the index | `gh repo clone zephytiju/JumboIndex` | Authenticated with the minted installation token or the static artifact token. `JUMBO_INDEX_PATH` points every later jumbo command at this clone. |
 | Lock | `jumbo lock` | Resolves internal deps from the index, generates `uv.lock` / `package-lock.json`. |
 | Fingerprint | `jumbo fingerprint` | `sha256(own commit + canonical extract)`; informational evidence for the run log. |
-| Dedup | `jumbo dedup` | **Fingerprint hit ⇒ `jumbo dedup --materialize` pulls the recorded artifact (exact URL, SHA-256 verified) into `dist/` and the run ends — no build, no publish, no append.** Same skip-build rule as CircleCI. |
+| Dedup | `jumbo dedup` | **Fingerprint hit ⇒ `jumbo dedup --materialize` pulls the recorded artifact (exact URL, SHA-256 verified) into `dist/` and the run ends — no build, no publish, no append.** Same skip-build rule as CircleCI. The step exports the caller's own `GH_TOKEN`, so a private repository's re-pull resolves through the authenticated api.github.com asset route (see [The dedup re-pull on private repositories](#the-dedup-re-pull-on-private-repositories)). |
 | Promote | `jumbo promote` | Decision JSON; `publishRequired` is true exactly when a new version was computed. |
 | Materialize dependencies (build path) | `jumbo dedup --materialize --deps --manifest <manifest>` via [`scripts/jumbo_publish_materialize_deps.sh`](../scripts/jumbo_publish_materialize_deps.sh) | Only when publishing: replaces each internal dependency's resolution-only stub under `deps/<slug>/` with its recorded release artifact (exact URL, SHA-256 verified — or the real repository source at the recorded commit when the artifact cannot be used) and repoints the manifest at it, **before any build tool runs**. The stubs `jumbo lock` writes are enough to resolve and fingerprint but are not buildable — a build backend invoked on one aborts (hatchling: "Unable to determine which files to ship"). With the wheels landed at `deps/<slug>/*.whl` the build consumes real artifacts on any uv/npm version. A pre-build guard in the script hard-fails if any materialized entry is missing on disk, so stubs can never reach a build silently. |
 | Build on bump | `uv build` / `npm pack` | The manifest keeps declaring only the major; the build's version is set from the decision's `publish.version` before building; the dependency artifacts are already materialized under `deps/`. |
@@ -216,6 +216,48 @@ then installs the built wheel with the materialized dependency wheel in a
 fresh venv and imports it. Dispatching that workflow is the standing
 dry-run demonstration of the build path: no release, no registry, no index
 append, and the fixture index clone is never pushed.
+
+### The dedup re-pull on private repositories
+
+The reuse path downloads release assets **by exact URL** and verifies the
+recorded `artifactSha256`. On a **private** repository that recorded
+`github.com/<owner>/<repo>/releases/download/<tag>/<asset>` URL answers
+**HTTP 404 even with an `Authorization` header** — GitHub serves private
+release assets only through the authenticated REST asset route (a public
+asset 302s from the same URL, which is why public repositories never see
+this). The "Pull the recorded artifact" step therefore exports the
+caller's own token (`GH_TOKEN: ${{ github.token }}`), and jumbo's fetch
+layer (`src/dedup/fetch.rs`) resolves the asset through that route when
+the direct URL 404s with a token present:
+
+1. `GET api.github.com/repos/<owner>/<repo>/releases/tags/<tag>` — the
+   release this workflow created on the caller repository; the caller's
+   token can always read it.
+2. The asset is matched by its **exact file name**.
+3. `GET api.github.com/repos/<owner>/<repo>/releases/assets/<id>` with
+   `Accept: application/octet-stream` returns the bytes through the same
+   release-asset CDN redirect a public download takes.
+
+The recorded SHA-256 is enforced identically on both routes — private
+bytes are never trusted without the digest. The egress policy stays
+closed: `api.github.com` is allowed **for this route only** (a recorded
+artifact URL pointing there is still rejected), every URL keeps the strict
+https / no-userinfo / default-port / no-IP-literal rules, and the token
+enters only through the environment, handed to curl via a mode-0600 config
+file — never a command line, a log line, or an error message. When the API
+route confirms the asset is gone (404), the behavior is unchanged: the
+dependency ingestion path falls back to the real repository source at the
+recorded commit, and an own-record re-pull still aborts. API outages
+(5xx) abort — they are transient failures, not absences.
+
+CI evidence: the offline CLI tests in `tests/dedup_cli.rs` drive both
+routes through a fixture transport — private-asset resolution via the
+API route (including an api-confirmed absence falling back to source and
+an API outage aborting), and the unchanged public direct-URL path —
+without any network access or credential; the exported `GH_TOKEN`
+contract is pinned by `tests/jumbo_publish_workflow.rs`. The remaining
+live leg — a real re-pull against a real private release asset in an
+Actions run — is exercised by the dedup live-validation task.
 
 ## The index record from this executor
 
