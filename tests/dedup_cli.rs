@@ -1076,6 +1076,29 @@ respond "${FAKE_CURL_STATUS:-404}" ""
         use std::os::unix::fs::PermissionsExt;
         let _ = fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755));
     }
+    // The credential stub: no token unless the test opts in via
+    // FAKE_GH_AUTH — a run under this transport must never see ambient
+    // `gh auth` credentials, so the fetch layer's behavior is
+    // deterministic with and without the private-release fallback.
+    let gh = shim_dir.join("gh");
+    fs::write(
+        &gh,
+        r#"#!/bin/sh
+# jumbo offline test credential stub: deterministic, never ambient.
+if [ -n "$FAKE_GH_AUTH" ]; then
+  echo "jumbo-test-token"
+  exit 0
+fi
+echo "gh: no auth in the offline test transport" >&2
+exit 1
+"#,
+    )
+    .expect("write gh stub");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755));
+    }
     shim_dir
 }
 
@@ -1768,6 +1791,258 @@ fn codeload_server_errors_abort_the_fallback() {
     let stderr = stderr_of(&out);
     assert!(stderr.contains("HTTP 500"), "stderr: {stderr}");
     assert!(stderr.contains("real source"), "stderr: {stderr}");
+    // The stub was not replaced and no marker was written.
+    let overlay = fs::read_to_string(project.join("deps/demo-gamma/pyproject.toml")).expect("stub");
+    assert!(
+        overlay.contains("jumbo-injected internal source"),
+        "{overlay}"
+    );
+    assert!(!project.join("deps/.jumbo-artifacts.json").exists());
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&project);
+}
+
+// ---------------------------------------------------------------------------
+// Private-repository release assets — the diagnosed jumbo-publish defect:
+// a PRIVATE member's recorded github.com release-download URL answers 404
+// even WITH an Authorization header (the public control 302s), so the
+// fetch layer resolves the asset through the authenticated api.github.com
+// asset route. Offline via the same curl shim: the tags lookup and the
+// asset endpoint are fixture-mapped URLs; the credential comes from the
+// shim's `gh` stub (FAKE_GH_AUTH), never from the ambient environment.
+// ---------------------------------------------------------------------------
+
+/// The api.github.com URLs the fetch layer builds from the recorded
+/// demo-gamma release-download URL (owner/repo/tag parsed from it).
+const DEMO_GAMMA_TAGS_URL: &str =
+    "https://api.github.com/repos/acme/demo-gamma/releases/tags/v1.0.0";
+const DEMO_GAMMA_ASSET_API_URL: &str =
+    "https://api.github.com/repos/acme/demo-gamma/releases/assets/424242";
+
+/// The release JSON the api.github.com tags lookup answers for the
+/// private demo-gamma release: the wheel, by exact name, at asset id
+/// 424242.
+fn private_release_json(with_wheel: bool) -> String {
+    let mut assets = vec![serde_json::json!({ "id": 4241, "name": "SHA256SUMS" })];
+    if with_wheel {
+        assets.push(serde_json::json!({
+            "id": 424242,
+            "name": "demo_gamma-1.0.0-py3-none-any.whl"
+        }));
+    }
+    serde_json::json!({ "id": 1001, "tag_name": "v1.0.0", "assets": assets }).to_string()
+}
+
+/// A committed single-dependency consumer (demo-gamma@1 only) plus an
+/// index carrying demo-gamma's record: a github.com release-download URL
+/// (dead — this is a PRIVATE repository's re-pull), the recorded commit,
+/// and the recorded sha256 of the fixture wheel.
+fn private_asset_fixture(tag: &str) -> (PathBuf, PathBuf) {
+    let root = temp_workspace(tag);
+    let index_dir = root.join("index");
+    fs::create_dir_all(&index_dir).expect("index dir");
+    fs::write(
+        index_dir.join("demo-gamma.jsonl"),
+        serde_json::json!({
+            "package": "demo-gamma",
+            "major": 1,
+            "version": "1.0.0",
+            "commit": DEMO_GAMMA_COMMIT,
+            "fingerprint": Some("e".repeat(64)),
+            "canonicalExtract": null,
+            "artifactUrl": DEMO_GAMMA_WHEEL_URL,
+            "artifactSha256": DEMO_GAMMA_WHEEL_SHA,
+            "imageDigest": null,
+            "buildId": "demo-gamma-1.0.0-001",
+            "pipelineRun": Some("circleci/run-52"),
+            "executor": "circleci",
+            "timestamp": "2026-09-20T00:00:00Z",
+        })
+        .to_string()
+            + "\n",
+    )
+    .expect("write record");
+    let project = committed_repo(
+        tag,
+        &[
+            (
+                "pyproject.toml",
+                "[project]\nname = \"consumer\"\ndependencies = [\"demo-gamma@1\"]\n",
+            ),
+            (
+                "uv.lock",
+                "version = 1\n\n[[package]]\nname = \"consumer\"\nversion = \"0.1.0\"\nsource = { editable = \".\" }\n\n[[package]]\nname = \"demo-gamma\"\nversion = \"1.0.0\"\nsource = { directory = \"deps/demo-gamma\" }\n",
+            ),
+        ],
+    );
+    (root, project)
+}
+
+/// A PRIVATE release asset resolves through the api.github.com route: the
+/// recorded URL answers 404 (what GitHub answers for private assets even
+/// with a token), the tags lookup returns the release, the asset is
+/// matched by exact name and downloaded by id — and the bytes are
+/// sha256-verified against the record exactly as a public pull's are.
+#[test]
+fn private_release_assets_resolve_via_the_api_route() {
+    let (root, project) = private_asset_fixture("private-ok");
+    let wheel_body = root.join("gamma.whl");
+    fs::write(&wheel_body, DEMO_GAMMA_WHEEL).expect("wheel bytes");
+    let wheel_body = wheel_body.display().to_string();
+    let release_json = root.join("release.json");
+    fs::write(&release_json, private_release_json(true)).expect("release json");
+    let (release_json, shim) = (release_json.display().to_string(), write_curl_shim(&root));
+
+    let out = run_jumbo_with_transport(
+        &[
+            "dedup",
+            "--manifest",
+            "pyproject.toml",
+            "--index",
+            &root.join("index").display().to_string(),
+            "--deps",
+        ],
+        &project,
+        &shim,
+        &[
+            ("FAKE_GH_AUTH", Some("1")),
+            // The recorded URL 404s — the private-repository answer.
+            ("FAKE_CURL_STATUS_URL", Some(DEMO_GAMMA_WHEEL_URL)),
+            ("FAKE_CURL_STATUS_CODE", Some("404")),
+            // The API route: release lookup 200 + the asset by id 200.
+            ("FAKE_CURL_OK_URL_A", Some(DEMO_GAMMA_TAGS_URL)),
+            ("FAKE_CURL_OK_BODY_A", Some(release_json.as_str())),
+            ("FAKE_CURL_OK_URL_B", Some(DEMO_GAMMA_ASSET_API_URL)),
+            ("FAKE_CURL_OK_BODY_B", Some(wheel_body.as_str())),
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "the private asset must resolve via the api.github.com route, stderr: {}",
+        stderr_of(&out)
+    );
+    let materialized = &stdout_json(&out)["dependencies"]["materialized"];
+    let gamma = materialized
+        .as_array()
+        .expect("materialized")
+        .iter()
+        .find(|m| m["package"] == "demo-gamma")
+        .expect("gamma entry")
+        .clone();
+    // An artifact-mode materialization: the recorded URL stands (the
+    // index record's provenance), the bytes verified against the
+    // recorded digest.
+    assert_eq!(gamma["mode"], "artifact", "{gamma}");
+    assert_eq!(gamma["url"], DEMO_GAMMA_WHEEL_URL, "{gamma}");
+    assert_eq!(gamma["sha256"], DEMO_GAMMA_WHEEL_SHA, "{gamma}");
+    assert_eq!(
+        gamma["path"], "deps/demo-gamma/demo_gamma-1.0.0-py3-none-any.whl",
+        "{gamma}"
+    );
+    assert!(project
+        .join("deps/demo-gamma/demo_gamma-1.0.0-py3-none-any.whl")
+        .is_file());
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&project);
+}
+
+/// When the api.github.com route confirms the asset is gone (404 from the
+/// release lookup), the definitive-absence behavior stands: the
+/// dependency falls back to the real repository source at the recorded
+/// commit, exactly as a token-less 404 always has.
+#[test]
+fn api_confirmed_gone_still_falls_back_to_real_source() {
+    let (root, project) = private_asset_fixture("private-gone");
+    let gamma_tarball = root.join("demo-gamma-tree.tar.gz");
+    write_tarball_fixture(
+        &gamma_tarball,
+        "demo-gamma-f00dcafe",
+        &real_python_project("demo-gamma", "1.0.1"),
+    );
+    let gamma_tarball = gamma_tarball.display().to_string();
+    let shim = write_curl_shim(&root);
+
+    let out = run_jumbo_with_transport(
+        &[
+            "dedup",
+            "--manifest",
+            "pyproject.toml",
+            "--index",
+            &root.join("index").display().to_string(),
+            "--deps",
+        ],
+        &project,
+        &shim,
+        &[
+            ("FAKE_GH_AUTH", Some("1")),
+            ("FAKE_CURL_STATUS_URL", Some(DEMO_GAMMA_WHEEL_URL)),
+            ("FAKE_CURL_STATUS_CODE", Some("404")),
+            // The tags lookup answers 404: release (or visibility) gone.
+            // Every unmapped URL — the tags URL included — 404s.
+            ("FAKE_CURL_STATUS", Some("404")),
+            ("FAKE_CURL_OK_URL_A", Some(DEMO_GAMMA_CODELOAD_URL)),
+            ("FAKE_CURL_OK_BODY_A", Some(gamma_tarball.as_str())),
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "an api-confirmed absence must still fall back to source, stderr: {}",
+        stderr_of(&out)
+    );
+    let materialized = &stdout_json(&out)["dependencies"]["materialized"];
+    let gamma = materialized
+        .as_array()
+        .expect("materialized")
+        .iter()
+        .find(|m| m["package"] == "demo-gamma")
+        .expect("gamma entry")
+        .clone();
+    assert_eq!(gamma["mode"], "source", "{gamma}");
+    assert_eq!(gamma["url"], DEMO_GAMMA_CODELOAD_URL, "{gamma}");
+    let reason = gamma["reason"].as_str().expect("reason");
+    assert!(reason.contains("HTTP 404"), "{reason}");
+    assert!(reason.contains(DEMO_GAMMA_WHEEL_URL), "{reason}");
+    assert!(reason.contains("real repository source"), "{reason}");
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&project);
+}
+
+/// An api.github.com outage (5xx on the release lookup) is a transient
+/// failure, not an absence: the run aborts instead of silently
+/// degrading to the source fallback, and nothing is mutated.
+#[test]
+fn api_outage_on_the_private_route_aborts() {
+    let (root, project) = private_asset_fixture("private-5xx");
+    let shim = write_curl_shim(&root);
+
+    let out = run_jumbo_with_transport(
+        &[
+            "dedup",
+            "--manifest",
+            "pyproject.toml",
+            "--index",
+            &root.join("index").display().to_string(),
+            "--deps",
+        ],
+        &project,
+        &shim,
+        &[
+            ("FAKE_GH_AUTH", Some("1")),
+            // The recorded URL 404s; the tags lookup then answers 500.
+            ("FAKE_CURL_STATUS_URL", Some(DEMO_GAMMA_WHEEL_URL)),
+            ("FAKE_CURL_STATUS_CODE", Some("404")),
+            ("FAKE_CURL_STATUS", Some("500")),
+        ],
+    );
+    assert!(
+        !out.status.success(),
+        "an api outage must abort, not fall back"
+    );
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains("the private-release asset lookup via api.github.com answered HTTP 500"),
+        "stderr: {stderr}"
+    );
     // The stub was not replaced and no marker was written.
     let overlay = fs::read_to_string(project.join("deps/demo-gamma/pyproject.toml")).expect("stub");
     assert!(
