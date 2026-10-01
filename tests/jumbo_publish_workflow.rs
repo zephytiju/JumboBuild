@@ -1,21 +1,44 @@
 //! Offline contract checks over the reusable `jumbo-publish` workflow —
 //! no network, no credentials, no Actions run required.
 //!
-//! The first check pins the dedup re-pull contract this executor carries:
-//! the "Pull the recorded artifact" step (the fingerprint-hit re-pull)
-//! must export the caller's own `GH_TOKEN`, because on a PRIVATE
-//! repository the recorded `github.com/<o>/<r>/releases/download/...` URL
-//! answers 404 even with an Authorization header — private release assets
-//! are served only through the authenticated api.github.com asset route,
-//! which jumbo's fetch layer (`src/dedup/fetch.rs`) walks when the direct
-//! URL 404s and a token is present. Without the export, every re-pull on
-//! a private member repository fails exactly the way the promotion
-//! validation observed (HTTP 404 on the recorded URL; the public control
-//! 302s fine). The token enters only through the environment: never a
+//! Three pinned contracts live here:
+//!
+//! 1. **The dedup re-pull credential.** The "Pull the recorded artifact"
+//!    step (the fingerprint-hit re-pull) must export the caller's own
+//!    `GH_TOKEN`, because on a PRIVATE repository the recorded
+//!    `github.com/<o>/<r>/releases/download/...` URL answers 404 even
+//!    with an Authorization header — private release assets are served
+//!    only through the authenticated api.github.com asset route, which
+//!    jumbo's fetch layer (`src/dedup/fetch.rs`) walks when the direct
+//!    URL 404s and a token is present.
+//!
+//! 2. **The dependency-materialization credential.** The "Materialize the
+//!    recorded dependency artifacts" step must export a `GH_TOKEN` that
+//!    can read PRIVATE member repositories (the org CI app's org-wide
+//!    read-only installation token, minted by its own step, preferred) —
+//!    without it the dependency fetches run anonymous and both the
+//!    recorded asset URLs and the codeload source-fallback URLs answer
+//!    404 for private repositories even though the run holds valid
+//!    credentials (evidence: PrismPipelineFluxboardMicroUI run
+//!    36819957831 — anonymous codeload 404 for private
+//!    zephytiju/PrismReact).
+//!
+//! 3. **The npm build-before-pack contract.** The npm branch of the
+//!    "Build the artifacts" step must run the package's standard build
+//!    (lock refresh → clean install → build script, the node.rs
+//!    pipeline) BEFORE `npm pack`, so the packed tarball carries the
+//!    built dist — packing the bare tree released source-only stubs
+//!    (proof: @zephytiju/software-development-cicd-interfaces@1.0.0 =
+//!    package.json + README only).
+//!
+//! In every case the token enters only through the environment: never a
 //! literal, never a log line, never a command line.
 
-/// The step whose environment the re-pull contract lives in.
+/// The steps whose environments carry pinned credentials.
 const REPULL_STEP: &str = "Pull the recorded artifact (fingerprint hit - build skipped)";
+const MATERIALIZE_STEP: &str = "Materialize the recorded dependency artifacts (build path)";
+const DEPS_TOKEN_MINT_STEP: &str = "Mint the org-wide dependency read token";
+const BUILD_STEP: &str = "Build the artifacts at the jumbo-computed version";
 
 /// Extract one step's YAML block from the workflow text: from its
 /// `- name:` line to the next sibling step (`- name:` at the same
@@ -47,6 +70,18 @@ fn step_block(workflow: &str, step_name: &str) -> Option<String> {
     Some(block.join("\n"))
 }
 
+/// No credential literal may appear anywhere in the workflow file.
+#[test]
+fn no_credential_literal_appears_in_the_workflow() {
+    let workflow = include_str!("../.github/workflows/jumbo-publish.yml");
+    for literal in ["ghp_", "github_pat_", "ghs_", "gho_"] {
+        assert!(
+            !workflow.to_lowercase().contains(literal),
+            "credential literal `{literal}` must never appear in jumbo-publish.yml"
+        );
+    }
+}
+
 #[test]
 fn the_repull_step_exports_the_caller_github_token() {
     let workflow = include_str!("../.github/workflows/jumbo-publish.yml");
@@ -62,20 +97,118 @@ fn the_repull_step_exports_the_caller_github_token() {
          (private release assets resolve only via the authenticated api.github.com \
          asset route):\n{block}"
     );
-    // The export is context-expression only: no credential literal may
-    // ever appear in the step.
+}
+
+#[test]
+fn the_materialize_step_exports_the_dependency_read_token() {
+    let workflow = include_str!("../.github/workflows/jumbo-publish.yml");
+    let block = step_block(workflow, MATERIALIZE_STEP)
+        .unwrap_or_else(|| panic!("step `{MATERIALIZE_STEP}` not found in jumbo-publish.yml"));
+    // The credential chain: the org CI app's org-wide read token (the
+    // mint step below), then the static artifact token, then the caller's
+    // own GITHUB_TOKEN (public dependencies only). An anonymous
+    // dependency fetch is the diagnosed defect — the chain must exist.
     assert!(
-        !block.to_lowercase().contains("ghp_") && !block.to_lowercase().contains("github_pat_"),
-        "no credential literal may appear in the re-pull step"
+        block.contains("env:"),
+        "the materialize step must carry an env block:\n{block}"
+    );
+    assert!(
+        block.contains(
+            "GH_TOKEN: ${{ steps.deps-token.outputs.token || secrets.JUNTAI_GITHUB_ARTIFACT_TOKEN || github.token }}"
+        ),
+        "the materialize step must export GH_TOKEN from the org-wide dependency \
+         read token, falling back to the static artifact token and then the \
+         caller's github.token:\n{block}"
+    );
+}
+
+#[test]
+fn the_dependency_read_token_is_org_wide_and_read_only() {
+    let workflow = include_str!("../.github/workflows/jumbo-publish.yml");
+    let block = step_block(workflow, DEPS_TOKEN_MINT_STEP)
+        .unwrap_or_else(|| panic!("step `{DEPS_TOKEN_MINT_STEP}` not found in jumbo-publish.yml"));
+    // App path only, same pinned action as the index/artifact mint.
+    assert!(
+        block.contains("if: steps.auth.outputs.mode == 'app'"),
+        "the dependency token mint follows the resolved auth mode:\n{block}"
+    );
+    assert!(
+        block.contains("actions/create-github-app-token@"),
+        "the dependency token is a minted installation token:\n{block}"
+    );
+    // Read only — dependency fetches never need write.
+    assert!(
+        block.contains("permission-contents: read"),
+        "the dependency token is downgraded to contents: read:\n{block}"
+    );
+    // And deliberately NOT repository-scoped: dependency materialization
+    // reads arbitrary private member repositories of the organization,
+    // which cannot be pre-listed. A `repositories:` line here would
+    // reintroduce the anonymous-404 defect for every unlisted member.
+    assert!(
+        !block.contains("repositories:"),
+        "the dependency token mint must stay org-wide (no repositories scoping):\n{block}"
+    );
+}
+
+#[test]
+fn the_npm_build_path_builds_before_packing() {
+    let workflow = include_str!("../.github/workflows/jumbo-publish.yml");
+    let block = step_block(workflow, BUILD_STEP)
+        .unwrap_or_else(|| panic!("step `{BUILD_STEP}` not found in jumbo-publish.yml"));
+    // The standard build (the node.rs pipeline) must run inside the npm
+    // branch, before the pack, in pipeline order.
+    let lock_refresh = block
+        .find("npm install --package-lock-only --ignore-scripts")
+        .unwrap_or_else(|| panic!("the npm branch must refresh the lock:\n{block}"));
+    let install = block
+        .find("npm ci")
+        .unwrap_or_else(|| panic!("the npm branch must clean-install:\n{block}"));
+    let build = block
+        .find("npm run build")
+        .unwrap_or_else(|| panic!("the npm branch must run the build script:\n{block}"));
+    let pack = block
+        .find("npm pack")
+        .unwrap_or_else(|| panic!("the npm branch must pack:\n{block}"));
+    assert!(
+        lock_refresh < install && install < build && build < pack,
+        "the standard build must complete before npm pack (lock refresh → clean \
+         install → build script → pack);\n{block}"
+    );
+    // The build must be conditional on a configured build script (the
+    // node.rs rule), not unconditional.
+    assert!(
+        block.contains("jq -e '.scripts.build' package.json"),
+        "the build script runs only when one is configured:\n{block}"
+    );
+    // The pack lands in a staging directory outside the build output and
+    // the tarball is moved into a RESET dist/ — the package's own build
+    // usually writes dist/, so packing into it directly would mix build
+    // outputs into the release assets (the built bytes travel inside the
+    // tarball already).
+    assert!(
+        block.contains("npm pack --pack-destination \"$pack_dir\"")
+            && block.contains("rm -rf dist")
+            && block.contains("mv \"$pack_dir\"/*.tgz dist/"),
+        "npm packs into a staging directory and dist/ is reset to exactly the \
+         artifact:\n{block}"
+    );
+    // The npm build path also needs Node set up before the step runs.
+    let setup = step_block(workflow, "Set up node (npm build path)")
+        .unwrap_or_else(|| panic!("the npm build path needs a node setup step"));
+    assert!(
+        setup.contains("steps.identity.outputs.ecosystem == 'npm'")
+            && setup.contains("steps.promote.outputs.publish_required == 'true'"),
+        "the node setup step is gated to the npm build path:\n{setup}"
     );
 }
 
 #[test]
 fn no_other_step_gains_a_credential_through_this_contract() {
-    // The re-pull token export is scoped to exactly one step. Every other
-    // `env:` block in the workflow must not export GH_TOKEN (the other
-    // steps authenticate through their own named secrets, checked by
-    // review and by the workflows' own CI).
+    // The token exports are scoped to exactly the steps that need them.
+    // Every other `env:` block in the workflow must not export GH_TOKEN
+    // (the other steps authenticate through their own named secrets,
+    // checked by review and by the workflows' own CI).
     let workflow = include_str!("../.github/workflows/jumbo-publish.yml");
     let mut current: Option<&str> = None;
     for line in workflow.lines() {
@@ -88,11 +221,12 @@ fn no_other_step_gains_a_credential_through_this_contract() {
             let allowed = [
                 "Fetch the Jumbo index", // minted installation token / static artifact token
                 "Publish the GitHub Release on the caller repository", // github.token for gh release create
+                MATERIALIZE_STEP, // org-wide dependency read token / static artifact token / github.token
             ];
             assert!(
                 allowed.contains(&owner),
-                "unexpected GH_TOKEN export in step `{owner}` — scope the re-pull \
-                 credential to the re-pull step only"
+                "unexpected GH_TOKEN export in step `{owner}` — scope credential exports to \
+                 the steps whose contracts name them"
             );
         }
     }

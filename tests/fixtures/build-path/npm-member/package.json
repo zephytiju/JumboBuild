@@ -1,0 +1,11 @@
+{
+  "name": "demo-npm-member",
+  "version": "1.0.0",
+  "description": "Fixture npm member for the jumbo-publish build-before-pack check",
+  "license": "MIT",
+  "files": ["dist"],
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "node build.mjs"
+  }
+}
