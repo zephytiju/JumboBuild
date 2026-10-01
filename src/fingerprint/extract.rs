@@ -16,16 +16,18 @@
 //! - Python names PEP 503-normalized; npm names kept verbatim;
 //! - injected internal sources carry the stable relative coordinate
 //!   `deps/<slug>` regardless of how the tool wrote the path;
-//! - digests are the lock's own integrity strings, never lock formatting:
-//!   uv `sha256:…` hashes normalized to the bare lowercase hex the
-//!   JumboIndex record schema requires (sdist hash preferred, else the
-//!   smallest of the sorted unique wheel hashes), npm `sha512-…`
-//!   integrity verbatim.
+//! - digests are normalized to bare lowercase hex, never lock formatting:
+//!   uv `sha256:…` hash prefixes are stripped (sdist hash preferred, else
+//!   the smallest of the sorted unique wheel hashes) and npm SRI integrity
+//!   (`sha512-<base64>`) is base64-decoded — sha512 → 128 hex chars,
+//!   sha256 → 64 — so both ecosystems carry the same tool-independent,
+//!   schema-valid hex digest form the JumboIndex record schema requires.
 //!
 //! A formatting-only lock change produces the same extract and therefore
 //! no fingerprint change; any real resolution change produces a different
 //! extract and therefore a rebuild.
 
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as Json;
 use sha2::{Digest, Sha256};
@@ -280,10 +282,10 @@ pub fn extract_uv_lock(content: &str) -> Result<CanonicalExtract, FingerprintErr
 /// hashes. Both are fixed per released version, so the choice is stable
 /// across uv formatting versions. Algorithm prefixes (`sha256:`) are
 /// stripped and the hex lowercased: the JumboIndex record schema's
-/// `digest` pattern accepts only the bare hex digest (or an npm-style
-/// integrity string), and the index record must store exactly the
-/// extract the fingerprint hashed — so the normalized form is what both
-/// the fingerprint and the record use.
+/// `digest` pattern accepts only bare lowercase hex (64 or 128 chars —
+/// npm SRI integrity is decoded to the same form), and the index record
+/// must store exactly the extract the fingerprint hashed — so the
+/// normalized form is what both the fingerprint and the record use.
 fn uv_digest(package: &toml::Value) -> Option<String> {
     let bare = |hash: &str| {
         hash.trim()
@@ -496,6 +498,46 @@ fn npm_name_from_modules_key(key: &str) -> String {
     }
 }
 
+/// Decode an npm SRI integrity string to its bare lowercase hex digest.
+///
+/// npm locks carry Subresource Integrity — `sha512-<base64>` per entry,
+/// occasionally several algorithms space-separated. The canonical extract
+/// is tool-independent (Jumbo Build & Versioning Standard, §2.3), so the
+/// entry stores the decoded digest, not npm's serialization of it:
+/// `sha512-…` → 128 hex chars, `sha256-…` → 64 hex chars — exactly the
+/// hex-only `digest` pattern the JumboIndex record schema accepts. When
+/// several algorithms are present the longest decodable digest wins
+/// (sha512 over sha256), which is deterministic.
+///
+/// Returns `None` for integrity strings no supported algorithm decodes
+/// from (e.g. a `sha1-…`-only entry): the caller then keeps the string
+/// verbatim so the record schema rejects the append loudly instead of a
+/// build silently recording an unverifiable digest.
+fn decode_sri_integrity(integrity: &str) -> Option<String> {
+    let mut best: Option<String> = None;
+    for token in integrity.split_whitespace() {
+        let Some((algorithm, encoded)) = token.split_once('-') else {
+            continue;
+        };
+        let width = match algorithm {
+            "sha512" => 64usize,
+            "sha256" => 32,
+            _ => continue,
+        };
+        let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(encoded) else {
+            continue;
+        };
+        if bytes.len() != width {
+            continue;
+        }
+        let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        if best.as_ref().is_none_or(|b| b.len() < hex.len()) {
+            best = Some(hex);
+        }
+    }
+    best
+}
+
 /// Classify a `resolved` (+ `integrity`) pair of an npm entry.
 fn classify_npm_resolved(
     resolved: Option<&Json>,
@@ -503,7 +545,9 @@ fn classify_npm_resolved(
     name: &str,
     origin: &str,
 ) -> Result<(EntrySource, Option<String>, Option<String>), FingerprintError> {
-    let digest = integrity.and_then(|i| i.as_str()).map(str::to_string);
+    let digest = integrity
+        .and_then(|i| i.as_str())
+        .map(|i| decode_sri_integrity(i).unwrap_or_else(|| i.to_string()));
     let Some(resolved) = resolved.and_then(|r| r.as_str()) else {
         // Bundled dependencies have no resolved URL; they are registry
         // artifacts of their parent, already covered by its integrity.
@@ -766,6 +810,11 @@ source = { path = "/Users/someone/deps/local-pinned" }
   }
 }"#;
 
+    /// The bare lowercase hex of NPM_LOCK_V3's lodash SRI integrity
+    /// (`sha512-v2yUIIQQAL05…==`, base64-decoded): what the canonical
+    /// extract and every schema-valid record carry.
+    const LODASH_SHA512_HEX: &str = "bf6c9420841000bd39fb4d77af726ed5c1e922407c29fdc6c0f426642b9465915e12142a5dc1c0e62be86794b6b2b0488cf94569a179d342e0944b991c0918b8";
+
     #[test]
     fn npm_lock_extracts_link_target_registry_and_root_excluded() {
         let extract = extract_npm_lock(NPM_LOCK_V3).expect("extract");
@@ -783,7 +832,7 @@ source = { path = "/Users/someone/deps/local-pinned" }
                     "lodash",
                     "4.17.21",
                     EntrySource::Npm,
-                    Some("sha512-v2yUIIQQAL05+013r3Ju1cHpIkB8Kf3GwPQmZCuUZZFeEhQqXcHA5ivoZ5S2srBIjPlFaaF500LglEuZHAkYuA=="),
+                    Some(LODASH_SHA512_HEX),
                     None
                 ),
             ]
@@ -815,9 +864,134 @@ source = { path = "/Users/someone/deps/local-pinned" }
         assert_eq!(
             extract.entries,
             vec![
-                entry("@juntai/demo-kit", "1.2.0", EntrySource::Index, None, Some("deps/juntai-demo-kit")),
-                entry("lodash", "4.17.21", EntrySource::Npm, Some("sha512-v2yUIIQQAL05+013r3Ju1cHpIkB8Kf3GwPQmZCuUZZFeEhQqXcHA5ivoZ5S2srBIjPlFaaF500LglEuZHAkYuA=="), None),
+                entry(
+                    "@juntai/demo-kit",
+                    "1.2.0",
+                    EntrySource::Index,
+                    None,
+                    Some("deps/juntai-demo-kit")
+                ),
+                entry(
+                    "lodash",
+                    "4.17.21",
+                    EntrySource::Npm,
+                    Some(LODASH_SHA512_HEX),
+                    None
+                ),
             ]
+        );
+    }
+
+    /// A fixture lock whose registry entries carry real npm SRI
+    /// integrity: the canonical extract must carry the decoded hex
+    /// digest — 128 lowercase hex chars for sha512 — never the SRI
+    /// string itself, so an index append validates against the record
+    /// schema's hex-only `digest` pattern.
+    const NPM_SRI_FIXTURE_LOCK: &str = r#"{
+  "name": "consumer",
+  "version": "1.0.0",
+  "lockfileVersion": 3,
+  "requires": true,
+  "packages": {
+    "": { "name": "consumer", "version": "1.0.0", "dependencies": { "@juntai/demo-kit": "^1", "lodash": "^4.17.21", "typescript": "^5.6.3" } },
+    "node_modules/@juntai/demo-kit": { "resolved": "deps/juntai-demo-kit", "link": true },
+    "deps/juntai-demo-kit": { "name": "@juntai/demo-kit", "version": "1.2.0", "extraneous": false },
+    "node_modules/lodash": {
+      "version": "4.17.21",
+      "resolved": "https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz",
+      "integrity": "sha512-v2yUIIQQAL05+013r3Ju1cHpIkB8Kf3GwPQmZCuUZZFeEhQqXcHA5ivoZ5S2srBIjPlFaaF500LglEuZHAkYuA=="
+    },
+    "node_modules/typescript": {
+      "version": "5.6.3",
+      "resolved": "https://registry.npmjs.org/typescript/-/typescript-5.6.3.tgz",
+      "integrity": "sha512-hHfn7sP4tHP13kOSbp2AKePMWkdI6fJS8FfFbPclso7DIbpuXLQvC85c1suLSjdiRjA3Trx0cWZiybtuuGIOYQ=="
+    }
+  }
+}"#;
+
+    #[test]
+    fn npm_lock_sri_integrity_decodes_to_bare_hex_digest() {
+        let extract = extract_npm_lock(NPM_SRI_FIXTURE_LOCK).expect("extract");
+        let digest = extract
+            .entries
+            .iter()
+            .find(|e| e.name == "lodash")
+            .expect("lodash entry")
+            .digest
+            .as_deref()
+            .expect("lodash digest");
+        // sha512 SRI decodes to exactly 128 lowercase hex characters —
+        // no `sha512-` prefix, no base64 alphabet, no padding.
+        assert_eq!(digest.len(), 128);
+        assert!(
+            digest
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+            "digest must be bare lowercase hex: {digest}"
+        );
+        assert_eq!(digest, LODASH_SHA512_HEX);
+
+        let typescript = extract
+            .entries
+            .iter()
+            .find(|e| e.name == "typescript")
+            .expect("typescript entry")
+            .digest
+            .as_deref()
+            .expect("typescript digest");
+        assert_eq!(typescript.len(), 128);
+        assert!(
+            typescript
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+            "digest must be bare lowercase hex: {typescript}"
+        );
+
+        // No entry anywhere still carries the SRI/base64 serialization.
+        for e in &extract.entries {
+            if let Some(d) = e.digest.as_deref() {
+                assert!(!d.starts_with("sha512-"), "SRI leaked into extract: {d}");
+            }
+        }
+    }
+
+    #[test]
+    fn npm_sri_decode_covers_sha256_multi_algorithm_and_undecodable() {
+        // sha256 SRI → 64-hex (the other schema-valid digest width).
+        let sha256 = decode_sri_integrity("sha256-H0DRmGdXq2e5dA7Bv9C1zGH+fl0XhEQkzYQj5c5G9Zk=")
+            .expect("sha256 decodes");
+        assert_eq!(sha256.len(), 64);
+        assert!(sha256
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
+
+        // Several algorithms listed: the strongest decodable one wins.
+        let both = decode_sri_integrity(
+            "sha1-qU3y2tWLeGYpHXcRQQPQuwVy5Ck= sha512-v2yUIIQQAL05+013r3Ju1cHpIkB8Kf3GwPQmZCuUZZFeEhQqXcHA5ivoZ5S2srBIjPlFaaF500LglEuZHAkYuA==",
+        );
+        assert_eq!(both.as_deref(), Some(LODASH_SHA512_HEX));
+
+        // A width mismatch (sha512 label, sha256 body) never decodes.
+        assert_eq!(
+            decode_sri_integrity("sha512-H0DRmGdXq2e5dA7Bv9C1zGH+fl0XhEQkzYQj5c5G9Zk="),
+            None
+        );
+        // Undecodable integrity stays verbatim in the extract (for the
+        // schema to reject loudly) rather than being dropped or mangled.
+        let only_sha1 = r#"{
+  "lockfileVersion": 3,
+  "packages": {
+    "node_modules/ancient": {
+      "version": "0.0.1",
+      "resolved": "https://registry.npmjs.org/ancient/-/ancient-0.0.1.tgz",
+      "integrity": "sha1-qU3y2tWLeGYpHXcRQQPQuwVy5Ck="
+    }
+  }
+}"#;
+        let extract = extract_npm_lock(only_sha1).expect("extract");
+        assert_eq!(
+            extract.entries[0].digest.as_deref(),
+            Some("sha1-qU3y2tWLeGYpHXcRQQPQuwVy5Ck=")
         );
     }
 
