@@ -38,7 +38,13 @@
 //! at the recorded commit** — never the minimal lock stub, which exists for
 //! resolution only and is not buildable — from GitHub's tarball host
 //! (`https://codeload.github.com/<owner>/<repo>/tar.gz/<commit>`, through
-//! the same validated https layer). The tree unpacks into `deps/<slug>/`
+//! the same validated https layer, authenticated with the run's available
+//! credentials exactly like every other fetch: a PRIVATE repository
+//! answers 404 to an anonymous codeload request, so the executor must pass
+//! a token that can read member repositories — the org CI app installation
+//! token — through `GITHUB_TOKEN`/`GH_TOKEN`; see
+//! [`super::fetch::source_tarball_gone_reason`] for the split-by-credential
+//! failure guidance). The tree unpacks into `deps/<slug>/`
 //! (leading directory stripped), replacing any standing minimal stub so
 //! exactly one materialization exists, and the downstream uv/npm build
 //! consumes it as the ordinary workspace member / `file:` source. The
@@ -883,10 +889,12 @@ fn fetch_source_tree(
     provider
         .stage(&url, staging_dir)
         .map_err(|e| match e {
-            MaterializeError::ArtifactGone { status, .. } => failure(format!(
-                "HTTP {status}: no repository tarball exists at this URL (the repository was \
-                 deleted or made private, or the commit is gone)"
-            )),
+            MaterializeError::ArtifactGone { status, .. } => {
+                failure(super::fetch::source_tarball_gone_reason(
+                    status,
+                    super::fetch::github_token_present(),
+                ))
+            }
             MaterializeError::ArtifactDownload { reason, .. } => failure(reason),
             other => other,
         })

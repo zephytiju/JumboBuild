@@ -155,16 +155,29 @@ The workflow resolves index/artifact authentication at run time, in this
 order:
 
 1. **Preferred — the org CI GitHub App pair.** When `JUNTAI_CI_APP_ID` and
-   `JUNTAI_CI_APP_PRIVATE_KEY` are both present, the workflow mints a
-   short-lived **installation token** at run time
-   (`actions/create-github-app-token`, pinned to a full commit SHA). The
-   token is downgraded to exactly `contents: read+write`, scoped to the two
-   repositories the executor touches (`zephytiju/JumboBuild` and the index
-   repository), and revoked when the job ends. It authenticates the
-   JumboBuild checkout, the JumboIndex fetch, **and** the index append. No
-   long-lived credential is stored anywhere; the private key flows only from
-   its secret into the minting action — never echoed, logged, or written to
-   a file.
+   `JUNTAI_CI_APP_PRIVATE_KEY` are both present, the workflow mints two
+   short-lived **installation tokens** at run time
+   (`actions/create-github-app-token`, pinned to a full commit SHA; both
+   revoked when the job ends):
+   - an **index/artifact token** downgraded to exactly `contents: read+write`,
+     scoped to the two repositories the executor itself touches
+     (`zephytiju/JumboBuild` and the index repository) — it authenticates the
+     JumboBuild checkout, the JumboIndex fetch, **and** the index append;
+   - an **org-wide dependency read token** downgraded to `contents: read`
+     with **no repository scoping** — dependency materialization fetches
+     recorded release assets and source-fallback trees from *private member
+     repositories*, arbitrary organization repositories that cannot be
+     pre-listed before `jumbo lock` resolves the manifest. The org CI app is
+     installed on every organization repository, so the org-wide mint covers
+     exactly what a dependency fetch may need. Without it the fetches run
+     **anonymous**, and both the recorded
+     `github.com/.../releases/download/...` URLs and the
+     `codeload.github.com` source-fallback URLs answer 404 for private
+     repositories even though the run holds valid credentials (see
+     [Dependency materialization on private repositories](#dependency-materialization-on-private-repositories)).
+   No long-lived credential is stored anywhere; the private key flows only
+   from its secret into the minting action — never echoed, logged, or
+   written to a file.
 2. **Backward-compatible fallback — the static token secrets.** When the App
    pair is absent, the workflow falls back to the two static secrets below,
    exactly as it did before the App path existed. If only one half of the
@@ -177,8 +190,8 @@ order:
 
 | Secret | Required | Used for |
 | --- | --- | --- |
-| `JUNTAI_CI_APP_ID` + `JUNTAI_CI_APP_PRIVATE_KEY` | preferred (one of the two auth paths must exist) | The org CI GitHub App pair. Mints a short-lived installation token (`contents: read+write`, scoped to `zephytiju/JumboBuild` + the index repository, revoked at job end) used for the JumboBuild checkout, the index fetch, and the index append. The private key is consumed only as the minting action's `private-key` input. |
-| `JUNTAI_GITHUB_ARTIFACT_TOKEN` | static fallback | When the App pair is absent: a token that can **read** the private `zephytiju/JumboBuild` (the workflow/JumboBuild checkout) and **clone** the private `zephytiju/JumboIndex`. |
+| `JUNTAI_CI_APP_ID` + `JUNTAI_CI_APP_PRIVATE_KEY` | preferred (one of the two auth paths must exist) | The org CI GitHub App pair (installed on **all** organization repositories). Mints two short-lived installation tokens, both revoked at job end: an index/artifact token (`contents: read+write`, scoped to `zephytiju/JumboBuild` + the index repository) for the JumboBuild checkout, the index fetch, and the index append; and an org-wide dependency read token (`contents: read`, no repository scoping) for dependency materialization on private member repositories. The private key is consumed only as the minting action's `private-key` input. |
+| `JUNTAI_GITHUB_ARTIFACT_TOKEN` | static fallback | When the App pair is absent: a token that can **read** the private `zephytiju/JumboBuild` (the workflow/JumboBuild checkout) and **clone** the private `zephytiju/JumboIndex`; it is also the dependency-fetch fallback credential (it must then be able to read the private member repositories being depended on). |
 | `JUNTAI_INDEX_TOKEN` | static fallback (on publish) | When the App pair is absent: a token with `contents: write` on `zephytiju/JumboIndex` — pushes the index append. Passed to `scripts/jumbo_index_append.py` through the `JUMBO_INDEX_TOKEN` environment variable only. |
 | `PYPI_TOKEN` | only with `publish-to-public-registry: true` and a Python package | Trusted publishing token for `uv publish`. Consumed via the `UV_PUBLISH_TOKEN` env var. |
 | `NPM_TOKEN` | only with `publish-to-public-registry: true` and an npm package | Automation token for `npm publish`. Consumed via the `NODE_AUTH_TOKEN` env var. |
@@ -209,8 +222,8 @@ order:
 
 | Step | Command / action | Notes |
 | --- | --- | --- |
-| Resolve index/artifact auth | presence checks on the secrets | App pair present → mint an installation token; else the static `JUNTAI_GITHUB_ARTIFACT_TOKEN` / `JUNTAI_INDEX_TOKEN` fallback; neither → actionable `::error` before any build work. |
-| Mint installation token | `actions/create-github-app-token@<full SHA>` | App path only: short-lived token downgraded to `contents: read+write`, scoped to `zephytiju/JumboBuild` + the index repository, revoked when the job ends; the private key flows only from its secret into the action input. |
+| Resolve index/artifact auth | presence checks on the secrets | App pair present → mint the installation tokens; else the static `JUNTAI_GITHUB_ARTIFACT_TOKEN` / `JUNTAI_INDEX_TOKEN` fallback; neither → actionable `::error` before any build work. |
+| Mint installation tokens | `actions/create-github-app-token@<full SHA>` ×2 | App path only: the index/artifact token (`contents: read+write`, scoped to `zephytiju/JumboBuild` + the index repository) and the org-wide dependency read token (`contents: read`, no repository scoping) — both short-lived and revoked when the job ends; the private key flows only from its secret into the action input. |
 | Checkout caller repo | `actions/checkout@v6` at the release commit | Clean, attributable tree — `jumbo promote` refuses a dirty tree. |
 | Build jumbo | `actions/checkout@v6` + `cargo build --release --locked` | From the JumboBuild ref pinned by `jumbobuild-ref` (direct runs on JumboBuild fall back to the ref the workflow was dispatched at — never from `GITHUB_WORKFLOW_REF`, which names the caller's workflow under `workflow_call`); cargo build cached with `Swatinem/rust-cache@v2`. |
 | Fetch the index | `gh repo clone zephytiju/JumboIndex` | Authenticated with the minted installation token or the static artifact token. `JUMBO_INDEX_PATH` points every later jumbo command at this clone. |
@@ -218,8 +231,8 @@ order:
 | Fingerprint | `jumbo fingerprint` | `sha256(own commit + canonical extract)`; informational evidence for the run log. |
 | Dedup | `jumbo dedup` | **Fingerprint hit ⇒ `jumbo dedup --materialize` pulls the recorded artifact (exact URL, SHA-256 verified) into `dist/` and the run ends — no build, no publish, no append.** Same skip-build rule as CircleCI. The step exports the caller's own `GH_TOKEN`, so a private repository's re-pull resolves through the authenticated api.github.com asset route (see [The dedup re-pull on private repositories](#the-dedup-re-pull-on-private-repositories)). |
 | Promote | `jumbo promote` | Decision JSON; `publishRequired` is true exactly when a new version was computed. |
-| Materialize dependencies (build path) | `jumbo dedup --materialize --deps --manifest <manifest>` via [`scripts/jumbo_publish_materialize_deps.sh`](../scripts/jumbo_publish_materialize_deps.sh) | Only when publishing: replaces each internal dependency's resolution-only stub under `deps/<slug>/` with its recorded release artifact (exact URL, SHA-256 verified — or the real repository source at the recorded commit when the artifact cannot be used) and repoints the manifest at it, **before any build tool runs**. The stubs `jumbo lock` writes are enough to resolve and fingerprint but are not buildable — a build backend invoked on one aborts (hatchling: "Unable to determine which files to ship"). With the wheels landed at `deps/<slug>/*.whl` the build consumes real artifacts on any uv/npm version. A pre-build guard in the script hard-fails if any materialized entry is missing on disk, so stubs can never reach a build silently. |
-| Build on bump | `uv build` / `npm pack` | The manifest keeps declaring only the major; the build's version is set from the decision's `publish.version` before building; the dependency artifacts are already materialized under `deps/`. |
+| Materialize dependencies (build path) | `jumbo dedup --materialize --deps --manifest <manifest>` via [`scripts/jumbo_publish_materialize_deps.sh`](../scripts/jumbo_publish_materialize_deps.sh) | Only when publishing: replaces each internal dependency's resolution-only stub under `deps/<slug>/` with its recorded release artifact (exact URL, SHA-256 verified — or the real repository source at the recorded commit when the artifact cannot be used) and repoints the manifest at it, **before any build tool runs**, with `GH_TOKEN` exported so every fetch is authenticated (see [Dependency materialization on private repositories](#dependency-materialization-on-private-repositories)). The stubs `jumbo lock` writes are enough to resolve and fingerprint but are not buildable — a build backend invoked on one aborts (hatchling: "Unable to determine which files to ship"). With the wheels landed at `deps/<slug>/*.whl` the build consumes real artifacts on any uv/npm version. A pre-build guard in the script hard-fails if any materialized entry is missing on disk, so stubs can never reach a build silently. |
+| Build on bump | `uv build` / `npm pack` after the standard build | The manifest keeps declaring only the major; the build's version is set from the decision's `publish.version` before building; the dependency artifacts are already materialized under `deps/`. npm runs the package's **standard build** before packing (lock refresh against the materialized manifest → `npm ci` → `npm run build` when a build script is configured — the `node.rs` pipeline), then packs into a staging directory and resets `dist/` to exactly the tarball; packing the bare tree would ship a source-only stub (`package.json` + README), which is the defect this order prevents. |
 | Checksums + Release | `sha256sum` → `gh release create v<version>` on the **caller** repository | Assets + `SHA256SUMS`; notes carry the version, bump, commit, fingerprint, executor, and run URL. |
 | Service image (opt-in) | `docker/build-push-action@v6` → `scripts/verify_image_digest.sh` | Only with `publish-image: true`: build the `Dockerfile` at the repository root from the same release commit, push to `ghcr.io/<owner>/<repo>:v<version>`, then verify the pushed digest against the registry **before** anything is recorded — a digest mismatch aborts the build with no index append (standard §3.7). |
 | Index append | `scripts/jumbo_index_append.py --push` | JumboIndex append protocol: canonical one-line record, serialized fast-forward push, fetch-and-retry on non-FF (bounded backoff), validator-gated, no history rewrites ever. Authenticated with the minted installation token or the static `JUNTAI_INDEX_TOKEN`. `executor` is `jumbo-publish-github-actions`. |
@@ -237,7 +250,12 @@ build step with the manifest repointed at it (SHA-256 verified against the
 fixture record), builds successfully on a uv matrix (0.7 / 0.8 / latest —
 the lines where the executor's `uv version <version>` build step exists),
 then installs the built wheel with the materialized dependency wheel in a
-fresh venv and imports it. Dispatching that workflow is the standing
+fresh venv and imports it. A third job pins the npm build order: packing
+the bare fixture member must ship the source-only stub (the reported
+defect — `@zephytiju/software-development-cicd-interfaces@1.0.0` was
+`package.json` + README only), while the executor's verbatim npm branch
+(lock refresh → `npm ci` → build script → staged pack) must ship the
+built `dist/`. Dispatching that workflow is the standing
 dry-run demonstration of the build path: no release, no registry, no index
 append, and the fixture index clone is never pushed.
 
@@ -282,6 +300,38 @@ without any network access or credential; the exported `GH_TOKEN`
 contract is pinned by `tests/jumbo_publish_workflow.rs`. The remaining
 live leg — a real re-pull against a real private release asset in an
 Actions run — is exercised by the dedup live-validation task.
+
+### Dependency materialization on private repositories
+
+The build path's dependency materialization fetches **other
+repositories'** artifacts and sources — the recorded release assets of
+every internal dependency and, on the source fallback, the
+`codeload.github.com` tarball of the dependency's repository at the
+recorded commit. Both answer **404 to an anonymous request when the
+repository is private**, so the "Materialize the recorded dependency
+artifacts" step exports `GH_TOKEN` with a credential that can read
+private member repositories:
+
+1. **Preferred** — the org CI app's **org-wide dependency read token**
+   (`contents: read`, minted with no repository scoping because the
+   dependency repositories are arbitrary organization repositories that
+   cannot be pre-listed before resolution);
+2. the static `JUNTAI_GITHUB_ARTIFACT_TOKEN` (which must then be able to
+   read the member repositories being depended on);
+3. last, the caller's own `GITHUB_TOKEN` — enough for public
+   dependencies only.
+
+Without the export the run fails exactly the way
+`PrismPipelineFluxboardMicroUI` run `36819957831` did: the recorded
+private asset URL 404'd anonymously, the ingestion fell back to the
+source, and the anonymous codeload fetch 404'd for the private
+`zephytiju/PrismReact` even though the run held the org CI app pair.
+jumbo's failure guidance splits on credential availability
+(`source_tarball_gone_reason` in `src/dedup/fetch.rs`): an anonymous 404
+names the missing token; an authenticated 404 names the installation
+scope. The exported `GH_TOKEN` chain and the org-wide read-only shape of
+the mint are pinned by `tests/jumbo_publish_workflow.rs`; no credential
+literal ever appears in the workflow.
 
 ## The index record from this executor
 

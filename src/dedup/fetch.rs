@@ -565,6 +565,41 @@ fn github_token() -> Option<String> {
     None
 }
 
+/// Whether a GitHub token is available to the fetch layer right now (the
+/// same sources [`download_artifact`] reads: `GITHUB_TOKEN` / `GH_TOKEN`,
+/// then `gh auth token`). Public so dependency-source error guidance can
+/// branch on credential availability without touching the token value.
+pub fn github_token_present() -> bool {
+    github_token().is_some()
+}
+
+/// The failure text for a source-fallback tarball fetch that answered a
+/// definitive 404/410, split by whether the fetch carried credentials.
+///
+/// A PRIVATE repository answers 404 to an ANONYMOUS fetch no matter how
+/// healthy it is, so an absent token is the first thing the message must
+/// name — the executor defect this guards against is a run that holds
+/// valid credentials (org CI app installation token) but never passed
+/// them to the fetch layer, so the source fallback failed with a
+/// misleading "repository was deleted or made private". With a token
+/// present, the same status means the token cannot see the repository
+/// (wrong installation scope) or the repository/commit is really gone.
+pub fn source_tarball_gone_reason(status: u16, token_present: bool) -> String {
+    if !token_present {
+        return format!(
+            "HTTP {status}: the tarball was fetched ANONYMOUSLY (no GITHUB_TOKEN/GH_TOKEN in \
+             the environment and no `gh auth token`); a PRIVATE repository answers 404 to an \
+             anonymous fetch — give the run a token that can read it (the executor's org CI \
+             app installation token) and dispatch again"
+        );
+    }
+    format!(
+        "HTTP {status}: no repository tarball is readable at this URL with the available \
+         credentials (the token cannot see this repository — check the installation scope — \
+         or the repository/commit is gone)"
+    )
+}
+
 /// Write curl headers carrying credential material to a mode-0600 temp
 /// file. Passing headers this way keeps the token off the process argv.
 fn stage_private_file(prefix: &str, contents: String) -> Result<PathBuf, MaterializeError> {
@@ -957,6 +992,40 @@ mod tests {
         // The commit is the final path segment: the staged file name a
         // cache provider resolves the tarball by.
         assert_eq!(url.file_name, "f00dcafe0123456789abcdef0123456789abcdef0");
+    }
+
+    #[test]
+    fn source_tarball_404_names_the_missing_credentials_first() {
+        // The diagnosed executor defect: the run HELD valid credentials
+        // (org CI app installation token) but the fetch layer saw none,
+        // so a healthy private repository's codeload tarball "404'd". The
+        // anonymous message must say the fetch was anonymous and how to
+        // fix it — not "the repository was deleted".
+        let anonymous = source_tarball_gone_reason(404, false);
+        assert!(anonymous.contains("HTTP 404"), "{anonymous}");
+        assert!(anonymous.contains("ANONYMOUSLY"), "{anonymous}");
+        assert!(
+            anonymous.contains("GITHUB_TOKEN") && anonymous.contains("GH_TOKEN"),
+            "{anonymous}"
+        );
+        assert!(
+            anonymous.contains("installation token"),
+            "the anonymous message must point at the executor credential: {anonymous}"
+        );
+        // The same split holds for a definitive 410.
+        assert!(source_tarball_gone_reason(410, false).contains("HTTP 410"));
+        // With a token present the same status is a scope/visibility
+        // problem instead — named as such, never as an anonymous fetch.
+        let authenticated = source_tarball_gone_reason(404, true);
+        assert!(authenticated.contains("HTTP 404"), "{authenticated}");
+        assert!(
+            authenticated.contains("cannot see this repository"),
+            "{authenticated}"
+        );
+        assert!(
+            !authenticated.to_lowercase().contains("anonymously"),
+            "{authenticated}"
+        );
     }
 
     #[test]

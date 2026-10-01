@@ -30,6 +30,14 @@
 #      installed in a fresh venv together with the materialized
 #      dependency wheel and imported, proving the dependency closure the
 #      build consumed is the real recorded artifact.
+#   3. npm build-before-pack: the npm branch of the "Build the artifacts"
+#      step must run the package's standard build before `npm pack` —
+#      the negative control packs the bare fixture member and must get
+#      the source-only stub (package.json + README, the reported defect:
+#      @zephytiju/software-development-cicd-interfaces@1.0.0), the
+#      positive control runs the executor's verbatim npm branch and the
+#      tarball must carry the built dist/index.js (offline, zero
+#      third-party dependencies).
 #
 # The positive-control job is also the standing dry-run demonstration of
 # the build path: dispatch this workflow and the run log shows
@@ -300,4 +308,85 @@ jobs:
             echo
             echo "- materialized dependency artifacts: ${{ steps.deps.outputs.materialized }}"
             echo "- wheel under deps/ before the build: deps/demo-alpha/${{ env.WHEEL_NAME }}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # 3. The npm publication path must BUILD before it packs. A clean
+  #    checkout packed bare ships the source-only stub (package.json +
+  #    README — proof: @zephytiju/software-development-cicd-interfaces@
+  #    1.0.0); the executor's npm branch therefore runs the package's
+  #    standard build (lock refresh → clean install → build script) and
+  #    packs into a staging directory so the release carries exactly the
+  #    built artifact. Offline: the fixture member has zero third-party
+  #    dependencies and no network is contacted.
+  npm-pack-carries-built-dist:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Stage the fixture npm member (zero dependencies, offline)
+        run: |
+          set -euo pipefail
+          member="$RUNNER_TEMP/npm-member"
+          cp -r tests/fixtures/build-path/npm-member "$member"
+          cd "$member"
+          git init -q -b main
+          git config user.email "fixture@example.invalid"
+          git config user.name "build-path fixture"
+          git add -A
+          git commit -qm "demo-npm-member 1.0.0"
+          echo "MEMBER_DIR=$member" >> "$GITHUB_ENV"
+
+      - name: Negative control — packing the bare tree ships the stub (the reported defect)
+        working-directory: ${{ runner.temp }}/npm-member
+        run: |
+          set -euo pipefail
+          # The OLD npm branch: version + pack, no build.
+          mkdir -p "$RUNNER_TEMP/negative-pack"
+          npm version 1.0.1 --no-git-tag-version --allow-same-version
+          npm pack --pack-destination "$RUNNER_TEMP/negative-pack" > /dev/null
+          tgz="$(find "$RUNNER_TEMP/negative-pack" -type f -name '*.tgz')"
+          tar -tzf "$tgz" | tee "$RUNNER_TEMP/negative.lst"
+          grep -q "package/package.json" "$RUNNER_TEMP/negative.lst"
+          if grep -q "package/dist/index.js" "$RUNNER_TEMP/negative.lst"; then
+            echo "the bare tree packed a dist/ - the reported defect is NOT reproduced" >&2
+            exit 1
+          fi
+          echo "defect reproduced: without the build the tarball is package.json + README only"
+
+      - name: Positive control — the executor's npm branch packs the built dist
+        working-directory: ${{ runner.temp }}/npm-member
+        run: |
+          set -euo pipefail
+          # The NEW npm branch of the "Build the artifacts" step, verbatim.
+          rm -rf dist
+          npm version 1.0.2 --no-git-tag-version --allow-same-version
+          npm install --package-lock-only --ignore-scripts
+          npm ci
+          if jq -e '.scripts.build' package.json > /dev/null; then
+            npm run build
+          fi
+          pack_dir="$RUNNER_TEMP/positive-pack"
+          mkdir -p "$pack_dir"
+          npm pack --pack-destination "$pack_dir" > /dev/null
+          rm -rf dist
+          mkdir -p dist
+          mv "$pack_dir"/*.tgz dist/
+          tgz="$(find dist -type f -name '*.tgz')"
+          echo "artifact: $tgz"
+          tar -tzf "$tgz" | tee "$RUNNER_TEMP/positive.lst"
+          grep -q "package/dist/index.js" "$RUNNER_TEMP/positive.lst"
+          # The packed bytes are the built output, and dist/ carries exactly
+          # the artifact (no build outputs mixed into the release assets).
+          [ "$(find dist -type f | wc -l)" -eq 1 ]
+          tar -xOzf "$tgz" package/dist/index.js | grep -q "memberValue = 42"
+          echo "fixed path verified: the tarball carries the built dist/index.js"
+
+      - name: Run summary
+        if: always()
+        run: |
+          {
+            echo "## jumbo publish npm build-before-pack check"
+            echo
+            echo "- negative control (pack without build): $(wc -l < "$RUNNER_TEMP/negative.lst" 2>/dev/null || echo 0) entries, no dist/"
+            echo "- positive control (build then pack): carries package/dist/index.js"
           } >> "$GITHUB_STEP_SUMMARY"

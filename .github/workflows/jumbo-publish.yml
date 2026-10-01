@@ -40,17 +40,21 @@
 #
 #   1. PREFERRED — the org CI GitHub App pair:
 #        JUNTAI_CI_APP_ID + JUNTAI_CI_APP_PRIVATE_KEY
-#      A short-lived installation token is minted at run time (downgraded to
-#      exactly contents read+write, scoped to zephytiju/JumboBuild and the
-#      index repository, revoked when the job ends) and used for the
-#      JumboBuild checkout, the JumboIndex fetch, and the index append. No
-#      long-lived credential is stored anywhere; the private key flows only
-#      from its secret into the minting action — never echoed, logged, or
-#      written to a file.
+#      Two short-lived installation tokens are minted at run time (both
+#      revoked when the job ends): (a) a contents read+write token scoped to
+#      exactly zephytiju/JumboBuild and the index repository, used for the
+#      JumboBuild checkout, the JumboIndex fetch, and the index append; and
+#      (b) an org-wide contents:read token for dependency materialization,
+#      which fetches recorded release assets and source-fallback trees from
+#      PRIVATE member repositories the narrowly scoped token (a) cannot
+#      read. No long-lived credential is stored anywhere; the private key
+#      flows only from its secret into the minting action — never echoed,
+#      logged, or written to a file.
 #   2. FALLBACK — the static token secrets (backward compatible):
 #        JUNTAI_GITHUB_ARTIFACT_TOKEN - reads the private JumboBuild checkout
 #          and clones the private JumboIndex repository (the caller's default
-#          GITHUB_TOKEN cannot cross repository boundaries).
+#          GITHUB_TOKEN cannot cross repository boundaries); also the
+#          dependency-fetch fallback credential when the App pair is absent.
 #        JUNTAI_INDEX_TOKEN           - pushes the index append to JumboIndex
 #          (a GitHub App or user token with contents:write on
 #          zephytiju/JumboIndex).
@@ -293,6 +297,32 @@ jobs:
           repositories: JumboBuild,${{ steps.auth.outputs.index-name }}
           permission-contents: write
 
+      # 2b. Mint the org-wide dependency read token (App path only).
+      #     Dependency materialization (step 8) fetches recorded release
+      #     assets and source-fallback trees from PRIVATE member
+      #     repositories — arbitrary repositories of the organization,
+      #     unknowable before `jumbo lock` resolves the manifest — so its
+      #     credential cannot be pre-scoped to the two repositories the
+      #     executor itself touches. The org CI app is installed on every
+      #     organization repository, so a token minted with NO repository
+      #     filter covers exactly what a dependency fetch may need,
+      #     downgraded to contents: read only and revoked when the job
+      #     ends. Without it the fetches run anonymous, and github.com
+      #     release-asset URLs AND codeload tarball URLs answer 404 for
+      #     private repositories even though the run holds valid
+      #     credentials — the defect this token exists to fix (evidence:
+      #     PrismPipelineFluxboardMicroUI run 36819957831, source fallback
+      #     → anonymous codeload 404 for private zephytiju/PrismReact).
+      - name: Mint the org-wide dependency read token
+        id: deps-token
+        if: steps.auth.outputs.mode == 'app'
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.JUNTAI_CI_APP_ID }}
+          private-key: ${{ secrets.JUNTAI_CI_APP_PRIVATE_KEY }}
+          owner: ${{ steps.auth.outputs.index-owner }}
+          permission-contents: read
+
       # 3. The caller repository at the triggering commit. Promotion only
       #    happens on a clean attributable tree: checkout gives exactly the
       #    release commit, and persist-credentials keeps no token in the
@@ -478,6 +508,19 @@ jobs:
       - name: Materialize the recorded dependency artifacts (build path)
         id: deps
         if: steps.promote.outputs.publish_required == 'true'
+        env:
+          # Dependency fetches must be AUTHENTICATED: recorded asset URLs
+          # on private repositories answer 404 to anonymous requests (the
+          # asset then resolves through jumbo's authenticated
+          # api.github.com route, which needs this token), and a source
+          # fallback fetches the codeload tarball, which answers 404
+          # anonymously for private repositories outright. Preferred
+          # credential: the org CI app's org-wide read-only installation
+          # token; then the static artifact token; then the caller's own
+          # GITHUB_TOKEN (public dependencies only — it cannot cross
+          # repository boundaries). jumbo reads GITHUB_TOKEN/GH_TOKEN from
+          # its environment; the value enters only through the environment.
+          GH_TOKEN: ${{ steps.deps-token.outputs.token || secrets.JUNTAI_GITHUB_ARTIFACT_TOKEN || github.token }}
         run: |
           bash "$RUNNER_TEMP/jumbo-build/jumbobuild/scripts/jumbo_publish_materialize_deps.sh" "${{ steps.identity.outputs.ecosystem }}"
 
@@ -486,6 +529,15 @@ jobs:
       #    minor/patch are pipeline-owned, so the version for this build is
       #    set from the promotion decision before building). The
       #    dependencies it declares are already materialized under deps/.
+      #    npm runs the package's standard build BEFORE packing (the
+      #    node.rs pipeline: refresh the lock against the materialized
+      #    manifest, clean-install it, run the build script when one is
+      #    configured) — packing the bare tree released source-only stubs
+      #    (package.json + README), which is the defect this fixes (proof:
+      #    @zephytiju/software-development-cicd-interfaces@1.0.0).
+      - name: Set up node (npm build path)
+        if: steps.identity.outputs.ecosystem == 'npm' && steps.promote.outputs.publish_required == 'true'
+        uses: actions/setup-node@v5
       - name: Build the artifacts at the jumbo-computed version
         id: build
         if: steps.promote.outputs.publish_required == 'true'
@@ -501,7 +553,26 @@ jobs:
               ;;
             npm)
               npm version "$JUMBO_VERSION" --no-git-tag-version --allow-same-version
-              npm pack --pack-destination dist
+              # The package's standard build (the node.rs pipeline). The
+              # materialization step rewrote dependency references in
+              # package.json, so the lock is refreshed against the
+              # materialized manifest before the clean install.
+              npm install --package-lock-only --ignore-scripts
+              npm ci
+              if jq -e '.scripts.build' package.json > /dev/null; then
+                npm run build
+              fi
+              # Pack into a staging directory OUTSIDE the build output
+              # (the package's own build usually writes dist/). The built
+              # bytes travel INSIDE the tarball (files: ["dist", ...]), so
+              # dist/ is reset afterwards to carry exactly the release
+              # artifact — no build outputs mixed into the release assets.
+              pack_dir="$JUMBO_OUT/npm-pack"
+              mkdir -p "$pack_dir"
+              npm pack --pack-destination "$pack_dir"
+              rm -rf dist
+              mkdir -p dist
+              mv "$pack_dir"/*.tgz dist/
               ;;
             *) echo "unsupported ecosystem: ${{ steps.identity.outputs.ecosystem }}" >&2; exit 1 ;;
           esac
