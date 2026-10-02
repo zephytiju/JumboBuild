@@ -5,6 +5,9 @@ inputs:
   ecosystem:
     description: "Language of the caller repository: npm or python."
     required: true
+  jumbobuild-ref:
+    description: "The JumboBuild ref to build jumbo from. Pin the same ref the uses: line of this action pins. Explicit because github.action_ref inside a composite step resolves to the nested step's own action (e.g. actions/checkout@v6), not to this action's ref."
+    required: true
   token:
     description: "Optional pre-minted token with contents:read on zephytiju/JumboIndex and the organization's member repositories. When omitted, the org CI App pair inputs below are used."
     required: false
@@ -50,7 +53,7 @@ runs:
       uses: actions/checkout@v6
       with:
         repository: zephytiju/JumboBuild
-        ref: ${{ github.action_ref }}
+        ref: ${{ inputs.jumbobuild-ref }}
         path: jumbobuild
         persist-credentials: false
         token: ${{ inputs.token || steps.deps-token.outputs.token }}
