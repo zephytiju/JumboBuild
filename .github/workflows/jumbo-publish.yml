@@ -575,7 +575,7 @@ jobs:
               # manifest section for exactly this restore.
               if [[ -f deps/.jumbo-sources.json ]]; then
                 jq -s '.[1].sources as $src | reduce $src[] as $s (.[0];
-                  .[$s.location][$s.name] = $s.declared)' \
+                  .[$s.location | split(" ") | last][$s.name] = $s.declared)' \
                   package.json deps/.jumbo-sources.json > package.json.clean
                 mv package.json.clean package.json
               fi
