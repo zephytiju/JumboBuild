@@ -562,6 +562,23 @@ jobs:
               if jq -e '.scripts.build' package.json > /dev/null; then
                 npm run build
               fi
+              # Pack the CLEAN manifest: restore every jumbo-rewritten
+              # declaration (file:deps/... -> the declared range) so the
+              # released artifact carries the developer's declaration.
+              # Consumers resolve internal dependencies from the index —
+              # a file: path baked into the artifact is uninstallable for
+              # them (npm ENOENT on the deps/ tree the tarball never
+              # ships; defect proven by the first artifact with an
+              # internal dependency, @juntai/prism-layout-templates@1.0.0).
+              # The injection marker (deps/.jumbo-sources.json, written by
+              # jumbo lock) carries the original declared spec and the
+              # manifest section for exactly this restore.
+              if [[ -f deps/.jumbo-sources.json ]]; then
+                jq -s '.[1].sources as $src | reduce $src[] as $s (.[0];
+                  .[$s.location][$s.name] = $s.declared)' \
+                  package.json deps/.jumbo-sources.json > package.json.clean
+                mv package.json.clean package.json
+              fi
               # Pack into a staging directory OUTSIDE the build output
               # (the package's own build usually writes dist/). The built
               # bytes travel INSIDE the tarball (files: ["dist", ...]), so
