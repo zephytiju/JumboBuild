@@ -1,0 +1,119 @@
+name: jumbo-resolve
+description: Resolve a member repository's internal dependencies from the Jumbo index for non-release CI (verify jobs). Builds the jumbo CLI from the JumboBuild ref this action is called with, fetches the JumboIndex, generates the language lock, and materializes internal dependency artifacts (or source fallbacks) under deps/ with the manifest repointed at them. The release path stays the reusable jumbo-publish workflow; this action never promotes, publishes, or appends index records (Jumbo Build & Versioning Standard, sections 2.2, 2.4, 3.4).
+
+inputs:
+  ecosystem:
+    description: "Language of the caller repository: npm or python."
+    required: true
+  token:
+    description: "Optional pre-minted token with contents:read on zephytiju/JumboIndex and the organization's member repositories. When omitted, the org CI App pair inputs below are used."
+    required: false
+    default: ""
+  app-id:
+    description: "Org CI GitHub App id (org secret JUNTAI_CI_APP_ID). Used only when token is empty."
+    required: false
+    default: ""
+  app-private-key:
+    description: "Org CI GitHub App private key (org secret JUNTAI_CI_APP_PRIVATE_KEY). Used only when token is empty."
+    required: false
+    default: ""
+  index-repository:
+    description: "The Jumbo index repository, owner/name."
+    required: false
+    default: "zephytiju/JumboIndex"
+
+runs:
+  using: composite
+  steps:
+    # Credential: prefer the ready token; else mint the org CI App's
+    # org-wide installation token (contents: read). Dependency
+    # materialization fetches recorded release assets and source-fallback
+    # trees from arbitrary PRIVATE member repositories, so its credential
+    # cannot be pre-scoped to named repositories; the org CI app is
+    # installed on every organization repository, which is exactly the
+    # reach a dependency fetch may need, downgraded to read only.
+    - name: Mint the org-wide dependency read token
+      id: deps-token
+      if: inputs.token == ''
+      uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+      with:
+        app-id: ${{ inputs.app-id }}
+        private-key: ${{ inputs.app-private-key }}
+        owner: zephytiju
+        permission-contents: read
+
+    # JumboBuild at the ref this action was called with. Checked out into
+    # the workspace because actions/checkout accepts paths under
+    # GITHUB_WORKSPACE only; moved out below so jumbo lock rewrites and
+    # deps/ materialization never see it as part of the caller tree.
+    - name: Check out JumboBuild at the action ref
+      uses: actions/checkout@v6
+      with:
+        repository: zephytiju/JumboBuild
+        ref: ${{ github.action_ref }}
+        path: jumbobuild
+        persist-credentials: false
+        token: ${{ inputs.token || steps.deps-token.outputs.token }}
+
+    - name: Install the Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+
+    # Restore/build happen at the pre-move path; rust-cache's post-save
+    # looks for the directory there and skips the target-dir save when it
+    # is gone — a perf cost, never a correctness issue.
+    - name: Cache the cargo build of jumbo
+      uses: Swatinem/rust-cache@v2
+      with:
+        workspaces: jumbobuild
+
+    - name: Build jumbo from the pinned JumboBuild commit
+      run: cargo build --release --locked
+      working-directory: jumbobuild
+      shell: bash
+
+    - name: Move the JumboBuild checkout out of the caller working tree
+      run: |
+        set -euo pipefail
+        mkdir -p "${RUNNER_TEMP}/jumbo-build"
+        mv "${GITHUB_WORKSPACE}/jumbobuild" "${RUNNER_TEMP}/jumbo-build/jumbobuild"
+      shell: bash
+
+    - name: Put jumbo on PATH
+      run: echo "${RUNNER_TEMP}/jumbo-build/jumbobuild/target/release" >> "$GITHUB_PATH"
+      shell: bash
+
+    # The index is PRIVATE: the caller's default GITHUB_TOKEN cannot read
+    # it, so the clone carries the minted/read token above.
+    - name: Fetch the Jumbo index
+      env:
+        GH_TOKEN: ${{ inputs.token || steps.deps-token.outputs.token }}
+        INDEX_REPOSITORY: ${{ inputs.index-repository }}
+      run: |
+        set -euo pipefail
+        index_dir="${RUNNER_TEMP}/jumbo-index"
+        gh repo clone "$INDEX_REPOSITORY" "$index_dir"
+        echo "JUMBO_INDEX_PATH=${index_dir}" >> "$GITHUB_ENV"
+        echo "JUMBO_INDEX_REPOSITORY=${INDEX_REPOSITORY}" >> "$GITHUB_ENV"
+      shell: bash
+
+    - name: jumbo lock (resolve and generate the language lock)
+      run: |
+        set -euo pipefail
+        jumbo lock
+      shell: bash
+
+    # Replace the resolution-only stubs jumbo lock wrote under deps/ with
+    # the recorded artifacts (exact URL, SHA-256 verified) or the real
+    # repository source at the recorded commit, repointing the manifest at
+    # them so the standard build (npm, uv) consumes real packages. The
+    # dependency fetch must be AUTHENTICATED: private release assets and
+    # private codeload tarballs answer 404 anonymously.
+    - name: Materialize the internal dependency artifacts
+      env:
+        JUMBO_OUT: ${{ runner.temp }}/jumbo-state
+        GH_TOKEN: ${{ inputs.token || steps.deps-token.outputs.token }}
+      run: |
+        set -euo pipefail
+        mkdir -p "$JUMBO_OUT"
+        bash "${RUNNER_TEMP}/jumbo-build/jumbobuild/scripts/jumbo_publish_materialize_deps.sh" "${{ inputs.ecosystem }}"
+      shell: bash
