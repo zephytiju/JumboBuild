@@ -396,6 +396,12 @@ jobs:
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "24.14.0"
+          # setup-node v7 auto-enables package-manager caching when the
+          # manifest carries a packageManager field, and then HARD-FAILS on
+          # jumbo members: the standard removed their committed lock files
+          # (section 2.4), so no cache key file exists. Lock generation
+          # needs the pinned npm only, never the cache.
+          package-manager-cache: false
 
       # 5. The Jumbo index (private). Authenticated with the minted
       #    installation token when the App pair is present, else the static
