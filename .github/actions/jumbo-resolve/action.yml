@@ -24,6 +24,10 @@ inputs:
     description: "The Jumbo index repository, owner/name."
     required: false
     default: "zephytiju/JumboIndex"
+  manifest:
+    description: "Manifest to resolve, for mixed-ecosystem repositories (package.json or pyproject.toml). A bare `jumbo lock` detects the language and prefers python when both manifests exist; a mixed npm+python member whose python side is not yet jumbo-lockable (exact internal pins) passes manifest: package.json to resolve the npm side only. The materialization step already follows the ecosystem input."
+    required: false
+    default: ""
 
 runs:
   using: composite
@@ -115,9 +119,15 @@ runs:
       shell: bash
 
     - name: jumbo lock (resolve and generate the language lock)
+      env:
+        JUMBO_RESOLVE_MANIFEST: ${{ inputs.manifest }}
       run: |
         set -euo pipefail
-        jumbo lock
+        if [[ -n "$JUMBO_RESOLVE_MANIFEST" ]]; then
+          jumbo lock --manifest "$JUMBO_RESOLVE_MANIFEST"
+        else
+          jumbo lock
+        fi
       shell: bash
 
     # Replace the resolution-only stubs jumbo lock wrote under deps/ with
