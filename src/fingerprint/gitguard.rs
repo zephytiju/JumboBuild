@@ -81,8 +81,16 @@ pub fn promotion_tree_state(start: &Path) -> Result<TreeState, FingerprintError>
         })?
         .to_string_lossy()
         .into_owned();
+    // Untracked-but-not-ignored, recursively: the guard's subject is work
+    // the developer could have committed. Gitignored build output — a
+    // redirected npm cache (MeridianConstructs `.npmrc` cache=.npm/cache),
+    // dist/, node_modules/ — is invisible to git status and must be
+    // invisible to the guard, or every publish from such a repository
+    // refuses with a dirty tree the developer cannot clean.
+    let mut options = git2::StatusOptions::new();
+    options.include_untracked(true).recurse_untracked_dirs(true);
     let statuses = repo
-        .statuses(None)
+        .statuses(Some(&mut options))
         .map_err(|e| FingerprintError::NotARepository {
             start: format!("{} (git status failed: {e})", start.display()),
         })?;
