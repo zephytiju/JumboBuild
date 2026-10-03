@@ -715,6 +715,13 @@ jobs:
           file: ./Dockerfile
           push: true
           tags: ${{ steps.image-coords.outputs.tag }}
+          # The release commit is offered to the Dockerfile as the standard
+          # SOURCE_COMMIT build-arg (member Dockerfiles that embed their own
+          # source commit — e.g. JuntaiConsole's release manifest — declare
+          # ARG JUNTAI_CONSOLE_SOURCE_COMMIT or read SOURCE_COMMIT; Dockerfiles
+          # that consume neither are unaffected).
+          build-args: |
+            SOURCE_COMMIT=${{ steps.coords.outputs.commit }}
 
       - name: Verify the pushed image digest against the registry (§3.7)
         id: image-verify
