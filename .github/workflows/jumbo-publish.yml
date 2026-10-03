@@ -385,6 +385,18 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@v7
 
+      # Node runs the npm side of the standard build (lock generation via
+      # `npm install --package-lock-only`, build, pack). Unconditional for
+      # the same reason as uv — and PINNED: the runner-default npm (11.0-11.4
+      # era) carries an Arborist crash ("Cannot read properties of null
+      # (reading 'edgesOut')") on some member trees (e.g. JuntaiConsoleSDK's
+      # react-dom + vitest 4 closure); npm 11.9 (node 24.14) is proven
+      # against every current member manifest.
+      - name: Set up node (pinned for lock generation)
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24.14.0"
+
       # 5. The Jumbo index (private). Authenticated with the minted
       #    installation token when the App pair is present, else the static
       #    JUNTAI_GITHUB_ARTIFACT_TOKEN — the auth resolution above fails
@@ -535,9 +547,14 @@ jobs:
       #    configured) — packing the bare tree released source-only stubs
       #    (package.json + README), which is the defect this fixes (proof:
       #    @zephytiju/software-development-cicd-interfaces@1.0.0).
+      # Redundant when the pinned step above already ran; kept so a future
+      # revert of the early pin cannot resurrect the runner-default npm on
+      # the build path. Same pinned version as the lock-generation step.
       - name: Set up node (npm build path)
         if: steps.identity.outputs.ecosystem == 'npm' && steps.promote.outputs.publish_required == 'true'
-        uses: actions/setup-node@v5
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24.14.0"
       - name: Build the artifacts at the jumbo-computed version
         id: build
         if: steps.promote.outputs.publish_required == 'true'

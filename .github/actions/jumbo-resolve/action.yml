@@ -74,6 +74,15 @@ runs:
       working-directory: jumbobuild
       shell: bash
 
+    # Pinned node/npm BEFORE jumbo lock: the runner-default npm (11.0-11.4
+    # era) carries an Arborist crash ("Cannot read properties of null
+    # (reading 'edgesOut')") on some member trees; npm 11.9 (node 24.14)
+    # is proven. Harmless for python callers.
+    - name: Set up node (pinned for lock generation)
+      uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      with:
+        node-version: "24.14.0"
+
     - name: Move the JumboBuild checkout out of the caller working tree
       run: |
         set -euo pipefail
