@@ -677,6 +677,17 @@ fn unpack_tarball_strip_one(
         for entry in entries {
             let entry =
                 entry.map_err(|e| failure(format!("failed to read a tarball entry: {e}")))?;
+            let entry_type = entry.header().entry_type();
+            // PAX/GNU metadata entries — every GitHub codeload tarball
+            // carries a `pax_global_header` entry — are archive
+            // metadata, not members. Counting one as a leading directory
+            // rejected every GitHub source fallback ("the tarball has
+            // more than one leading directory (`pax_global_header`,
+            // `<repo>-<ref>`)"; MeridianConfigArtifactPlugin run
+            // 37261477754); the single-root contract is about MEMBERS.
+            if matches!(entry_type.as_byte(), b'g' | b'x' | b'L' | b'K') {
+                continue;
+            }
             let path = entry
                 .path()
                 .map_err(|e| failure(format!("failed to read an entry path: {e}")))?
@@ -704,7 +715,6 @@ fn unpack_tarball_strip_one(
             if relative.as_os_str().is_empty() {
                 continue; // the root directory entry itself
             }
-            let entry_type = entry.header().entry_type();
             if matches!(entry_type, tar::EntryType::Symlink | tar::EntryType::Link) {
                 if let Some(target) = entry.link_name().ok().flatten() {
                     // A hardlink target is archive-root relative; a symlink
@@ -1746,5 +1756,82 @@ mod tests {
             .collect();
         assert_eq!(lock_sources, vec!["demo-alpha"]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn github_pax_global_header_does_not_break_the_single_root_contract() {
+        // Every GitHub codeload tarball carries a pax_global_header
+        // metadata entry. The single-root validation must treat PAX/GNU
+        // metadata as non-members — counting one as a second leading
+        // directory rejected every GitHub source fallback
+        // (MeridianConfigArtifactPlugin run 37261477754).
+        let dir = temp_dir("pax-tarball");
+        let tarball = dir.join("source.tar.gz");
+        let file = std::fs::File::create(&tarball).unwrap();
+        let gz = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+        let mut builder = tar::Builder::new(gz);
+        let root = "MeridianObjectCommon-e520402f778378c50d3d6dd9181da2bfb4c3e469";
+
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::new(b'g'));
+        header.set_size(0);
+        header.set_path("pax_global_header").unwrap();
+        header.set_cksum();
+        builder.append(&header, std::io::empty()).unwrap();
+
+        let mut header = tar::Header::new_gnu();
+        header.set_size(0);
+        header.set_mode(0o755);
+        header.set_entry_type(tar::EntryType::Directory);
+        header.set_path(format!("{root}/")).unwrap();
+        header.set_cksum();
+        builder.append(&header, std::io::empty()).unwrap();
+
+        let mut header = tar::Header::new_gnu();
+        header.set_size(5);
+        header.set_mode(0o644);
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_path(format!("{root}/pyproject.toml")).unwrap();
+        header.set_cksum();
+        builder
+            .append(&header, std::io::Cursor::new(b"hello"))
+            .unwrap();
+        builder.into_inner().unwrap().finish().unwrap();
+
+        let dest = dir.join("unpacked");
+        unpack_tarball_strip_one(&tarball, &dest, "demo-alpha")
+            .expect("the pax_global_header entry must not count as a leading directory");
+        assert_eq!(
+            std::fs::read_to_string(dest.join("pyproject.toml")).unwrap(),
+            "hello"
+        );
+    }
+
+    #[test]
+    fn two_real_roots_are_still_rejected() {
+        let dir = temp_dir("two-roots");
+        let tarball = dir.join("source.tar.gz");
+        let file = std::fs::File::create(&tarball).unwrap();
+        let gz = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+        let mut builder = tar::Builder::new(gz);
+        for root in ["repo-a-abc", "repo-b-def"] {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(5);
+            header.set_mode(0o644);
+            header.set_entry_type(tar::EntryType::Regular);
+            header.set_path(format!("{root}/file.txt")).unwrap();
+            header.set_cksum();
+            builder
+                .append(&header, std::io::Cursor::new(b"hello"))
+                .unwrap();
+        }
+        builder.into_inner().unwrap().finish().unwrap();
+
+        let err = unpack_tarball_strip_one(&tarball, &dir.join("dest"), "demo-alpha")
+            .expect_err("two real roots must stay rejected");
+        assert!(
+            err.to_string().contains("more than one leading directory"),
+            "unexpected error: {err}"
+        );
     }
 }
