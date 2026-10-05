@@ -956,9 +956,20 @@ pub fn materialize_dependency_artifacts(
     // Phase 1: stage and verify every candidate — pulled artifacts and
     // fallback source trees alike. Definitive absence degrades to the
     // real-source fetch; everything else aborts with nothing mutated.
+    // A dependency declared in SEVERAL manifest locations (a base extra
+    // and the test extra, say) appears once per location in the
+    // resolution; it materializes ONCE — the manifest rewrites are by
+    // name and idempotent, and a second source move would consume an
+    // already-moved staged tree ("failed to place the fetched source:
+    // No such file or directory", MeridianConfigArtifactPlugin's
+    // meridian-storage-oci, declared in [oci] and [test]).
+    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut candidates: Vec<(&ResolvedDependency, ArtifactUrl, String, PathBuf)> = Vec::new();
     let mut fallbacks: Vec<StagedFallback> = Vec::new();
     for dep in resolution {
+        if !seen.insert(dep.name.clone()) {
+            continue;
+        }
         match stage_and_verify(&dep.record, provider, staging_dir) {
             Ok((url, sha256, staged)) => {
                 ArtifactKind::of(&url, ecosystem)?;
@@ -1832,6 +1843,66 @@ mod tests {
         assert!(
             err.to_string().contains("more than one leading directory"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn a_dependency_declared_in_several_locations_materializes_once() {
+        // meridian-storage-oci is declared in the [oci] extra AND the
+        // [test] extra: the resolution carries it twice (one entry per
+        // location), and the second source move would consume an
+        // already-moved staged tree ("failed to place the fetched source:
+        // No such file or directory", MeridianConfigArtifactPlugin run
+        // 37263414772). Materialization is by NAME.
+        use crate::resolver::ResolvedDependency;
+        let dir = temp_dir("dup-dep");
+        let project = dir.join("project");
+        std::fs::create_dir_all(&project).expect("project dir");
+        let manifest = project.join("pyproject.toml");
+        std::fs::write(
+            &manifest,
+            "[project]\nname = \"consumer\"\nversion = \"1.0.0\"\ndependencies = [\"demo-alpha>=2,<3\"]\n",
+        )
+        .expect("manifest");
+
+        let cache = dir.join("cache");
+        std::fs::create_dir_all(&cache).expect("cache");
+        let bytes = b"demo wheel bytes";
+        std::fs::write(cache.join("demo_alpha-2.4.0-py3-none-any.whl"), bytes).expect("asset");
+        let mut hasher = Sha256::new();
+        hasher.update(bytes);
+        let sha: String = hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+
+        let make_dep = || ResolvedDependency {
+            name: "demo-alpha".to_string(),
+            declared_major: 2,
+            declaration: "demo-alpha>=2,<3".to_string(),
+            extras: vec![],
+            marker: None,
+            location: "project.dependencies".to_string(),
+            record: record(Some(URL), Some(&sha)),
+            record_line: 1,
+            index_file: "demo-alpha.jsonl".to_string(),
+        };
+        let resolution = vec![make_dep(), make_dep()];
+
+        let materialized = materialize_dependency_artifacts(
+            &manifest,
+            &resolution,
+            Ecosystem::Python,
+            &ArtifactProvider::Cache(cache),
+            &dir.join("staging"),
+            None,
+        )
+        .expect("duplicate-location dependency materializes once");
+        assert_eq!(
+            materialized.iter().filter(|m| m.package == "demo-alpha").count(),
+            1,
+            "one materialization per package name"
         );
     }
 }
