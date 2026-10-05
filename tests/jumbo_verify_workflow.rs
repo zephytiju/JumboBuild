@@ -198,8 +198,8 @@ fn the_npm_pipeline_refreshes_installs_restores_then_verifies() {
         .find("npm ci")
         .unwrap_or_else(|| panic!("the npm pipeline must clean-install:\n{block}"));
     let restore = block
-        .find("deps/.jumbo-sources.json")
-        .unwrap_or_else(|| panic!("the npm pipeline must restore the clean declarations:\n{block}"));
+        .find("declared-package.json")
+        .unwrap_or_else(|| panic!("the npm pipeline must restore the declared manifest:\n{block}"));
     let verify = block
         .find("npm run verify --if-present")
         .unwrap_or_else(|| panic!("the npm pipeline must run the project's verify script:\n{block}"));
@@ -220,8 +220,8 @@ fn the_npm_pipeline_refreshes_installs_restores_then_verifies() {
     );
 }
 
-/// The python verify pipeline: sync (all extras) → restore the clean
-/// declarations → build → gated pytest.
+/// The python verify pipeline: sync (all extras) → restore the declared
+/// manifest verbatim → build → gated pytest.
 #[test]
 fn the_python_pipeline_syncs_restores_builds_then_tests() {
     let workflow = include_str!("../.github/workflows/jumbo-verify.yml");
@@ -231,8 +231,8 @@ fn the_python_pipeline_syncs_restores_builds_then_tests() {
         .find("uv sync --all-extras")
         .unwrap_or_else(|| panic!("the python pipeline must sync every extra:\n{block}"));
     let restore = block
-        .find(".jumbo-sources.json")
-        .unwrap_or_else(|| panic!("the python pipeline must restore the clean declarations from the injection marker:\n{block}"));
+        .find("declared-pyproject.toml")
+        .unwrap_or_else(|| panic!("the python pipeline must restore the declared manifest verbatim:\n{block}"));
     let build = block
         .find("uv build")
         .unwrap_or_else(|| panic!("the python pipeline must run the standard build:\n{block}"));
@@ -241,17 +241,17 @@ fn the_python_pipeline_syncs_restores_builds_then_tests() {
         .unwrap_or_else(|| panic!("the python pipeline must run pytest:\n{block}"));
     assert!(
         sync < restore && restore < build && build < pytest,
-        "the python pipeline must run uv sync → restore clean declarations → uv build → \
-         pytest (jumbo's python test pipeline order, with the same restore the npm \
-         branch applies — the manifest's rewritten exact pins must never reach anything \
-         that packs or asserts it):\n{block}"
+        "the python pipeline must run uv sync → restore the declared manifest → uv build → \
+         pytest (jumbo's python test pipeline order — the injected manifest must never \
+         reach anything that packs or asserts it):\n{block}"
     );
-    // The restore maps the marker's rewritten strings back to the declared
-    // ones (never a blind delete — [tool.uv.sources] must survive for the
-    // synced environment to keep resolving the materialized wheels).
+    // The restore is the FULL declared file, not a string mapping: the
+    // injection re-serializes the manifest and drops comments (SPDX
+    // headers — MeridianQuery run 37266872477), so a string-level restore
+    // leaves a re-serialized approximation in the tree.
     assert!(
-        block.contains("source[\"rewritten\"]") && block.contains("source[\"declared\"]"),
-        "the restore uses the injection marker's rewritten→declared mapping:\n{block}"
+        block.contains("cp \"$RUNNER_TEMP/declared-pyproject.toml\" pyproject.toml"),
+        "the restore copies the snapshotted declared file verbatim:\n{block}"
     );
     // `python -m pytest` (not bare pytest): the module form puts the
     // project root on sys.path, which member suites that import through
@@ -265,6 +265,38 @@ fn the_python_pipeline_syncs_restores_builds_then_tests() {
         block.contains("import pytest"),
         "pytest is gated on being installed in the synced environment (build-only \
          members skip it with a notice, never fail):\n{block}"
+    );
+}
+
+/// The declared-manifest snapshot happens after the checkout and before
+/// jumbo lock rewrites the manifests; both ecosystem branches restore it
+/// after their installs.
+#[test]
+fn the_declared_manifests_are_snapshotted_before_the_injection() {
+    let workflow = include_str!("../.github/workflows/jumbo-verify.yml");
+    let snapshot = step_block(workflow, "Snapshot the declared manifests")
+        .unwrap_or_else(|| panic!("the snapshot step not found in jumbo-verify.yml"));
+    assert!(
+        snapshot.contains("declared-pyproject.toml") && snapshot.contains("declared-package.json"),
+        "both manifests are snapshotted:\n{snapshot}"
+    );
+    // Ordering: the snapshot precedes the lock step; the npm branch
+    // restores the file after npm ci (before the project scripts).
+    let lock = step_block(workflow, "jumbo lock (resolve and generate the language lock)")
+        .expect("the lock step");
+    let snap_pos = workflow.find("Snapshot the declared manifests").expect("snapshot");
+    let lock_pos = workflow.find("jumbo lock (resolve and generate the language lock)").expect("lock");
+    assert!(snap_pos < lock_pos, "the snapshot precedes jumbo lock");
+    let npm = step_block(workflow, NPM_VERIFY_STEP).expect("npm verify step");
+    let ci = npm.find("npm ci").expect("npm ci");
+    let restore = npm
+        .find("declared-package.json")
+        .unwrap_or_else(|| panic!("the npm pipeline restores the declared manifest:\n{npm}"));
+    let verify_script = npm.find("npm run verify --if-present").expect("verify script");
+    assert!(
+        ci < restore && restore < verify_script,
+        "the npm pipeline restores the declared manifest after the install and before the \
+         project scripts:\n{npm}"
     );
 }
 

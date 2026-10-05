@@ -287,6 +287,19 @@ jobs:
           echo "JUMBO_INDEX_PATH=${index_dir}" >> "$GITHUB_ENV"
           echo "JUMBO_INDEX_REPOSITORY=${INDEX_REPOSITORY}" >> "$GITHUB_ENV"
 
+      # 5b. Snapshot the pristine declared manifests BEFORE jumbo lock
+      #     rewrites them: the injection re-serializes the manifest (TOML
+      #     re-serialization drops comments — SPDX headers, formatting),
+      #     and everything after the install (builds, packs, and the
+      #     repository's own contract tests) must see the developer's
+      #     file verbatim, not a re-serialized approximation. The full
+      #     file is restored after the install in each ecosystem branch.
+      - name: Snapshot the declared manifests
+        run: |
+          set -euo pipefail
+          if [[ -f pyproject.toml ]]; then cp pyproject.toml "$RUNNER_TEMP/declared-pyproject.toml"; fi
+          if [[ -f package.json ]]; then cp package.json "$RUNNER_TEMP/declared-package.json"; fi
+
       # 6. Ecosystem resolution: the explicit input wins; `auto` follows
       #    jumbo lock's preference (pyproject.toml -> python, else
       #    package.json -> npm). The optional manifest input (mixed
@@ -367,11 +380,11 @@ jobs:
           set -euo pipefail
           npm install --package-lock-only --ignore-scripts
           npm ci
-          if [[ -f deps/.jumbo-sources.json ]]; then
-            jq -s '.[1].sources as $src | reduce $src[] as $s (.[0];
-              .[$s.location | split(" ") | last][$s.name] = $s.declared)' \
-              package.json deps/.jumbo-sources.json > package.json.clean
-            mv package.json.clean package.json
+          # Restore the developer's manifest verbatim (the jumbo
+          # materialization pointers must never reach anything that packs
+          # or asserts it).
+          if [[ -f "$RUNNER_TEMP/declared-package.json" ]]; then
+            cp "$RUNNER_TEMP/declared-package.json" package.json
           fi
           npm run verify --if-present
           npm run typecheck --if-present
@@ -410,21 +423,13 @@ jobs:
         run: |
           set -euo pipefail
           uv sync --all-extras
-          python3 - <<'PY'
-          import json
-          from pathlib import Path
-
-          marker = Path("deps/.jumbo-sources.json")
-          if marker.exists():
-              manifest = Path("pyproject.toml")
-              text = manifest.read_text(encoding="utf-8")
-              for source in json.loads(marker.read_text(encoding="utf-8"))["sources"]:
-                  rewritten = source["rewritten"]
-                  declared = source["declared"]
-                  if rewritten != declared and rewritten in text:
-                      text = text.replace(rewritten, declared, 1)
-              manifest.write_text(text, encoding="utf-8")
-          PY
+          # Restore the developer's manifest verbatim (the injection's
+          # re-serialization drops comments — e.g. SPDX headers — and the
+          # exact-pins form must never reach anything that packs or
+          # asserts it).
+          if [[ -f "$RUNNER_TEMP/declared-pyproject.toml" ]]; then
+            cp "$RUNNER_TEMP/declared-pyproject.toml" pyproject.toml
+          fi
           uv build
           if uv run --no-sync python -c 'import pytest' >/dev/null 2>&1; then
             uv run --no-sync python -m pytest -q
