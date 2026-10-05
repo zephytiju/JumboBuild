@@ -427,7 +427,7 @@ jobs:
           PY
           uv build
           if uv run --no-sync python -c 'import pytest' >/dev/null 2>&1; then
-            uv run --no-sync pytest -q
+            uv run --no-sync python -m pytest -q
           else
             echo "::notice title=jumbo verify::pytest is not installed in the synced environment; build-only verification"
           fi
