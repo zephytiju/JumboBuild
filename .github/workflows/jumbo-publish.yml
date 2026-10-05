@@ -606,14 +606,19 @@ jobs:
               # in the JumboIndex, and every consumer resolution of the
               # record then fails (defect proven by lattice-runtime-core
               # 0.2.0 pinning
-              # juntai-documentation-capability==2.0.2). `uv version`
-              # runs AFTER the restore so the pipeline-owned version
-              # lands on the clean file; the build's dependency
-              # artifacts are already materialized under deps/.
+              # juntai-documentation-capability==2.0.2). `uv version
+              # --frozen` stamps the pipeline version on the clean file
+              # WITHOUT re-locking — a plain `uv version` would refresh
+              # uv.lock against the restored declarations, whose
+              # index-only internal ranges no public registry serves
+              # (the re-lock fails outright: LatticeRuntimeCore publish
+              # run 37366690541, `No solution found` with
+              # JUMBO_VERSION=0.3.0). The build's dependency artifacts
+              # are already materialized under deps/.
               if [[ -f "$RUNNER_TEMP/declared-pyproject.toml" ]]; then
                 cp "$RUNNER_TEMP/declared-pyproject.toml" pyproject.toml
               fi
-              uv version "$JUMBO_VERSION"
+              uv version --frozen "$JUMBO_VERSION"
               uv build --out-dir dist
               ;;
             npm)
