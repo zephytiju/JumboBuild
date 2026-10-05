@@ -56,25 +56,40 @@ record is the lock** (§8 below).
 ### Touch 1 — the forwarder file
 
 Copy [`templates/member-jumbo-publish.yml`](../templates/member-jumbo-publish.yml)
-into your repository as `.github/workflows/jumbo-publish.yml` and replace
-**both** `<ref>` occurrences with the zephytiju/JumboBuild ref you release
+into your repository as `.github/workflows/jumbo.yml` and replace **every**
+`<ref>` occurrence with the zephytiju/JumboBuild ref you verify and release
 with (a tag or a full commit SHA — the members pin a full SHA). The `uses:`
-line picks the workflow version; the `jumbobuild-ref` input pins the ref
+lines pick the workflow versions; the `jumbobuild-ref` inputs pin the ref
 jumbo is built from. Under `workflow_call` GitHub does not expose the
 `uses:` ref to the called workflow, so the input is the authoritative pin —
-keep the two identical.
+keep them identical.
 
-The template carries the **release-commit passthrough** (`commit: ${{
-inputs.commit }}`): push runs and plain dispatches release the triggering
-commit, and a dispatch with an explicit `commit` releases that exact
-existing commit — the re-release path a fingerprint-equal dedup re-run uses.
+The forwarder is the **single workflow file** a member repository carries,
+with two modes:
 
-That is the entire file. It carries **no release logic**: every release step
+- **PR-mode** (`pull_request` + `push` to the default branch) calls the
+  reusable [jumbo-verify](./jumbo-verify.md) workflow: `jumbo lock` →
+  materialize the recorded dependency artifacts → build → test, read-only.
+  This replaces any standalone per-PR verify workflow the repository
+  carried; repository-specific checks (lock-presence gates, secret scans,
+  boundary checks) move into the repository's own test surface (an npm
+  `verify` script or a pytest test), where the verify pipeline runs them.
+- **Dispatch-mode** (`workflow_dispatch`) calls the reusable
+  [jumbo-publish](./jumbo-publish.md) workflow with the **release-commit
+  passthrough** (`commit: ${{ inputs.commit }}`): plain dispatches release
+  the triggering commit, and a dispatch with an explicit `commit` releases
+  that exact existing commit — the re-release path a fingerprint-equal
+  dedup re-run uses.
+
+That is the entire file. It carries **no release and no verify logic**:
+every release step
 (lock → fingerprint → dedup → promote → publish on bump → index append →
 opt-in public registry) is owned by the reusable
 [`.github/workflows/jumbo-publish.yml`](../.github/workflows/jumbo-publish.yml)
-in this repository. If your repository needs release steps beyond calling
-the workflow, that is a design change — stop and return to the standard
+in this repository, and every verify step by
+[`.github/workflows/jumbo-verify.yml`](../.github/workflows/jumbo-verify.yml).
+If your repository needs workflow steps beyond calling these two workflows,
+that is a design change — stop and return to the standard
 first.
 
 ### Touch 2 — the pipeline listing
