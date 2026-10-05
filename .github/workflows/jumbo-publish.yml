@@ -420,6 +420,29 @@ jobs:
           echo "JUMBO_INDEX_PATH=${index_dir}" >> "$GITHUB_ENV"
           echo "JUMBO_INDEX_REPOSITORY=${INDEX_REPOSITORY}" >> "$GITHUB_ENV"
 
+      # 5b. Snapshot the pristine declared python manifest BEFORE jumbo
+      #     lock rewrites it (the same full-file mechanism jumbo-verify
+      #     uses): the injection rewrites every internal declaration to
+      #     the resolved record's exact pin and re-serializes the file
+      #     (TOML re-serialization drops comments — SPDX headers,
+      #     formatting). Everything that builds or packs must see the
+      #     developer's file: a wheel packed from the materialized
+      #     manifest carries the exact pins in Requires-Dist, and an
+      #     exact internal pin can name a version that exists only in
+      #     the JumboIndex — consumer resolution then fails outright
+      #     (lattice-runtime-core 0.2.0 pinning
+      #     juntai-documentation-capability==2.0.2). The snapshot is
+      #     restored on the python build path after materialization,
+      #     before `uv version` sets the pipeline version on the clean
+      #     file. The npm branch keeps its marker-based field restore
+      #     (deps/.jumbo-sources.json) — package.json carries no
+      #     comments, and that contract is already pinned by its own
+      #     offline tests.
+      - name: Snapshot the declared python manifest
+        run: |
+          set -euo pipefail
+          if [[ -f pyproject.toml ]]; then cp pyproject.toml "$RUNNER_TEMP/declared-pyproject.toml"; fi
+
       # 6. The standard jumbo release steps — identical commands to the
       #    CircleCI executor, identical outputs. jumbo prefixes its stdout
       #    with progress lines; `sed -n '/^{/,$p'` keeps the JSON document
@@ -571,6 +594,25 @@ jobs:
           mkdir -p dist
           case "${{ steps.identity.outputs.ecosystem }}" in
             python)
+              # Restore the declared manifest verbatim BEFORE the
+              # version is set and the wheel is packed — the python
+              # twin of the npm branch's clean-pack restore. `jumbo
+              # lock` rewrote every internal declaration to the
+              # resolved record's exact pin and re-serialized the file
+              # (dropping comments); the released wheel's Requires-Dist
+              # must carry the developer's declared ranges, not the
+              # materialized exact pins: an exact internal pin baked
+              # into wheel metadata can name a version that exists only
+              # in the JumboIndex, and every consumer resolution of the
+              # record then fails (defect proven by lattice-runtime-core
+              # 0.2.0 pinning
+              # juntai-documentation-capability==2.0.2). `uv version`
+              # runs AFTER the restore so the pipeline-owned version
+              # lands on the clean file; the build's dependency
+              # artifacts are already materialized under deps/.
+              if [[ -f "$RUNNER_TEMP/declared-pyproject.toml" ]]; then
+                cp "$RUNNER_TEMP/declared-pyproject.toml" pyproject.toml
+              fi
               uv version "$JUMBO_VERSION"
               uv build --out-dir dist
               ;;
