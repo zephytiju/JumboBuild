@@ -220,15 +220,19 @@ fn the_npm_pipeline_refreshes_installs_restores_then_verifies() {
     );
 }
 
-/// The python verify pipeline: sync (all extras) → build → gated pytest.
+/// The python verify pipeline: sync (all extras) → restore the clean
+/// declarations → build → gated pytest.
 #[test]
-fn the_python_pipeline_syncs_builds_then_tests() {
+fn the_python_pipeline_syncs_restores_builds_then_tests() {
     let workflow = include_str!("../.github/workflows/jumbo-verify.yml");
     let block = step_block(workflow, PYTHON_VERIFY_STEP)
         .unwrap_or_else(|| panic!("step `{PYTHON_VERIFY_STEP}` not found in jumbo-verify.yml"));
     let sync = block
         .find("uv sync --all-extras")
         .unwrap_or_else(|| panic!("the python pipeline must sync every extra:\n{block}"));
+    let restore = block
+        .find(".jumbo-sources.json")
+        .unwrap_or_else(|| panic!("the python pipeline must restore the clean declarations from the injection marker:\n{block}"));
     let build = block
         .find("uv build")
         .unwrap_or_else(|| panic!("the python pipeline must run the standard build:\n{block}"));
@@ -236,9 +240,18 @@ fn the_python_pipeline_syncs_builds_then_tests() {
         .find("pytest")
         .unwrap_or_else(|| panic!("the python pipeline must run pytest:\n{block}"));
     assert!(
-        sync < build && build < pytest,
-        "the python pipeline must run uv sync → uv build → pytest (jumbo's python \
-         test pipeline order):\n{block}"
+        sync < restore && restore < build && build < pytest,
+        "the python pipeline must run uv sync → restore clean declarations → uv build → \
+         pytest (jumbo's python test pipeline order, with the same restore the npm \
+         branch applies — the manifest's rewritten exact pins must never reach anything \
+         that packs or asserts it):\n{block}"
+    );
+    // The restore maps the marker's rewritten strings back to the declared
+    // ones (never a blind delete — [tool.uv.sources] must survive for the
+    // synced environment to keep resolving the materialized wheels).
+    assert!(
+        block.contains("source[\"rewritten\"]") && block.contains("source[\"declared\"]"),
+        "the restore uses the injection marker's rewritten→declared mapping:\n{block}"
     );
     assert!(
         block.contains("import pytest"),

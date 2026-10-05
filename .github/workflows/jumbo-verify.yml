@@ -394,13 +394,37 @@ jobs:
       #     python test pipeline runs): sync the environment against the
       #     jumbo-generated lock (the materialized file: wheels resolve
       #     through [tool.uv.sources]) with every declared extra so test
-      #     dependencies install, run the standard build, then pytest when
-      #     the project carries tests.
+      #     dependencies install, restore the clean dependency
+      #     declarations, run the standard build, then pytest when the
+      #     project carries tests. The restore is the python twin of the
+      #     npm branch's jq restore: `jumbo lock` rewrites every internal
+      #     declaration to the resolved record's exact pin (the
+      #     materialized form uv must see), so AFTER the sync anything
+      #     that packs or asserts the manifest — the build's wheel
+      #     metadata, the repository's own contract tests — must see the
+      #     developer's declared ranges again. The injection marker
+      #     (deps/.jumbo-sources.json) carries each entry's original
+      #     declared and rewritten strings.
       - name: Verify (python)
         if: steps.eco.outputs.ecosystem == 'python'
         run: |
           set -euo pipefail
           uv sync --all-extras
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          marker = Path("deps/.jumbo-sources.json")
+          if marker.exists():
+              manifest = Path("pyproject.toml")
+              text = manifest.read_text(encoding="utf-8")
+              for source in json.loads(marker.read_text(encoding="utf-8"))["sources"]:
+                  rewritten = source["rewritten"]
+                  declared = source["declared"]
+                  if rewritten != declared and rewritten in text:
+                      text = text.replace(rewritten, declared, 1)
+              manifest.write_text(text, encoding="utf-8")
+          PY
           uv build
           if uv run --no-sync python -c 'import pytest' >/dev/null 2>&1; then
             uv run --no-sync pytest -q
