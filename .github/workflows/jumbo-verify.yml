@@ -1,0 +1,423 @@
+# Reusable jumbo member verification workflow (Jumbo Build & Versioning
+# Standard, §3.5 "Executors and the Publication Contract").
+#
+# Member PR verification runs the SAME jumbo pipeline the publication
+# executor runs — resolve the internal dependencies from the JumboIndex
+# (`jumbo lock`), materialize the recorded dependency artifacts (or source
+# fallbacks) under deps/ with the manifest repointed at them, then build
+# and test — minus every publication-side step: no fingerprint, no dedup,
+# no promote, no GitHub Release, no index append, no registry publication.
+# A member repository verifies with NO per-repo workflow logic: its
+# dispatch-only jumbo forwarder additionally triggers this workflow on
+# pull_request (and on push to the default branch), so every repository
+# carries exactly ONE workflow file.
+#
+# Caller usage (see docs/jumbo-verify.md for the full contract):
+#
+#   jobs:
+#     verify:
+#       if: github.event_name != 'workflow_dispatch'
+#       uses: zephytiju/JumboBuild/.github/workflows/jumbo-verify.yml@<ref>
+#       secrets: inherit
+#       with:
+#         jumbobuild-ref: <ref>   # the same JumboBuild ref the uses: line pins
+#       permissions:
+#         contents: read
+#
+# Required secrets (org-level, passed with `secrets: inherit`). The
+# workflow resolves the index/dependency authentication at run time, in
+# this order (the read-only half of jumbo-publish's resolution):
+#
+#   1. PREFERRED — the org CI GitHub App pair:
+#        JUNTAI_CI_APP_ID + JUNTAI_CI_APP_PRIVATE_KEY
+#      One short-lived ORG-WIDE installation token (contents: read,
+#      revoked when the job ends) is minted for the JumboBuild checkout,
+#      the JumboIndex fetch, and dependency materialization — the same
+#      credential shape jumbo-publish's dependency step uses, because
+#      materialization fetches recorded release assets and source-fallback
+#      trees from arbitrary PRIVATE member repositories and cannot be
+#      pre-scoped. The private key flows only from its secret into the
+#      minting action — never echoed, logged, or written to a file — and
+#      the action accepts the key as raw PEM or base64-encoded PEM (the
+#      tolerant org-wide reader; the same action and pin jumbo-publish
+#      uses).
+#   2. FALLBACK — the static secret (backward compatible):
+#        JUNTAI_GITHUB_ARTIFACT_TOKEN - reads the private JumboBuild
+#          checkout and clones the private JumboIndex repository (the
+#          caller's default GITHUB_TOKEN cannot cross repository
+#          boundaries); also the dependency-fetch fallback credential.
+#   3. NEITHER PATH AVAILABLE — the workflow fails fast with an
+#      actionable error naming both options (before any build work).
+#
+# No index-write credential is read: verification never writes the index.
+#
+# Credentials enter exclusively through secrets/env. No credential
+# literals appear in this workflow, and outbound traffic goes to
+# github.com plus the language registries (pypi.org / registry.npmjs.org)
+# the standard build tools use.
+name: jumbo verify
+
+on:
+  workflow_call:
+    inputs:
+      commit:
+        description: "Commit SHA of the caller repository to verify (default: the pull request head, else the triggering commit)"
+        type: string
+        default: ""
+      jumbobuild-ref:
+        description: "JumboBuild ref (tag, branch, or full SHA) to build jumbo from — pin the same ref the uses: line uses. Required when called with workflow_call; empty falls back to this workflow's own ref (direct runs on JumboBuild)."
+        type: string
+        default: ""
+      ecosystem:
+        description: "python | npm | auto (detected from the package manifest: pyproject.toml -> python, package.json -> npm)"
+        type: string
+        default: "auto"
+      manifest:
+        description: "Manifest to resolve, for mixed npm+python repositories whose python side is not jumbo-lockable yet (pass package.json to verify the npm side); forwarded to `jumbo lock --manifest`"
+        type: string
+        default: ""
+      index-repository:
+        description: "JumboIndex repository (owner/name)"
+        type: string
+        default: "zephytiju/JumboIndex"
+
+# Verification is read-only: the caller's GITHUB_TOKEN never needs more
+# than contents: read (the checkout of the caller repository itself).
+# Reusable workflows cannot elevate permissions; the calling job grants
+# this and the workflow only downgrades.
+permissions:
+  contents: read
+
+# PR verification keeps exactly one run per ref; a new push to the same
+# PR supersedes the stale run (unlike publication, nothing durable is
+# produced, so cancellation is safe).
+concurrency:
+  group: jumbo-verify-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Resolve the verify commit and the JumboBuild coordinates
+        id: coords
+        env:
+          INPUT_COMMIT: ${{ inputs.commit }}
+          INPUT_JUMBOBUILD_REF: ${{ inputs.jumbobuild-ref }}
+        run: |
+          set -euo pipefail
+          commit="${INPUT_COMMIT:-${{ github.event.pull_request.head.sha || github.sha }}}"
+          # JumboBuild coordinates: the repository owning THIS workflow
+          # file, and the ref jumbo is built from — the same resolution
+          # jumbo-publish performs (GITHUB_WORKFLOW_REF names the CALLER's
+          # file and ref under workflow_call, so reusable callers must pin
+          # the build ref explicitly via the jumbobuild-ref input).
+          build_repo="zephytiju/JumboBuild"
+          build_ref="${INPUT_JUMBOBUILD_REF:-}"
+          if [[ -z "$build_ref" ]]; then
+            workflow_ref="${GITHUB_WORKFLOW_REF:?GITHUB_WORKFLOW_REF is required}"
+            repo_and_path="${workflow_ref%@*}"
+            called_repo="${repo_and_path%%/.github/*}"
+            if [[ "$called_repo" == "$build_repo" ]]; then
+              build_ref="${workflow_ref##*@}"
+            else
+              echo "::error title=jumbo coordinates::the jumbobuild-ref input is required when jumbo-verify is called with workflow_call (GITHUB_WORKFLOW_REF names the caller workflow ${called_repo}, not ${build_repo}). Pin the same JumboBuild ref the uses: line uses." >&2
+              exit 1
+            fi
+          fi
+          if [[ -z "$build_ref" || ! "$build_repo" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]]; then
+            echo "invalid JumboBuild coordinates: repo=${build_repo} ref=${build_ref}" >&2
+            exit 1
+          fi
+          {
+            echo "commit=${commit}"
+            echo "build-repo=${build_repo}"
+            echo "build-ref=${build_ref}"
+          } >> "$GITHUB_OUTPUT"
+          # jumbo command outputs live OUTSIDE the caller checkout, mirroring
+          # jumbo-publish (nothing this workflow writes may dirty the caller
+          # tree beyond jumbo's own lock/deps overlays).
+          jumbo_state="${RUNNER_TEMP}/jumbo-state"
+          mkdir -p "$jumbo_state"
+          echo "JUMBO_OUT=${jumbo_state}" >> "$GITHUB_ENV"
+          echo "Verifying ${GITHUB_REPOSITORY}@${commit} with jumbo from ${build_repo}@${build_ref}"
+
+      # 1. Resolve the index/dependency authentication path (presence
+      #    checks only: no secret VALUE enters this step). Preferred: the
+      #    org CI GitHub App pair; fallback: the static artifact token.
+      #    Neither available: fail fast — the caller's default
+      #    GITHUB_TOKEN cannot read the private JumboBuild/JumboIndex
+      #    repositories, so continuing would only fail later at the
+      #    checkout or the index clone.
+      - name: Resolve the index/dependency authentication path
+        id: auth
+        env:
+          INDEX_REPOSITORY: ${{ inputs.index-repository }}
+        run: |
+          set -euo pipefail
+          app_id_present='${{ secrets.JUNTAI_CI_APP_ID != '' }}'
+          app_key_present='${{ secrets.JUNTAI_CI_APP_PRIVATE_KEY != '' }}'
+          artifact_token_present='${{ secrets.JUNTAI_GITHUB_ARTIFACT_TOKEN != '' }}'
+          if [[ ! "$INDEX_REPOSITORY" =~ ^([A-Za-z0-9._-]+)/([A-Za-z0-9._-]+)$ ]]; then
+            echo "::error title=jumbo verify auth::index-repository must be owner/name (got: ${INDEX_REPOSITORY})" >&2
+            exit 1
+          fi
+          echo "index-owner=${BASH_REMATCH[1]}" >> "$GITHUB_OUTPUT"
+          echo "index-name=${BASH_REMATCH[2]}" >> "$GITHUB_OUTPUT"
+          if [[ "$app_id_present" == true && "$app_key_present" == true ]]; then
+            echo "mode=app" >> "$GITHUB_OUTPUT"
+            echo "index auth: GitHub App pair present - a short-lived org-wide read token will be minted"
+          elif [[ "$artifact_token_present" == true ]]; then
+            if [[ "$app_id_present" == true || "$app_key_present" == true ]]; then
+              echo "::warning title=jumbo verify auth::only one of JUNTAI_CI_APP_ID / JUNTAI_CI_APP_PRIVATE_KEY is set - falling back to the static JUNTAI_GITHUB_ARTIFACT_TOKEN secret (set both to use the preferred App path)"
+            fi
+            echo "mode=static" >> "$GITHUB_OUTPUT"
+            echo "index auth: using the static JUNTAI_GITHUB_ARTIFACT_TOKEN (checkouts + index fetch)"
+          else
+            echo "::error title=jumbo verify auth::no index/dependency credentials are available to this run. Configure one of: (1) the org CI GitHub App pair - secrets JUNTAI_CI_APP_ID and JUNTAI_CI_APP_PRIVATE_KEY (preferred: a short-lived installation token, no long-lived credential is stored); or (2) the static secret JUNTAI_GITHUB_ARTIFACT_TOKEN (read access to zephytiju/JumboBuild and the index repository). See docs/jumbo-verify.md in zephytiju/JumboBuild." >&2
+            exit 1
+          fi
+
+      # 2. Mint the org-wide dependency read token (App path only) — the
+      #    same shape jumbo-publish's dependency step mints: dependency
+      #    materialization fetches recorded release assets and
+      #    source-fallback trees from PRIVATE member repositories, so its
+      #    credential cannot be pre-scoped to named repositories. The org
+      #    CI app is installed on every organization repository, exactly
+      #    the reach a dependency fetch may need, downgraded to
+      #    contents: read and revoked when the job ends. The minting
+      #    action is pinned to the same full commit SHA jumbo-publish
+      #    pins; it accepts the private key as raw or base64-encoded PEM
+      #    and the key material never leaves the action.
+      - name: Mint the org-wide dependency read token
+        id: deps-token
+        if: steps.auth.outputs.mode == 'app'
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.JUNTAI_CI_APP_ID }}
+          private-key: ${{ secrets.JUNTAI_CI_APP_PRIVATE_KEY }}
+          owner: ${{ steps.auth.outputs.index-owner }}
+          permission-contents: read
+
+      # 3. The caller repository at the verify commit (the pull request
+      #    head on PR events). persist-credentials keeps no token in the
+      #    local git config.
+      - name: Check out the caller repository at the verify commit
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ steps.coords.outputs.commit }}
+          persist-credentials: false
+
+      # 4. JumboBuild at the ref the caller pinned; jumbo is built from it.
+      #    Cross-repository access needs the minted token or the static
+      #    artifact token (resolved above; fail-fast when neither exists).
+      - name: Check out JumboBuild at the pinned ref
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ steps.coords.outputs.build-repo }}
+          ref: ${{ steps.coords.outputs.build-ref }}
+          path: jumbobuild
+          persist-credentials: false
+          token: ${{ steps.deps-token.outputs.token || secrets.JUNTAI_GITHUB_ARTIFACT_TOKEN }}
+
+      - name: Install the Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      # Restore/build happen at the pre-move path (see the move step below);
+      # rust-cache's post-save looks for the directory there and skips the
+      # target-dir save when it is gone — a perf cost, never a correctness
+      # issue (the cargo-home part of the cache still saves).
+      - name: Cache the cargo build of jumbo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: jumbobuild
+
+      - name: Build jumbo from the pinned JumboBuild commit
+        run: cargo build --release --locked
+        working-directory: jumbobuild
+
+      # The self-checkout must not remain inside the caller's working tree:
+      # an untracked jumbobuild/ directory would shadow the caller tree for
+      # every later step. Same-volume rename; identical to jumbo-publish.
+      - name: Move the JumboBuild checkout out of the caller working tree
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/jumbo-build"
+          mv "$GITHUB_WORKSPACE/jumbobuild" "$RUNNER_TEMP/jumbo-build/jumbobuild"
+
+      - name: Put jumbo on PATH
+        run: echo "$RUNNER_TEMP/jumbo-build/jumbobuild/target/release" >> "$GITHUB_PATH"
+
+      # uv runs the Python side of the standard verification (lock, sync,
+      # build, test) and fetches the interpreter the caller's
+      # requires-python declares. Unconditional so ecosystem detection
+      # stays jumbo's job.
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+
+      # Node runs the npm side (lock generation via `npm install
+      # --package-lock-only`, clean install, build/test scripts). Pinned:
+      # the runner-default npm (11.0-11.4 era) carries an Arborist crash
+      # on some member trees; npm 11.9 (node 24.14) is proven against
+      # every current member manifest (the same pin jumbo-publish uses).
+      - name: Set up node (pinned for lock generation)
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24.14.0"
+          # No committed lock exists on jumbo members (standard §2.4), so
+          # setup-node's auto package-manager cache would hard-fail.
+          package-manager-cache: false
+
+      # 5. The Jumbo index (private), authenticated with the minted token
+      #    or the static artifact token.
+      - name: Fetch the Jumbo index
+        env:
+          GH_TOKEN: ${{ steps.deps-token.outputs.token || secrets.JUNTAI_GITHUB_ARTIFACT_TOKEN }}
+          INDEX_REPOSITORY: ${{ inputs.index-repository }}
+        run: |
+          set -euo pipefail
+          : "${INDEX_REPOSITORY:?input index-repository is required}"
+          index_dir="${RUNNER_TEMP}/jumbo-index"
+          gh repo clone "$INDEX_REPOSITORY" "$index_dir"
+          echo "JUMBO_INDEX_PATH=${index_dir}" >> "$GITHUB_ENV"
+          echo "JUMBO_INDEX_REPOSITORY=${INDEX_REPOSITORY}" >> "$GITHUB_ENV"
+
+      # 6. Ecosystem resolution: the explicit input wins; `auto` follows
+      #    jumbo lock's preference (pyproject.toml -> python, else
+      #    package.json -> npm). The optional manifest input (mixed
+      #    npm+python repositories) implies its own ecosystem.
+      - name: Resolve the ecosystem
+        id: eco
+        env:
+          INPUT_ECOSYSTEM: ${{ inputs.ecosystem }}
+          INPUT_MANIFEST: ${{ inputs.manifest }}
+        run: |
+          set -euo pipefail
+          ecosystem="${INPUT_ECOSYSTEM}"
+          manifest="${INPUT_MANIFEST}"
+          if [[ "$ecosystem" == "auto" ]]; then
+            if [[ -n "$manifest" ]]; then
+              case "$manifest" in
+                package.json) ecosystem="npm" ;;
+                pyproject.toml) ecosystem="python" ;;
+                *) echo "::error title=jumbo verify::manifest must be package.json or pyproject.toml (got: ${manifest})" >&2; exit 1 ;;
+              esac
+            elif [[ -f pyproject.toml ]]; then
+              ecosystem="python"
+            elif [[ -f package.json ]]; then
+              ecosystem="npm"
+            else
+              echo "::error title=jumbo verify::no package manifest in $(pwd) (expected pyproject.toml or package.json); pass ecosystem + manifest explicitly" >&2
+              exit 1
+            fi
+          fi
+          case "$ecosystem" in
+            python|npm) ;;
+            *) echo "::error title=jumbo verify::unsupported ecosystem: ${ecosystem}" >&2; exit 1 ;;
+          esac
+          echo "ecosystem=${ecosystem}" >> "$GITHUB_OUTPUT"
+          echo "Verifying the ${ecosystem} closure"
+
+      # 7. The standard resolve: generate the language lock with jumbo's
+      #    injected internal sources (the same `jumbo lock` the release
+      #    executor and the jumbo-resolve action run).
+      - name: jumbo lock (resolve and generate the language lock)
+        env:
+          JUMBO_RESOLVE_MANIFEST: ${{ inputs.manifest }}
+        run: |
+          set -euo pipefail
+          if [[ -n "$JUMBO_RESOLVE_MANIFEST" ]]; then
+            jumbo lock --manifest "$JUMBO_RESOLVE_MANIFEST"
+          else
+            jumbo lock
+          fi
+
+      # 8. Materialize the recorded dependency artifacts: replace every
+      #    internal dependency's resolution-only stub under deps/<slug>/
+      #    with the recorded, SHA-256-verified release artifact (or the
+      #    real source at the recorded commit), repointing the manifest at
+      #    it — the identical script the jumbo-publish build path runs, so
+      #    verification consumes exactly what a release build would. The
+      #    fetch must be AUTHENTICATED (private assets answer 404
+      #    anonymously).
+      - name: Materialize the recorded dependency artifacts
+        env:
+          GH_TOKEN: ${{ steps.deps-token.outputs.token || secrets.JUNTAI_GITHUB_ARTIFACT_TOKEN }}
+        run: |
+          set -euo pipefail
+          bash "$RUNNER_TEMP/jumbo-build/jumbobuild/scripts/jumbo_publish_materialize_deps.sh" "${{ steps.eco.outputs.ecosystem }}"
+
+      # 9. Build and test — the npm pipeline (the same front the release
+      #    build runs): refresh the lock against the materialized
+      #    manifest, clean-install it, restore the clean dependency
+      #    declarations (the materialization pointers must never leak into
+      #    anything that packs or asserts the manifest), then the
+      #    project's own verify/typecheck/test/build scripts. The test
+      #    step mirrors jumbo's node pipeline: `npm test` when a real
+      #    script is configured (npm's generated placeholder counts as
+      #    absent), else the Node test runner when test files exist.
+      - name: Verify (npm)
+        if: steps.eco.outputs.ecosystem == 'npm'
+        run: |
+          set -euo pipefail
+          npm install --package-lock-only --ignore-scripts
+          npm ci
+          if [[ -f deps/.jumbo-sources.json ]]; then
+            jq -s '.[1].sources as $src | reduce $src[] as $s (.[0];
+              .[$s.location | split(" ") | last][$s.name] = $s.declared)' \
+              package.json deps/.jumbo-sources.json > package.json.clean
+            mv package.json.clean package.json
+          fi
+          npm run verify --if-present
+          npm run typecheck --if-present
+          test_script="$(jq -r '.scripts.test // empty' package.json)"
+          if [[ -n "$test_script" && "$test_script" != *"no test specified"* ]]; then
+            npm test
+          elif find . \( -name node_modules -o -name .git -o -name deps -o -name dist \) -prune -o \
+              -type f \( -name '*.test.js' -o -name '*.test.mjs' -o -name '*.test.cjs' \
+              -o -name '*-test.js' -o -name '*-test.mjs' -o -name '*-test.cjs' \
+              -o -name '*_test.js' -o -name '*_test.mjs' -o -name '*_test.cjs' \) \
+              -print 2>/dev/null | grep -q .; then
+            echo "No test script configured; running the Node test runner"
+            node --test
+          else
+            echo "::notice title=jumbo verify::no npm test script and no Node test files; nothing to test"
+          fi
+          npm run build --if-present
+
+      # 9'. Build and test — the python pipeline (the same steps jumbo's
+      #     python test pipeline runs): sync the environment against the
+      #     jumbo-generated lock (the materialized file: wheels resolve
+      #     through [tool.uv.sources]) with every declared extra so test
+      #     dependencies install, run the standard build, then pytest when
+      #     the project carries tests.
+      - name: Verify (python)
+        if: steps.eco.outputs.ecosystem == 'python'
+        run: |
+          set -euo pipefail
+          uv sync --all-extras
+          uv build
+          if uv run --no-sync python -c 'import pytest' >/dev/null 2>&1; then
+            uv run --no-sync pytest -q
+          else
+            echo "::notice title=jumbo verify::pytest is not installed in the synced environment; build-only verification"
+          fi
+
+      - name: Verification summary
+        if: always()
+        run: |
+          set -euo pipefail
+          {
+            echo "## jumbo verify"
+            echo
+            echo "- repository: \`${GITHUB_REPOSITORY}\`"
+            echo "- commit: \`${{ steps.coords.outputs.commit }}\`"
+            echo "- jumbo: \`${{ steps.coords.outputs.build-ref }}\`"
+            echo "- ecosystem: \`${{ steps.eco.outputs.ecosystem }}\`"
+            echo "- pipeline: lock → materialize → build → test (no publish, no index append)"
+          } >> "$GITHUB_STEP_SUMMARY"

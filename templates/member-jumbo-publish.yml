@@ -1,46 +1,60 @@
-# Member forwarder for jumbo publication (Jumbo Build & Versioning Standard,
-# section 3.5 "Executors and the Publication Contract").
+# Member forwarder for jumbo (Jumbo Build & Versioning Standard, section
+# 3.5 "Executors and the Publication Contract").
 #
 # This is a TEMPLATE for member repositories — do not edit it here and do not
 # expect it to run inside JumboBuild: it lives outside .github/workflows so
 # GitHub Actions never picks it up in this repository.
 #
+# The forwarder is the SINGLE workflow file a member repository carries,
+# with two modes:
+#   - PR-mode (pull_request + push to the default branch) calls the
+#     reusable jumbo-verify workflow: jumbo lock → materialize the
+#     recorded dependency artifacts → build → test. No publication steps.
+#   - Dispatch-mode (workflow_dispatch) calls the reusable jumbo-publish
+#     workflow: the unchanged release path (lock → fingerprint → dedup →
+#     promote → build/publish on bump → index append).
+#
 # How to adopt (see docs/member-onboarding.md in zephytiju/JumboBuild for the
-# full walkthrough; docs/jumbo-publish.md for the executor contract):
+# full walkthrough; docs/jumbo-verify.md and docs/jumbo-publish.md for the
+# executor contracts):
 #   1. Copy this file into your repository as
-#      .github/workflows/jumbo-publish.yml (the file name is yours to choose;
+#      .github/workflows/jumbo.yml (the file name is yours to choose;
 #      only the location is fixed).
-#   2. Replace both <ref> occurrences below with the zephytiju/JumboBuild
-#      ref you release with — a tag or a full commit SHA. The uses: line
-#      picks the workflow version; the jumbobuild-ref input pins the ref the
-#      reusable workflow builds the jumbo binary from (under workflow_call
-#      GitHub does not expose the uses: ref to the called workflow, so the
-#      input is the authoritative pin — keep both identical).
-#   3. Nothing else. This forwarder carries NO release logic: every release
-#      step (lock, fingerprint, dedup, promote, publish on bump, index
-#      append, opt-in public registry publication) is owned by the reusable
-#      jumbo-publish workflow. If your repository needs release steps beyond
-#      calling this workflow, that is a design change — stop and return to
-#      the Jumbo Build & Versioning Standard first.
+#   2. Replace every <ref> occurrence below with the zephytiju/JumboBuild
+#      ref you verify and release with — a tag or a full commit SHA. The
+#      uses: lines pick the workflow versions; the jumbobuild-ref inputs
+#      pin the ref the reusable workflows build the jumbo binary from
+#      (under workflow_call GitHub does not expose the uses: ref to the
+#      called workflow, so the input is the authoritative pin — keep them
+#      identical).
+#   3. Nothing else. This forwarder carries NO release and NO verify
+#      logic: repository-specific checks (lock-presence gates, secret
+#      scans, boundary checks) belong in the repository's own test
+#      surface (an npm `verify` script or a pytest test), where the
+#      jumbo-verify pipeline runs them. If your repository needs workflow
+#      steps beyond calling these two workflows, that is a design change —
+#      stop and return to the Jumbo Build & Versioning Standard first.
 #
 # Secrets flow in with `secrets: inherit` from your repository/org settings.
 # Index/artifact authentication resolves in this order (docs/jumbo-publish.md
-# in zephytiju/JumboBuild has the details):
+# and docs/jumbo-verify.md in zephytiju/JumboBuild have the details):
 #   1. PREFERRED — the org CI GitHub App pair JUNTAI_CI_APP_ID +
-#      JUNTAI_CI_APP_PRIVATE_KEY: the executor mints a short-lived
-#      installation token (contents read+write, scoped to JumboBuild and the
-#      index repository, revoked at job end) for the checkouts, the index
-#      fetch, and the index append. No long-lived credential is stored.
+#      JUNTAI_CI_APP_PRIVATE_KEY: jumbo-verify mints a short-lived
+#      org-wide read-only installation token; jumbo-publish additionally
+#      mints a write-scoped token for the index append. The minting
+#      action accepts the private key as raw or base64-encoded PEM; no
+#      long-lived credential is stored.
 #   2. FALLBACK — the static secrets JUNTAI_GITHUB_ARTIFACT_TOKEN (read on
-#      JumboBuild + JumboIndex) and JUNTAI_INDEX_TOKEN (contents:write on
-#      JumboIndex). If neither the App pair nor these secrets exist, the run
-#      fails fast with an actionable error naming both options.
-#   PYPI_TOKEN / NPM_TOKEN are needed only when the reusable workflow is
-#   called with publish-to-public-registry enabled. Tokens are consumed via
+#      JumboBuild + JumboIndex) and, for publication, JUNTAI_INDEX_TOKEN
+#      (contents:write on JumboIndex). If neither the App pair nor the
+#      artifact token exists, the run fails fast with an actionable error.
+#   PYPI_TOKEN / NPM_TOKEN are needed only when jumbo-publish is called
+#   with publish-to-public-registry enabled. Tokens are consumed via
 #   secrets and environment only — never as literals in any file.
-name: jumbo publish
+name: jumbo
 
 on:
+  pull_request:
   push:
     branches: [main]
   workflow_dispatch:
@@ -51,19 +65,38 @@ on:
         default: ""
 
 jobs:
+  # PR-mode: verify every pull request (and pushes to main) through jumbo
+  # — the same lock → materialize → build → test pipeline the publication
+  # executor runs, minus every publish/index step.
+  verify:
+    if: github.event_name != 'workflow_dispatch'
+    uses: zephytiju/JumboBuild/.github/workflows/jumbo-verify.yml@<ref>
+    secrets: inherit
+    with:
+      # The same JumboBuild ref the uses: line pins — the reusable
+      # workflow builds the jumbo binary from exactly this ref.
+      jumbobuild-ref: <ref>
+      # Optional overrides (rarely needed): ecosystem (python|npm|auto,
+      # default auto-detect from the manifest) and manifest (mixed
+      # npm+python repositories whose python side is not jumbo-lockable
+      # yet pass package.json to verify the npm side).
+      # ecosystem: npm
+      # manifest: package.json
+    # Read-only: the verify pipeline never writes anything.
+    permissions:
+      contents: read
+
+  # Dispatch-mode: the release path (unchanged jumbo-publish contract).
   jumbo-publish:
+    if: github.event_name == 'workflow_dispatch'
     uses: zephytiju/JumboBuild/.github/workflows/jumbo-publish.yml@<ref>
     secrets: inherit
     with:
-      # The same JumboBuild ref the uses: line pins — the reusable workflow
-      # builds the jumbo binary from exactly this ref.
       jumbobuild-ref: <ref>
       # Release-commit passthrough (the executor's documented `commit`
-      # input): empty on push runs and on plain dispatches means the
-      # triggering commit; an explicit dispatch input releases that exact
-      # existing commit — the re-release path a fingerprint-equal dedup
-      # re-run uses. The executor itself defaults an empty value to
-      # GITHUB_SHA, so push behavior is unchanged.
+      # input): empty on plain dispatches means the triggering commit; an
+      # explicit dispatch input releases that exact existing commit — the
+      # re-release path a fingerprint-equal dedup re-run uses.
       commit: ${{ inputs.commit }}
     # Reusable workflows cannot elevate permissions; the calling job must
     # grant what the called workflow needs. contents: write covers the
