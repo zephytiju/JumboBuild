@@ -31,6 +31,19 @@
 //!    (proof: @zephytiju/software-development-cicd-interfaces@1.0.0 =
 //!    package.json + README only).
 //!
+//! 4. **The python clean-manifest restore contract.** The python
+//!    branch of the "Build the artifacts" step must restore the
+//!    developer's declared pyproject.toml (snapshotted before `jumbo
+//!    lock` rewrote it) BEFORE `uv version` sets the pipeline version
+//!    and `uv build` packs the wheel — the exact pins jumbo lock writes
+//!    for materialization must never reach the released wheel's
+//!    Requires-Dist, where an exact internal pin can name an
+//!    index-only version no consumer can resolve (proof:
+//!    lattice-runtime-core 0.2.0 pinning
+//!    juntai-documentation-capability==2.0.2). The full-file restore is
+//!    the python twin of the npm branch's marker-based restore and the
+//!    identical mechanism jumbo-verify runs after its `uv sync`.
+//!
 //! In every case the token enters only through the environment: never a
 //! literal, never a log line, never a command line.
 
@@ -39,6 +52,7 @@ const REPULL_STEP: &str = "Pull the recorded artifact (fingerprint hit - build s
 const MATERIALIZE_STEP: &str = "Materialize the recorded dependency artifacts (build path)";
 const DEPS_TOKEN_MINT_STEP: &str = "Mint the org-wide dependency read token";
 const BUILD_STEP: &str = "Build the artifacts at the jumbo-computed version";
+const SNAPSHOT_STEP: &str = "Snapshot the declared python manifest";
 
 /// Extract one step's YAML block from the workflow text: from its
 /// `- name:` line to the next sibling step (`- name:` at the same
@@ -202,6 +216,63 @@ fn the_npm_build_path_builds_before_packing() {
         "the node setup step is gated to the npm build path:\n{setup}"
     );
 }
+
+/// The python build path restores the declared manifest (full file,
+/// snapshotted before the injection) BEFORE `uv version` stamps the
+/// pipeline version and `uv build` packs the wheel — the materialized
+/// exact pins must never reach the released wheel's Requires-Dist.
+#[test]
+fn the_python_build_path_restores_the_declared_manifest_before_building() {
+    let workflow = include_str!("../.github/workflows/jumbo-publish.yml");
+    let block = step_block(workflow, BUILD_STEP)
+        .unwrap_or_else(|| panic!("step `{BUILD_STEP}` not found in jumbo-publish.yml"));
+    // The restore is the FULL declared file, not a string mapping: the
+    // injection re-serializes the manifest and drops comments (SPDX
+    // headers), and a string-level restore leaves the exact pins in
+    // place whenever the rewritten form differs from the mapping's
+    // expectation. (Same rationale as the jumbo-verify contract.)
+    let restore = block
+        .find("cp \"$RUNNER_TEMP/declared-pyproject.toml\" pyproject.toml")
+        .unwrap_or_else(|| panic!("the python branch must restore the declared manifest verbatim:\n{block}"));
+    let version = block
+        .find("uv version \"$JUMBO_VERSION\"")
+        .unwrap_or_else(|| panic!("the python branch must set the pipeline version:\n{block}"));
+    let build = block
+        .find("uv build --out-dir dist")
+        .unwrap_or_else(|| panic!("the python branch must run the standard build:\n{block}"));
+    assert!(
+        restore < version && version < build,
+        "the python branch must run restore → uv version → uv build (the declared ranges — \
+         not the materialized exact pins — reach the wheel metadata, and the pipeline-owned \
+         version lands on the clean file):\n{block}"
+    );
+}
+
+/// The declared python manifest is snapshotted after the checkout and
+/// BEFORE `jumbo lock` rewrites it; only the pristine file can be
+/// restored on the build path.
+#[test]
+fn the_declared_python_manifest_is_snapshotted_before_the_lock() {
+    let workflow = include_str!("../.github/workflows/jumbo-publish.yml");
+    let snapshot = step_block(workflow, SNAPSHOT_STEP)
+        .unwrap_or_else(|| panic!("step `{SNAPSHOT_STEP}` not found in jumbo-publish.yml"));
+    assert!(
+        snapshot.contains("declared-pyproject.toml"),
+        "the snapshot step preserves the declared python manifest:\n{snapshot}"
+    );
+    // Ordering: the snapshot precedes the lock step that rewrites the
+    // manifest (a snapshot taken after the injection would preserve the
+    // exact pins and the restore would be a no-op).
+    let snap_pos = workflow.find(SNAPSHOT_STEP).expect("snapshot step");
+    let lock_pos = workflow
+        .find("jumbo lock (resolve and generate the language lock)")
+        .expect("lock step");
+    assert!(
+        snap_pos < lock_pos,
+        "the snapshot precedes jumbo lock (the injection must never reach the snapshot)"
+    );
+}
+
 
 #[test]
 fn no_other_step_gains_a_credential_through_this_contract() {
