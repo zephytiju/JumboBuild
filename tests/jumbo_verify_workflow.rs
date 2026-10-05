@@ -253,6 +253,14 @@ fn the_python_pipeline_syncs_restores_builds_then_tests() {
         block.contains("source[\"rewritten\"]") && block.contains("source[\"declared\"]"),
         "the restore uses the injection marker's rewritten→declared mapping:\n{block}"
     );
+    // `python -m pytest` (not bare pytest): the module form puts the
+    // project root on sys.path, which member suites that import through
+    // the tests package rely on (MeridianS3Adapter run 37266649309 —
+    // "No module named 'tests'" under bare pytest).
+    assert!(
+        block.contains("python -m pytest"),
+        "pytest runs in module form (the project root joins sys.path):\n{block}"
+    );
     assert!(
         block.contains("import pytest"),
         "pytest is gated on being installed in the synced environment (build-only \
