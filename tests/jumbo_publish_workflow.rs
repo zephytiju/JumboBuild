@@ -34,15 +34,20 @@
 //! 4. **The python clean-manifest restore contract.** The python
 //!    branch of the "Build the artifacts" step must restore the
 //!    developer's declared pyproject.toml (snapshotted before `jumbo
-//!    lock` rewrote it) BEFORE `uv version` sets the pipeline version
-//!    and `uv build` packs the wheel — the exact pins jumbo lock writes
-//!    for materialization must never reach the released wheel's
-//!    Requires-Dist, where an exact internal pin can name an
-//!    index-only version no consumer can resolve (proof:
+//!    lock` rewrote it) BEFORE `uv version --frozen` stamps the
+//!    pipeline version and `uv build` packs the wheel — the exact pins
+//!    jumbo lock writes for materialization must never reach the
+//!    released wheel's Requires-Dist, where an exact internal pin can
+//!    name an index-only version no consumer can resolve (proof:
 //!    lattice-runtime-core 0.2.0 pinning
-//!    juntai-documentation-capability==2.0.2). The full-file restore is
-//!    the python twin of the npm branch's marker-based restore and the
-//!    identical mechanism jumbo-verify runs after its `uv sync`.
+//!    juntai-documentation-capability==2.0.2). The version stamp is
+//!    `--frozen`: a plain `uv version` refreshes uv.lock against the
+//!    restored declarations, whose index-only internal ranges no
+//!    public registry serves (proof: LatticeRuntimeCore publish run
+//!    37366690541 — `No solution found` at JUMBO_VERSION=0.3.0). The
+//!    full-file restore is the python twin of the npm branch's
+//!    marker-based restore and the identical mechanism jumbo-verify
+//!    runs after its `uv sync`.
 //!
 //! In every case the token enters only through the environment: never a
 //! literal, never a log line, never a command line.
@@ -235,16 +240,17 @@ fn the_python_build_path_restores_the_declared_manifest_before_building() {
         .find("cp \"$RUNNER_TEMP/declared-pyproject.toml\" pyproject.toml")
         .unwrap_or_else(|| panic!("the python branch must restore the declared manifest verbatim:\n{block}"));
     let version = block
-        .find("uv version \"$JUMBO_VERSION\"")
-        .unwrap_or_else(|| panic!("the python branch must set the pipeline version:\n{block}"));
+        .find("uv version --frozen \"$JUMBO_VERSION\"")
+        .unwrap_or_else(|| panic!("the python branch must set the pipeline version without re-locking:\n{block}"));
     let build = block
         .find("uv build --out-dir dist")
         .unwrap_or_else(|| panic!("the python branch must run the standard build:\n{block}"));
     assert!(
         restore < version && version < build,
-        "the python branch must run restore → uv version → uv build (the declared ranges — \
-         not the materialized exact pins — reach the wheel metadata, and the pipeline-owned \
-         version lands on the clean file):\n{block}"
+        "the python branch must run restore → uv version --frozen → uv build (the declared ranges — \
+         not the materialized exact pins — reach the wheel metadata, the pipeline-owned \
+         version lands on the clean file, and the version stamp never re-locks against the \
+         restored declarations):\n{block}"
     );
 }
 
