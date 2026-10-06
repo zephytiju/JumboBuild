@@ -9,6 +9,9 @@
 /// Errors produced by the fingerprint engine.
 #[derive(Debug, thiserror::Error)]
 pub enum FingerprintError {
+    #[error("local workspace inputs in `{path}` cannot be fingerprinted as an immutable published build; regenerate the lock from recorded index inputs before promotion or artifact reuse")]
+    LocalInputs { path: String },
+
     #[error("invalid lock file `{path}`: {reason}")]
     InvalidLock { path: String, reason: String },
 

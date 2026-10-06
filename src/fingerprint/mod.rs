@@ -69,6 +69,19 @@ pub fn fingerprint_lock_file(
     lock_path: &Path,
     promotion: bool,
 ) -> Result<FingerprintReport, FingerprintError> {
+    let project = lock_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    if project
+        .join("deps")
+        .join(crate::workspace::local::LOCAL_INPUTS_MARKER)
+        .exists()
+    {
+        return Err(FingerprintError::LocalInputs {
+            path: lock_path.display().to_string(),
+        });
+    }
     let own = if promotion {
         ensure_clean_for_promotion(lock_path)?
     } else {
@@ -85,6 +98,15 @@ pub fn fingerprint_lock_file(
             reason: format!("failed to read: {e}"),
         })?;
     let extract = extract_lock(&content, file_name)?;
+    if extract
+        .entries
+        .iter()
+        .any(|entry| entry.source == extract::EntrySource::Path)
+    {
+        return Err(FingerprintError::LocalInputs {
+            path: lock_path.display().to_string(),
+        });
+    }
     let fingerprint = compute_fingerprint(&own.commit, &extract)?;
     Ok(FingerprintReport {
         manifest: None,
@@ -131,6 +153,12 @@ pub fn fingerprint_manifest(
             FingerprintError::LockGeneration {
                 manifest: manifest.display().to_string(),
                 reason: format!("language lock tool failed: {e}"),
+            }
+        })?;
+        crate::workspace::local::clear_local_provenance(&working_dir).map_err(|e| {
+            FingerprintError::LockGeneration {
+                manifest: manifest.display().to_string(),
+                reason: format!("clearing local provenance: {e}"),
             }
         })?;
     }

@@ -8,7 +8,7 @@ Jumbo Build is Juntai's unified command-line interface for building projects and
 
 - **One project workflow:** use the same commands across every supported language.
 - **Multi-repository workspaces:** clone, import, remove, synchronize, and watch repositories under one workspace.
-- **Local dependency wiring:** keep checked-out Python packages connected as uv workspace members and fall back to recorded Git remotes when a package is absent locally; Node projects register with their npm identity alongside them.
+- **Local dependency wiring:** build compatible local Node and Python packages in dependency order, across public/private repositories and any remote organization. Python uses uv workspace sources; Node uses temporary file sources; missing checkouts retain remote fallback.
 - **Native CLI:** ship a single Rust binary for macOS and Linux.
 - **Extensible language support:** add another ecosystem by implementing `LanguageSupport` and registering it.
 
@@ -49,7 +49,7 @@ cd my-workspace
 jumbo workspace use -r https://github.com/example/example-package.git
 ```
 
-Project build commands must be run from inside a registered project. Jumbo detects the current project from `jumbo.toml` and operates only on that project:
+Project build commands must be run from inside a registered project. Jumbo detects the current project from `jumbo.toml`, builds its local dependency closure first, and applies the requested test, format, release check, or clean action to that project:
 
 ```bash
 cd projects/example-package
@@ -119,7 +119,13 @@ The pipeline selects its steps from the project's own configuration:
 - **Engines:** `engines.node` is enforced before any step runs — an unsatisfied range fails the pipeline immediately with both versions named. Ranges jumbo cannot evaluate statically are deferred to npm's own check.
 - **Release:** `jumbo release` is the strict variant: build pipeline → tests → strict format check. It never publishes; artifact publication is the executor's job under the publication contract.
 
-npm is the supported package manager; `packageManager` fields selecting other tools are not honored yet. Internal dependencies use the `@juntai/*` scope (legacy `@zephytiju/*` is accepted) and are injected at `file:deps/<slug>` coordinates by `jumbo lock` and the materializer — the workspace pipeline itself runs the plain toolchain.
+Developer workspace builds choose local repositories by their live manifest package name, ecosystem, and compatible declared version range. Repository folder names, remotes, organizations, and public/private flags do not affect selection. The dependency closure is validated before building; duplicate package identities, incompatible local versions, and dependency cycles fail with named diagnostics. Node manifests temporarily point at the selected checkout with `file:` sources; each producer installs and builds before its consumer. The original manifest bytes are restored on success or failure. Python keeps the existing uv workspace sources and normalizes Jumbo's `name@MAJOR` declarations during the build.
+
+When a checkout is absent, public npm dependencies use normal registry resolution and internal packages use the existing SHA-256-verified Jumbo index materializer. Set `JUMBO_INDEX_PATH`/`JUMBO_INDEX_URL` when public packages are also index-managed, and `JUMBO_ARTIFACT_DIR` for an existing artifact cache. Python retains the registered Git-source fallback. No root npm workspace is generated.
+
+Local workspace locks and their `deps/.jumbo-workspace-inputs.json` provenance marker cannot be used for immutable published fingerprints, promotion, or artifact reuse. Dirty source trees also cannot reuse a published artifact. Regenerate publication inputs with `jumbo lock` from the recorded index before promotion. Pinned reproduction continues to resolve the recorded closure, independent of local checkouts.
+
+npm is the supported package manager; `packageManager` fields selecting other tools are not honored yet. Internal dependencies use the `@juntai/*` scope (legacy `@zephytiju/*` is accepted) and are injected at `file:deps/<slug>` coordinates by `jumbo lock` and the materializer — the standalone publication pipeline runs the plain toolchain against recorded artifacts; developer workspace builds select compatible local checkouts first.
 
 Node repositories register with their npm package identity in `jumbo.toml` (`package = "@juntai/kit"`, `ecosystem = "node"`) and are excluded from the uv workspace, so mixed Python + Node workspaces work unchanged: no root npm workspace is generated, because npm workspaces would centralize `node_modules` at the root and change per-project install semantics that jumbo's file-protocol ingestion model relies on.
 

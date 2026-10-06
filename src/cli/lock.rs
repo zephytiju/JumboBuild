@@ -86,6 +86,7 @@ pub fn execute(args: LockArgs) -> Result<()> {
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("."));
         crate::utils::runner::run_steps(&[(command, description)], &working_dir)?;
+        crate::workspace::local::clear_local_provenance(&working_dir)?;
     }
 
     let report = serde_json::json!({

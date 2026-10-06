@@ -23,6 +23,8 @@ sha2 = "0.10"
 base64 = "0.22"
 tar = "0.4.46"
 flate2 = "1.1.10"
+node-semver = "2.2.0"
+pep440_rs = "0.7.3"
 
 [dev-dependencies]
 clap-markdown = "0.1.5"

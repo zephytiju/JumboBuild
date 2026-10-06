@@ -56,13 +56,19 @@ pub struct Manifest {
 /// The file must be named `pyproject.toml` or `package.json`; the language
 /// follows from the manifest kind.
 pub fn load_manifest(path: &Path) -> Result<Manifest, ResolverError> {
+    let content = read_to_string(path)?;
+    load_manifest_content(path, &content)
+}
+
+/// Parse declared inputs without mutating a temporarily injected manifest.
+pub fn load_manifest_content(path: &Path, content: &str) -> Result<Manifest, ResolverError> {
     let file_name = path
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or_default();
     match file_name {
-        "pyproject.toml" => load_python_manifest(path),
-        "package.json" => load_npm_manifest(path),
+        "pyproject.toml" => load_python_manifest(path, content),
+        "package.json" => load_npm_manifest(path, content),
         other => Err(ResolverError::InvalidManifest {
             path: path.display().to_string(),
             reason: format!(
@@ -79,8 +85,7 @@ fn read_to_string(path: &Path) -> Result<String, ResolverError> {
     })
 }
 
-fn load_python_manifest(path: &Path) -> Result<Manifest, ResolverError> {
-    let content = read_to_string(path)?;
+fn load_python_manifest(path: &Path, content: &str) -> Result<Manifest, ResolverError> {
     let doc: toml::Value = content
         .parse()
         .map_err(|e| ResolverError::InvalidManifest {
@@ -205,10 +210,9 @@ fn type_error(path: &Path, section: &str) -> ResolverError {
     }
 }
 
-fn load_npm_manifest(path: &Path) -> Result<Manifest, ResolverError> {
-    let content = read_to_string(path)?;
+fn load_npm_manifest(path: &Path, content: &str) -> Result<Manifest, ResolverError> {
     let doc: serde_json::Value =
-        serde_json::from_str(&content).map_err(|e| ResolverError::InvalidManifest {
+        serde_json::from_str(content).map_err(|e| ResolverError::InvalidManifest {
             path: path.display().to_string(),
             reason: format!("failed to parse JSON: {e}"),
         })?;

@@ -8,7 +8,7 @@ Jumbo Build 是 Juntai 统一的项目构建与多仓库工作空间管理命令
 
 - **统一的项目工作流：** 在所有受支持的语言中使用同一组命令。
 - **多仓库工作空间：** 在一个工作空间内克隆、导入、移除、同步和监听多个仓库。
-- **本地依赖连接：** 将已检出的 Python 包作为 uv workspace 成员连接，本地缺失时可回退到已记录的 Git 远程地址；Node 项目同样以 npm 包身份注册在其中。
+- **本地依赖连接：** 按实时包名、生态和版本范围选择兼容的 Node/Python checkout，先构建依赖，再构建当前项目；支持公开、私有及跨组织仓库，本地缺失时使用远端回退。
 - **原生 CLI：** 为 macOS 和 Linux 提供单个 Rust 二进制文件。
 - **可扩展的语言支持：** 实现并注册 `LanguageSupport` 即可接入新的生态系统。
 
@@ -218,3 +218,11 @@ jumbo completions fish > jumbo.fish
 - [部署固定契约（英文）](./docs/pinning.md)
 - 如需完整且与当前版本一致的命令细节，请运行 `jumbo --help` 或 `jumbo <command> --help`。
 - [许可证](./LICENSE)
+
+## 开发工作空间的本地依赖
+
+项目构建先校验并排序本地依赖链，重复包身份、不兼容版本和依赖环会在构建前报错。Python 复用 uv workspace sources；Node 临时使用指向本地 checkout 的 file sources，并在成功或失败后恢复 manifest 原始字节。包身份来自实时 manifest，仓库目录名、远程组织及公开/私有属性不影响选择。
+
+缺失的内部 Node checkout 通过 Jumbo 索引与 SHA-256 校验的制品回退；公开 npm 包保留普通 registry 解析。索引也管理公开包时显式设置 JUMBO_INDEX_PATH 或 JUMBO_INDEX_URL。Python 保留已登记的 Git-source 回退。
+
+本地锁及 deps/.jumbo-workspace-inputs.json 来源标记不能用于不可变发布指纹、晋升或制品复用；源码 dirty 时同样拒绝复用发布制品。发布前通过 jumbo lock 从已记录的索引重新生成输入。固定 buildId 的历史复现继续使用原记录，不受本地 checkout 影响。

@@ -195,6 +195,55 @@ fn staging_dir() -> PathBuf {
     dir
 }
 
+// A previously pulled own artifact is an output, not a source edit. Permit
+// only untracked bytes matching an exact recorded asset; never ignore dist/
+// wholesale or exempt a tracked source file.
+fn is_recorded_build_output(
+    path: &str,
+    report: &FingerprintReport,
+    package: &str,
+    index: &resolver::Index,
+    dist_dir: Option<&str>,
+) -> bool {
+    let project = project_dir_of(report);
+    let project = project.canonicalize().unwrap_or(project);
+    let Ok(repo) = git2::Repository::discover(&project) else {
+        return false;
+    };
+    let Ok(status) = repo.status_file(std::path::Path::new(path)) else {
+        return false;
+    };
+    if !status.contains(git2::Status::WT_NEW) {
+        return false;
+    }
+    let Some(records) = index.records(package) else {
+        return false;
+    };
+    records.entries.iter().any(|(_, record)| {
+        let Some(url) = &record.artifact_url else {
+            return false;
+        };
+        let Ok(url) = dedup::validate_artifact_url(url) else {
+            return false;
+        };
+        let relative = format!(
+            "{}/{}",
+            dist_dir.unwrap_or(dedup::DEFAULT_DIST_DIR),
+            url.file_name
+        );
+        let Some(workdir) = repo.workdir() else {
+            return false;
+        };
+        if workdir.join(path) != project.join(relative) {
+            return false;
+        }
+        let Some(expected) = &record.artifact_sha256 else {
+            return false;
+        };
+        dedup::verify_sha256(&workdir.join(path), expected).is_ok()
+    })
+}
+
 pub fn execute(args: DedupArgs) -> Result<()> {
     if args.lock.is_some() && args.manifest.is_some() {
         bail!("--lock and --manifest cannot be combined");
@@ -218,9 +267,19 @@ pub fn execute(args: DedupArgs) -> Result<()> {
     } else {
         None
     };
+    // Reject malformed local arguments before opening the index.
+    if let Some(lock) = &args.lock {
+        if !lock.exists() {
+            bail!("lock file not found: {}", lock.display());
+        }
+    }
+    if let Some(manifest) = &args.manifest {
+        if !manifest.exists() {
+            bail!("manifest not found: {}", manifest.display());
+        }
+    }
     let source = resolver::resolve_source(args.index.as_deref())?;
-    let index = resolver::Index::load(&source)
-        .map_err(|e| anyhow::anyhow!(e).context(format!("index source: {}", source.describe())))?;
+    let mut loaded_index = None;
 
     // 1. Compute the input fingerprint of the project about to build.
     let (report, manifest_path) = match (&args.lock, &args.manifest) {
@@ -262,12 +321,16 @@ pub fn execute(args: DedupArgs) -> Result<()> {
                     anyhow::anyhow!(e).context(format!("fingerprinting {}", existing.display()))
                 })?
             } else {
+                let index = resolver::Index::load(&source).map_err(|e| {
+                    anyhow::anyhow!(e).context(format!("index source: {}", source.describe()))
+                })?;
                 let (_generation, report) =
                     fingerprint::fingerprint_manifest(&manifest, &index, false, true, true)
                         .map_err(|e| {
                             anyhow::anyhow!(e)
                                 .context(format!("fingerprinting {}", manifest.display()))
                         })?;
+                loaded_index = Some(index);
                 report
             };
             (report, Some(manifest))
@@ -288,6 +351,25 @@ pub fn execute(args: DedupArgs) -> Result<()> {
         _ => unreachable!(),
     };
 
+    let index = match loaded_index {
+        Some(index) => index,
+        None => resolver::Index::load(&source).map_err(|e| {
+            anyhow::anyhow!(e).context(format!("index source: {}", source.describe()))
+        })?,
+    };
+    let dirty: Vec<_> = report
+        .dirty_paths
+        .iter()
+        .filter(|path| {
+            !is_recorded_build_output(path, &report, &package, &index, args.dist_dir.as_deref())
+        })
+        .collect();
+    if !dirty.is_empty() {
+        bail!(
+            "artifact reuse refused: dirty local inputs are not an immutable published build ({})",
+            dirty.into_iter().cloned().collect::<Vec<_>>().join(", ")
+        );
+    }
     // 3. The build-or-reuse decision.
     let decision = dedup::decide(&package, &report.fingerprint, &index)
         .map_err(|e| anyhow::anyhow!(e).context("dedup decision"))?;
@@ -401,6 +483,7 @@ pub fn execute(args: DedupArgs) -> Result<()> {
 fn project_dir_of(report: &FingerprintReport) -> PathBuf {
     std::path::Path::new(&report.lock)
         .parent()
+        .filter(|p| !p.as_os_str().is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."))
 }

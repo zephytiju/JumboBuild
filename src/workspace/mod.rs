@@ -1,4 +1,5 @@
 pub mod detection;
+pub mod local;
 pub mod metadata;
 pub mod vscode;
 

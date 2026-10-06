@@ -116,16 +116,34 @@ pub fn execute(args: &BuildArgs) -> Result<()> {
         repo.name
     );
 
-    let result = match &action {
-        Some(BuildAction::Clean) => lang.clean(&repo_path),
-        None | Some(BuildAction::Test) if action.is_none() => {
-            lang.build(&workspace_root, &repo_path)
+    let result = (|| -> Result<()> {
+        // Cleaning has no resolution or build side effects.
+        if matches!(action, Some(BuildAction::Clean)) {
+            return lang.clean(&repo_path);
         }
-        Some(BuildAction::Test) => lang.test(&workspace_root, &repo_path),
-        Some(BuildAction::Format) => lang.format(&workspace_root, &repo_path),
-        Some(BuildAction::Release) => lang.release(&workspace_root, &repo_path),
-        _ => lang.build(&workspace_root, &repo_path),
-    };
+        let plan = crate::workspace::local::BuildPlan::new(&workspace_root, &repo_path)?;
+        // Keep every reachable manifest overlay alive: uv resolves the whole
+        // workspace and npm links transitively to the producer's installed tree.
+        let mut guards = Vec::new();
+        for &index in &plan.order {
+            guards.push(plan.prepare(index)?);
+        }
+        crate::workspace::local::build_dependencies(&plan, &workspace_root)?;
+        let result = match &action {
+            Some(BuildAction::Test) => lang.test(&workspace_root, &repo_path),
+            Some(BuildAction::Format) => lang.format(&workspace_root, &repo_path),
+            Some(BuildAction::Release) => lang.release(&workspace_root, &repo_path),
+            _ => lang.build(&workspace_root, &repo_path),
+        };
+        if result.is_ok() {
+            plan.finish()?;
+        }
+        // Explicit restoration reports an I/O failure as a failed build.
+        for guard in &guards {
+            guard.restore()?;
+        }
+        result
+    })();
 
     if let Err(e) = result {
         eprintln!("  {} {} failed: {}", "✗".red(), repo.name, e);

@@ -1,0 +1,54 @@
+name: Local workspace acceptance
+
+on:
+  pull_request:
+    paths: ["Cargo.toml", "Cargo.lock", "src/**", "tests/**", ".github/workflows/local-workspace.yml"]
+  push:
+    branches: [main]
+    paths: ["Cargo.toml", "Cargo.lock", "src/**", "tests/**", ".github/workflows/local-workspace.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  acceptance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [20, 24]
+    env:
+      JUMBO_REQUIRE_PYTHON_TOOLCHAIN: "1"
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ matrix.node }}
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.12"
+      - name: Lint the implementation
+        run: cargo clippy --locked --lib --bins -- -D warnings
+      - name: Run all regressions and real npm/uv workspace acceptance
+        run: cargo test --locked
+      - name: Build the verified native CLI
+        if: github.event_name != 'pull_request' && matrix.node == 24
+        run: |
+          cargo build --release --locked
+          mkdir -p release-evidence
+          cp target/release/jumbo release-evidence/jumbo
+          printf '%s\n' "$GITHUB_SHA" > release-evidence/source-commit.txt
+          (cd release-evidence && sha256sum jumbo > SHA256SUMS)
+      - name: Save source-bound CLI release evidence
+        if: github.event_name != 'pull_request' && matrix.node == 24
+        uses: actions/upload-artifact@v4
+        with:
+          name: jumbo-linux-x86_64-${{ github.sha }}
+          path: release-evidence/
+          if-no-files-found: error
