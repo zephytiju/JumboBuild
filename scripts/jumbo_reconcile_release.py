@@ -9,6 +9,7 @@ continues to derive solely from the index. Default mode is read-only.
 from __future__ import annotations
 
 import argparse
+import base64
 import email.parser
 import hashlib
 import io
@@ -22,6 +23,7 @@ import tomllib
 import zipfile
 from datetime import UTC, datetime
 from pathlib import Path
+from urllib.parse import quote
 
 from jumbo_index_append import load_lines, validate_record
 
@@ -47,11 +49,24 @@ def normalized(name):
 
 
 def manifest_identity(path):
+    return parse_manifest(path, path.read_text())
+
+
+def unique_json(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise RecoveryError("ambiguous JSON metadata")
+        result[key] = value
+    return result
+
+
+def parse_manifest(path, content):
     if path.name == "pyproject.toml":
-        data = tomllib.loads(path.read_text())["project"]
+        data = tomllib.loads(content)["project"]
         ecosystem = "python"
     elif path.name == "package.json":
-        data = json.loads(path.read_text())
+        data = json.loads(content, object_pairs_hook=unique_json)
         ecosystem = "npm"
     else:
         raise RecoveryError("unsupported manifest")
@@ -61,8 +76,14 @@ def manifest_identity(path):
     return name, version(own_version)[0], ecosystem
 
 
-def select_release(releases, records, package, major):
-    """Pick one highest historical stable release; never downgrade history."""
+def select_release(releases, records, package, major, *, inspect_release):
+    """Rank only releases verified for this identity; never downgrade history.
+
+    The inspector must return true for a verified current-package release,
+    false only for a proven other identity, and raise for unknown/contradictory
+    identity or damaged current-package history. Inspect every eligible release
+    before ranking so a higher valid release cannot hide a damaged lower one.
+    """
     for row in records:
         if row["package"] != package:
             raise RecoveryError("index package identity mismatch")
@@ -76,7 +97,8 @@ def select_release(releases, records, package, major):
             continue
         key = version(tag[1:])
         if key[0] == major and key > floor:
-            candidates.append((key, release))
+            if inspect_release(release):
+                candidates.append((key, release))
     if not candidates:
         return None
     candidates.sort(key=lambda item: item[0])
@@ -92,7 +114,7 @@ def select_release(releases, records, package, major):
     return release
 
 
-def primary_asset(release, package, ecosystem):
+def matching_assets(release, package, ecosystem):
     tag_version = release["tag_name"][1:]
     if ecosystem == "python":
         prefix = normalized(package).replace("-", "_") + "-" + tag_version + "-"
@@ -100,6 +122,11 @@ def primary_asset(release, package, ecosystem):
     else:
         stem = package.lstrip("@").replace("/", "-")
         assets = [a for a in release["assets"] if a["name"] == f"{stem}-{tag_version}.tgz"]
+    return assets
+
+
+def primary_asset(release, package, ecosystem):
+    assets = matching_assets(release, package, ecosystem)
     if len(assets) != 1:
         raise RecoveryError("exactly one primary package artifact required")
     asset = assets[0]
@@ -130,7 +157,7 @@ def verify_package(data, package, release_version, ecosystem):
             if len(entries) != 1 or not entries[0].isfile() or entries[0].size > MAX_METADATA_BYTES:
                 raise RecoveryError("bounded unique npm metadata required")
             with archive.extractfile(entries[0]) as stream:
-                fields = json.load(stream)
+                fields = json.load(stream, object_pairs_hook=unique_json)
             valid_name = fields.get("name") == package
             actual_version = fields.get("version")
     if not valid_name or actual_version != release_version:
@@ -176,6 +203,73 @@ def tagged_commit(repository, tag):
     raise RecoveryError("historical tag does not resolve to a bounded commit")
 
 
+def tagged_manifest(repository, commit, manifest):
+    """Read the same manifest path at the peeled tag commit, never a branch."""
+    if manifest.is_absolute():
+        try:
+            manifest = manifest.relative_to(Path.cwd())
+        except ValueError as error:
+            raise RecoveryError("source manifest is outside the caller repository") from error
+    if not COMMIT.fullmatch(commit) or ".." in manifest.parts:
+        raise RecoveryError("tag-bound manifest requires an exact commit and repository-relative path")
+    item = gh_json(f"repos/{repository}/contents/{quote(manifest.as_posix(), safe='/')}?ref={commit}")
+    if (not isinstance(item, dict) or item.get("type") != "file"
+            or item.get("path") != manifest.as_posix() or item.get("encoding") != "base64"
+            or not isinstance(item.get("size"), int) or not 0 < item["size"] <= MAX_METADATA_BYTES):
+        raise RecoveryError("bounded tag-bound source manifest required")
+    data = base64.b64decode("".join(item["content"].split()), validate=True)
+    if len(data) != item["size"]:
+        raise RecoveryError("tag-bound manifest bytes differ from source metadata")
+    return parse_manifest(manifest, data.decode("utf-8"))
+
+
+def download_asset(repository, asset):
+    with tempfile.TemporaryDirectory(prefix="jumbo-historical-release-") as directory:
+        path = Path(directory) / "artifact"
+        with path.open("wb") as output:
+            subprocess.run([
+                "gh", "api", f"repos/{repository}/releases/assets/{asset['id']}",
+                "-H", "Accept: application/octet-stream",
+            ], stdout=output, check=True)
+        if path.stat().st_size > MAX_ARTIFACT_BYTES:
+            raise RecoveryError("download exceeds the historical artifact byte bound")
+        return path.read_bytes()
+
+
+def inspect_history(release, *, repository, manifest, package, major, ecosystem):
+    """Return a verified adoption record, or None for a proven other package."""
+    commit = tagged_commit(repository, release["tag_name"])
+    source_package, source_major, source_ecosystem = tagged_manifest(repository, commit, manifest)
+    same_identity = (normalized(source_package) == normalized(package) if ecosystem == "python"
+                     else source_package == package)
+    if source_ecosystem != ecosystem or source_major != major:
+        raise RecoveryError("tag-bound source ecosystem/major differs from historical release")
+    # Preserve original promotion provenance even when source identity changed.
+    if "jumbo release of **" in (release.get("body") or ""):
+        raise RecoveryError("interrupted Jumbo publication requires its original promotion record")
+    if same_identity:
+        if release.get("immutable") is not True:
+            raise RecoveryError("historical release must be immutable before indexing")
+    elif matching_assets(release, package, ecosystem):
+        raise RecoveryError("historical artifact contradicts tag-bound package identity")
+    elif not any(a["name"].endswith((".whl", ".tgz")) for a in release["assets"]):
+        # Source proves the rename even for an assetless mutable legacy release.
+        return None
+    # If package artifacts exist, source identity must agree with the unique
+    # expected primary artifact AND its actual bytes/name/version/digest.
+    asset = primary_asset(release, source_package, ecosystem)
+    if any(a != asset and a["name"].endswith((".whl", ".tgz")) for a in release["assets"]):
+        raise RecoveryError("ambiguous historical package artifacts")
+    record = make_record(
+        release, asset, download_asset(repository, asset), repository=repository,
+        package=source_package, major=major, ecosystem=ecosystem, commit=commit,
+    )
+    if not same_identity:
+        return None
+    record["package"] = package
+    return record
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", type=Path)
@@ -190,25 +284,25 @@ def main():
     package, major, ecosystem = manifest_identity(manifest)
     pages = gh_json(f"repos/{args.repository}/releases?per_page=100", "--paginate", "--slurp")
     releases = [release for page in pages for release in page]
-    release = select_release(releases, load_lines(args.index_dir, package), package, major)
+    verified = {}
+
+    def inspect(release):
+        record = inspect_history(
+            release, repository=args.repository, manifest=manifest,
+            package=package, major=major, ecosystem=ecosystem,
+        )
+        if record is None:
+            return False
+        verified[id(release)] = record
+        return True
+
+    release = select_release(
+        releases, load_lines(args.index_dir, package), package, major, inspect_release=inspect,
+    )
     if release is None:
         print(json.dumps({"status": "already-aligned", "package": package}))
         return 0
-    asset = primary_asset(release, package, ecosystem)
-    commit = tagged_commit(args.repository, release["tag_name"])
-    with tempfile.TemporaryDirectory(prefix="jumbo-historical-release-") as directory:
-        path = Path(directory) / "artifact"
-        with path.open("wb") as output:
-            subprocess.run([
-                "gh", "api", f"repos/{args.repository}/releases/assets/{asset['id']}",
-                "-H", "Accept: application/octet-stream",
-            ], stdout=output, check=True)
-        if path.stat().st_size > MAX_ARTIFACT_BYTES:
-            raise RecoveryError("download exceeds the historical artifact byte bound")
-        record = make_record(
-            release, asset, path.read_bytes(), repository=args.repository,
-            package=package, major=major, ecosystem=ecosystem, commit=commit,
-        )
+    record = verified[id(release)]
     args.output.write_text(json.dumps(record, ensure_ascii=False) + "\n")
     if args.push:
         result = json.loads(subprocess.check_output([
