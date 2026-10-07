@@ -420,6 +420,22 @@ jobs:
           echo "JUMBO_INDEX_PATH=${index_dir}" >> "$GITHUB_ENV"
           echo "JUMBO_INDEX_REPOSITORY=${INDEX_REPOSITORY}" >> "$GITHUB_ENV"
 
+      # Releases produced by a historical non-Jumbo workflow may be ahead of
+      # the index. Verify their immutable package/source/digest and use the
+      # normal append protocol before promotion computes the next version.
+      # No tags or release bytes are replaced, and no build provenance is invented.
+      - name: Reconcile verified historical releases with JumboIndex
+        env:
+          GH_TOKEN: ${{ github.token }}
+          JUMBO_INDEX_TOKEN: ${{ steps.app-token.outputs.token || secrets.JUNTAI_INDEX_TOKEN }}
+        run: |
+          set -euo pipefail
+          python3 "$RUNNER_TEMP/jumbo-build/jumbobuild/scripts/jumbo_reconcile_release.py" \
+            --repository "$GITHUB_REPOSITORY" \
+            --index-dir "$JUMBO_INDEX_PATH" \
+            --output "$RUNNER_TEMP/jumbo-historical-record.json" \
+            --push
+
       # 5b. Snapshot the pristine declared python manifest BEFORE jumbo
       #     lock rewrites it (the same full-file mechanism jumbo-verify
       #     uses): the injection rewrites every internal declaration to

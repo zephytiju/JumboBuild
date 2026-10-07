@@ -19,6 +19,30 @@ secrets, and nothing else.
   run in CI by [`index-append.yml`](../.github/workflows/index-append.yml) — including the
   concurrent two-writer race that must converge to exactly one record and one artifact)
 
+## Historical releases created outside Jumbo
+
+Before locking and promotion, the publisher checks the caller repository for a
+stable release of its declared major newer than its index history. This covers
+repositories whose former release workflow created GitHub releases without an
+index append. It prevents promotion from selecting an already occupied tag.
+
+`scripts/jumbo_reconcile_release.py` requires an immutable GitHub release, an
+exact tag-to-commit binding, one matching wheel or npm tarball, GitHub's asset
+SHA-256 and byte length, and matching package name/version inside that artifact.
+It submits one historical `bootstrap` record through the existing validated,
+fast-forward append client. Unknown historical build fingerprints, dependency
+extracts, build IDs, image digests and pipeline runs remain null. Existing
+records, tags and assets are preserved. Normal promotion then calculates its
+next version from the updated index and publishes the current source normally.
+
+The script defaults to read-only verification; only the publication job passes
+`--push`, using its existing index credential. A repeated run is a no-op once
+aligned. Mutable or ambiguous releases and mismatched bytes/metadata fail
+closed. An interrupted **Jumbo** publication is not converted to a historical
+bootstrap record: it requires recovery of its original promotion record so its
+known build provenance is retained. This step is publication recovery, not a
+repository-specific build or integration-test hook.
+
 ## The caller
 
 Add this to a workflow in the public repository (for example
