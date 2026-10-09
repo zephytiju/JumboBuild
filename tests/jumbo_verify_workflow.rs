@@ -128,7 +128,12 @@ fn the_workflow_carries_no_publication_machinery() {
 #[test]
 fn the_private_key_flows_verbatim_into_the_pinned_minting_action() {
     let workflow = include_str!("../.github/workflows/jumbo-verify.yml");
-    for forbidden in ["openssl pkey", "base64 --decode", "::add-mask::", "APP_PRIVATE_KEY:"] {
+    for forbidden in [
+        "openssl pkey",
+        "base64 --decode",
+        "::add-mask::",
+        "APP_PRIVATE_KEY:",
+    ] {
         assert!(
             !workflow.contains(forbidden),
             "`{forbidden}` must never appear in jumbo-verify.yml — a hand-rolled \
@@ -202,19 +207,25 @@ fn the_npm_pipeline_refreshes_installs_restores_then_verifies() {
         .unwrap_or_else(|| panic!("the npm pipeline must restore the declared manifest:\n{block}"));
     let verify = block
         .find("npm run verify --if-present")
-        .unwrap_or_else(|| panic!("the npm pipeline must run the project's verify script:\n{block}"));
-    let build = block
-        .find("npm run build --if-present")
-        .unwrap_or_else(|| panic!("the npm pipeline must run the build script:\n{block}"));
+        .unwrap_or_else(|| {
+            panic!("the npm pipeline must run the project's verify script:\n{block}")
+        });
+    let tests = step_block(workflow, "Jumbo tests (npm)").expect("measured npm test step");
+    let build = step_block(workflow, "Build (npm)").expect("npm build step");
     assert!(
-        lock_refresh < install && install < restore && restore < verify && verify < build,
+        lock_refresh < install && install < restore && restore < verify,
         "the npm pipeline must run lock refresh → clean install → restore clean \
          declarations → project scripts:\n{block}"
     );
+    assert!(tests.contains("npm test") && tests.contains("node --test"));
+    assert!(tests.contains("if: steps.npm-prepare.outputs.runner != ''"));
+    assert!(build.contains("npm run build --if-present"));
+    assert!(workflow.find("Verify (npm)") < workflow.find("Jumbo tests (npm)"));
+    assert!(workflow.find("Jumbo tests (npm)") < workflow.find("Build (npm)"));
     // npm's generated placeholder ("Error: no test specified") must count
     // as absent — running it would fail every scriptless member.
     assert!(
-        block.contains("\"no test specified\"") && block.contains("node --test"),
+        block.contains("\"no test specified\"") && workflow.contains("node --test"),
         "the test step guards npm's placeholder and falls back to the Node test \
          runner:\n{block}"
     );
@@ -230,14 +241,14 @@ fn the_python_pipeline_syncs_restores_builds_then_tests() {
     let sync = block
         .find("uv sync --all-extras")
         .unwrap_or_else(|| panic!("the python pipeline must sync every extra:\n{block}"));
-    let restore = block
-        .find("declared-pyproject.toml")
-        .unwrap_or_else(|| panic!("the python pipeline must restore the declared manifest verbatim:\n{block}"));
+    let restore = block.find("declared-pyproject.toml").unwrap_or_else(|| {
+        panic!("the python pipeline must restore the declared manifest verbatim:\n{block}")
+    });
     let build = block
         .find("uv build")
         .unwrap_or_else(|| panic!("the python pipeline must run the standard build:\n{block}"));
     let pytest = block
-        .find("pytest")
+        .find("import pytest")
         .unwrap_or_else(|| panic!("the python pipeline must run pytest:\n{block}"));
     assert!(
         sync < restore && restore < build && build < pytest,
@@ -258,7 +269,9 @@ fn the_python_pipeline_syncs_restores_builds_then_tests() {
     // the tests package rely on (MeridianS3Adapter run 37266649309 —
     // "No module named 'tests'" under bare pytest).
     assert!(
-        block.contains("python -m pytest"),
+        step_block(workflow, "Jumbo tests (python)")
+            .unwrap()
+            .contains("python -m pytest"),
         "pytest runs in module form (the project root joins sys.path):\n{block}"
     );
     assert!(
@@ -282,17 +295,26 @@ fn the_declared_manifests_are_snapshotted_before_the_injection() {
     );
     // Ordering: the snapshot precedes the lock step; the npm branch
     // restores the file after npm ci (before the project scripts).
-    let lock = step_block(workflow, "jumbo lock (resolve and generate the language lock)")
-        .expect("the lock step");
-    let snap_pos = workflow.find("Snapshot the declared manifests").expect("snapshot");
-    let lock_pos = workflow.find("jumbo lock (resolve and generate the language lock)").expect("lock");
+    step_block(
+        workflow,
+        "jumbo lock (resolve and generate the language lock)",
+    )
+    .expect("the lock step");
+    let snap_pos = workflow
+        .find("Snapshot the declared manifests")
+        .expect("snapshot");
+    let lock_pos = workflow
+        .find("jumbo lock (resolve and generate the language lock)")
+        .expect("lock");
     assert!(snap_pos < lock_pos, "the snapshot precedes jumbo lock");
     let npm = step_block(workflow, NPM_VERIFY_STEP).expect("npm verify step");
     let ci = npm.find("npm ci").expect("npm ci");
     let restore = npm
         .find("declared-package.json")
         .unwrap_or_else(|| panic!("the npm pipeline restores the declared manifest:\n{npm}"));
-    let verify_script = npm.find("npm run verify --if-present").expect("verify script");
+    let verify_script = npm
+        .find("npm run verify --if-present")
+        .expect("verify script");
     assert!(
         ci < restore && restore < verify_script,
         "the npm pipeline restores the declared manifest after the install and before the \
@@ -322,4 +344,25 @@ fn no_other_step_gains_a_credential_through_this_contract() {
             );
         }
     }
+}
+
+/// Stable badges must describe the triggering push, with no failure masking.
+#[test]
+fn measured_test_steps_preserve_failures_and_the_source_commit() {
+    let workflow = include_str!("../.github/workflows/jumbo-verify.yml");
+    let coords = step_block(
+        workflow,
+        "Resolve the verify commit and the JumboBuild coordinates",
+    )
+    .unwrap();
+    assert!(coords.contains("push && \"$commit\" != \"$GITHUB_SHA\""));
+    for name in ["Jumbo tests (python)", "Jumbo tests (npm)"] {
+        let block = step_block(workflow, name).unwrap();
+        assert!(!block.contains("continue-on-error"));
+        assert!(!block.contains("|| true"));
+        assert!(!block.contains("GH_TOKEN"));
+    }
+    let python = step_block(workflow, "Jumbo tests (python)").unwrap();
+    assert!(python.contains("if: steps.python-prepare.outputs.has-tests == 'true'"));
+    assert!(workflow.find("Verify (python)") < workflow.find("Jumbo tests (python)"));
 }

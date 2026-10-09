@@ -147,3 +147,12 @@ re-deriving bytes in a verify run.
 
 This workflow is `workflow_call`-only: it never runs directly on the
 JumboBuild repository (JumboBuild is the toolchain, not a member).
+
+## Shared test status
+
+Verification exposes separate `Jumbo tests (python)` / `Jumbo tests (npm)` steps
+so Jumbo's trusted index publisher can distinguish actual test command outcomes
+from build-only verification and infrastructure failures. Verification itself
+remains read-only. See [the shared badge contract](test-badges.md) for the stable
+README paths, source-run metadata, monotonic publication and private-index image
+rendering limitation.

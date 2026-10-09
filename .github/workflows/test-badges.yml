@@ -1,0 +1,92 @@
+name: Publish shared test badges
+
+# Called only by JumboIndex's trusted default-branch scheduler/dispatch.
+# Member verification remains read-only and passes no badge artifacts here.
+on:
+  workflow_call:
+    inputs:
+      producer-commit:
+        description: Full JumboBuild SHA, identical to this workflow's uses pin and the consumers' verification pin
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    if: github.repository == 'zephytiju/JumboIndex' && github.ref == 'refs/heads/main' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    concurrency:
+      group: jumbo-shared-test-badges
+      cancel-in-progress: false
+    steps:
+      - name: Validate the producer pin and read credentials
+        id: auth
+        env:
+          PRODUCER_COMMIT: ${{ inputs.producer-commit }}
+          APP_ID_PRESENT: ${{ secrets.JUNTAI_CI_APP_ID != '' }}
+          APP_KEY_PRESENT: ${{ secrets.JUNTAI_CI_APP_PRIVATE_KEY != '' }}
+          READ_TOKEN_PRESENT: ${{ secrets.JUNTAI_GITHUB_ARTIFACT_TOKEN != '' }}
+        run: |
+          set -euo pipefail
+          [[ "$PRODUCER_COMMIT" =~ ^[0-9a-f]{40}$ ]] || { echo '::error::producer-commit must be a full SHA'; exit 1; }
+          if [[ "$APP_ID_PRESENT" == true && "$APP_KEY_PRESENT" == true ]]; then
+            echo 'mode=app' >> "$GITHUB_OUTPUT"
+          elif [[ "$READ_TOKEN_PRESENT" == true ]]; then
+            echo 'mode=static' >> "$GITHUB_OUTPUT"
+          else
+            echo '::error::Configure JUNTAI_CI_APP_ID + JUNTAI_CI_APP_PRIVATE_KEY, or JUNTAI_GITHUB_ARTIFACT_TOKEN with contents:read and actions:read on JumboBuild and the configured source repositories.'
+            exit 1
+          fi
+
+      - name: Mint the source metadata read token
+        id: read-token
+        if: steps.auth.outputs.mode == 'app'
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.JUNTAI_CI_APP_ID }}
+          private-key: ${{ secrets.JUNTAI_CI_APP_PRIVATE_KEY }}
+          owner: zephytiju
+          repositories: |
+            JumboBuild
+            JuntaiFuseAPI
+            JuntaiObservabilityTools
+          permission-contents: read
+          permission-actions: read
+
+      - name: Check out the trusted index configuration
+        uses: actions/checkout@v6
+        with:
+          path: index
+          # Only this trusted job gets an index writer, via its GITHUB_TOKEN.
+          # Git credentials are consumed by git, never by consumer code.
+          persist-credentials: true
+
+      - name: Check out the trusted Jumbo badge producer
+        uses: actions/checkout@v6
+        with:
+          repository: zephytiju/JumboBuild
+          ref: ${{ inputs.producer-commit }}
+          path: producer
+          persist-credentials: false
+          token: ${{ steps.read-token.outputs.token || secrets.JUNTAI_GITHUB_ARTIFACT_TOKEN }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Collect measured outcomes and fast-forward the badge subtree
+        env:
+          GH_TOKEN: ${{ steps.read-token.outputs.token || secrets.JUNTAI_GITHUB_ARTIFACT_TOKEN }}
+          PRODUCER_COMMIT: ${{ inputs.producer-commit }}
+        run: |
+          set -euo pipefail
+          git -C index config user.name 'jumbo-badges[bot]'
+          git -C index config user.email 'jumbo-badges[bot]@users.noreply.github.com'
+          python3 producer/scripts/jumbo_test_badges.py \
+            --index index --sources index/config/test-badges.json \
+            --producer-commit "$PRODUCER_COMMIT" --publish
