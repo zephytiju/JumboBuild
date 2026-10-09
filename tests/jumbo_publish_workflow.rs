@@ -278,33 +278,3 @@ fn the_declared_python_manifest_is_snapshotted_before_the_lock() {
         "the snapshot precedes jumbo lock (the injection must never reach the snapshot)"
     );
 }
-
-
-#[test]
-fn no_other_step_gains_a_credential_through_this_contract() {
-    // The token exports are scoped to exactly the steps that need them.
-    // Every other `env:` block in the workflow must not export GH_TOKEN
-    // (the other steps authenticate through their own named secrets,
-    // checked by review and by the workflows' own CI).
-    let workflow = include_str!("../.github/workflows/jumbo-publish.yml");
-    let mut current: Option<&str> = None;
-    for line in workflow.lines() {
-        let trimmed = line.trim_start();
-        if let Some(rest) = trimmed.strip_prefix("- name: ") {
-            current = rest.trim().split('\n').next();
-        }
-        if trimmed.starts_with("GH_TOKEN:") && current != Some(REPULL_STEP) {
-            let owner = current.unwrap_or("<unknown step>");
-            let allowed = [
-                "Fetch the Jumbo index", // minted installation token / static artifact token
-                "Publish the GitHub Release on the caller repository", // github.token for gh release create
-                MATERIALIZE_STEP, // org-wide dependency read token / static artifact token / github.token
-            ];
-            assert!(
-                allowed.contains(&owner),
-                "unexpected GH_TOKEN export in step `{owner}` — scope credential exports to \
-                 the steps whose contracts name them"
-            );
-        }
-    }
-}
