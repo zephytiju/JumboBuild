@@ -112,6 +112,11 @@ jobs:
         run: |
           set -euo pipefail
           commit="${INPUT_COMMIT:-${{ github.event.pull_request.head.sha || github.sha }}}"
+          # Stable badges describe the triggering default-branch commit.
+          if [[ "$GITHUB_EVENT_NAME" == push && "$commit" != "$GITHUB_SHA" ]]; then
+            echo "::error::push verification must test the triggering commit" >&2
+            exit 1
+          fi
           # JumboBuild coordinates: the repository owning THIS workflow
           # file, and the ref jumbo is built from — the same resolution
           # jumbo-publish performs (GITHUB_WORKFLOW_REF names the CALLER's
@@ -375,6 +380,7 @@ jobs:
       #    script is configured (npm's generated placeholder counts as
       #    absent), else the Node test runner when test files exist.
       - name: Verify (npm)
+        id: npm-prepare
         if: steps.eco.outputs.ecosystem == 'npm'
         run: |
           set -euo pipefail
@@ -390,18 +396,31 @@ jobs:
           npm run typecheck --if-present
           test_script="$(jq -r '.scripts.test // empty' package.json)"
           if [[ -n "$test_script" && "$test_script" != *"no test specified"* ]]; then
-            npm test
+            echo "runner=npm" >> "$GITHUB_OUTPUT"
           elif find . \( -name node_modules -o -name .git -o -name deps -o -name dist \) -prune -o \
               -type f \( -name '*.test.js' -o -name '*.test.mjs' -o -name '*.test.cjs' \
               -o -name '*-test.js' -o -name '*-test.mjs' -o -name '*-test.cjs' \
               -o -name '*_test.js' -o -name '*_test.mjs' -o -name '*_test.cjs' \) \
               -print 2>/dev/null | grep -q .; then
             echo "No test script configured; running the Node test runner"
-            node --test
+            echo "runner=node" >> "$GITHUB_OUTPUT"
           else
             echo "::notice title=jumbo verify::no npm test script and no Node test files; nothing to test"
           fi
-          npm run build --if-present
+
+      # These names are the central badge producer's measured-outcome API.
+      # A skipped step is never evidence of passing tests.
+      - name: Jumbo tests (npm)
+        if: steps.npm-prepare.outputs.runner != ''
+        env:
+          TEST_RUNNER: ${{ steps.npm-prepare.outputs.runner }}
+        run: |
+          set -euo pipefail
+          if [[ "$TEST_RUNNER" == npm ]]; then npm test; else node --test; fi
+
+      - name: Build (npm)
+        if: steps.eco.outputs.ecosystem == 'npm'
+        run: npm run build --if-present
 
       # 9'. Build and test — the python pipeline (the same steps jumbo's
       #     python test pipeline runs): sync the environment against the
@@ -419,6 +438,7 @@ jobs:
       #     (deps/.jumbo-sources.json) carries each entry's original
       #     declared and rewritten strings.
       - name: Verify (python)
+        id: python-prepare
         if: steps.eco.outputs.ecosystem == 'python'
         run: |
           set -euo pipefail
@@ -432,10 +452,14 @@ jobs:
           fi
           uv build
           if uv run --no-sync python -c 'import pytest' >/dev/null 2>&1; then
-            uv run --no-sync python -m pytest -q
+            echo "has-tests=true" >> "$GITHUB_OUTPUT"
           else
             echo "::notice title=jumbo verify::pytest is not installed in the synced environment; build-only verification"
           fi
+
+      - name: Jumbo tests (python)
+        if: steps.python-prepare.outputs.has-tests == 'true'
+        run: uv run --no-sync python -m pytest -q
 
       - name: Verification summary
         if: always()

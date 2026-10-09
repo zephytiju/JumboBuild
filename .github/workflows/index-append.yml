@@ -10,6 +10,8 @@ name: Index append hardening
 on:
   pull_request:
     paths:
+      - "scripts/jumbo_test_badges.py"
+      - ".github/workflows/test-badges.yml"
       - "scripts/jumbo_index_append.py"
       - "scripts/jumbo_reconcile_release.py"
       - "scripts/tests/**"
@@ -18,6 +20,8 @@ on:
     branches:
       - main
     paths:
+      - "scripts/jumbo_test_badges.py"
+      - ".github/workflows/test-badges.yml"
       - "scripts/jumbo_index_append.py"
       - "scripts/jumbo_reconcile_release.py"
       - "scripts/tests/**"
